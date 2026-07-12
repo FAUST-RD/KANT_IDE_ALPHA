@@ -94,6 +94,6 @@ IGNORE_DIRS = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', 'dist', '
 COORDINATED_LEAF_TAGS = {'CST'}
 SEARCH_MAX_BYTES = 2_000_000
 
-TREE_FONT_PT = 13
+TREE_FONT_PT = 11
 CODE_FONT_PT = 13
 TREE_MIN_WIDTH = 420

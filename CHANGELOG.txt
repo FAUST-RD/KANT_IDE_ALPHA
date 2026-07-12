@@ -1,0 +1,52 @@
+KANT IDE changelog
+
+2026-07-12
+- MAPPA now follows directed data flow: cyclic modules are grouped, acyclic flow is ranked left-to-right, weighted barycenter ordering reduces crossings, and organic per-module clusters plus local forces keep modules apart. Edge hover shows green incoming and red outgoing references; clicking pins the popup.
+- Initial KANT tagging/map generation now grants automatic permissions only for that confirmed AI operation (Claude permission bridge or Codex `--full-auto`), then restores normal permission handling. AI change review now uses assistant cards and rounded chat-style inspection surfaces.
+- Restored reliable module expansion/collapse in MAPPA and stabilized its camera: zoom and center now survive expansion, tag filtering, background graph refresh, and node drag; the graph recenters only for explicit framing actions.
+- Replaced MAPPA's rigid file columns with an Obsidian-style deterministic force layout. Nodes are drag-and-drop movable, curved arrows follow them live, positions persist per project, and `Riorganizza` resets to the automatic layout.
+- Added interactive Claude permissions inside the AI chat: deny, allow once, allow by tool for the current session, plus an explicit Automatic mode. Requests use an authenticated local MCP bridge; project snapshots and final selective review remain active in every mode.
+- Replaced the AI keep/rollback prompt with a Codex-style change-review dialog: compact file and line totals, expandable file list, per-file/per-hunk inspection, editable final content, selective accept/reject, accept-all, and full rollback.
+- Moved the terminal to a full-width bottom panel beneath the tree and editor, ending before the right-side AI pane.
+- Restyled the AI terminal as a messaging chat with right-aligned user bubbles and streamed left-aligned Claude/Codex replies.
+- Reduced `MainWindow` from 2,986 to 2,317 lines without changing the UI: themed dialogs moved to `kant/dialogs.py`, pure scans/search/map/validation to `kant/projectops.py`, and watchers/conflicts/AI snapshot/file lifecycle to `kant/workspace.py`.
+- Atomic writes now retry short-lived Windows file locks caused by concurrent background readers.
+
+2026-07-10
+- Incoming/Outgoing are now navigable lists: Incoming shows what references the selected element and from which file (`←`), Outgoing what it references and to which file (`→`); rows are labeled by the element's short description (as in the left tree) with its category text on hover; double-click a row to jump straight to that element.
+- MAPPA now opens the cross-reference graph in a frameless dialog internal to the IDE (floating over the editor, not a separate OS window). Modules start collapsed — the graph opens as a clean file-to-file overview and you double-click a module to expand it into its elements — and tests are hidden by default. Nodes are labeled by short description with category text on hover. Navigation aids: name/description search that expands+focuses a hidden match, per-tag toggles (also the color legend), a file selector isolating one file plus neighbors, isolate-selected, expand/collapse-all, zoom/fit, and double-click-a-leaf to jump to it in the editor. Selecting a node dims everything except it and its neighbors.
+- BREAKING: dropped hand-written `[TAG INCOMING]`/`[TAG OUTGOING]` comments from the KANT convention. New deterministic cross-reference system (`kant/xref.py`, zero dependencies): every KANT-tagged element's code is tokenized and identifier matches against other elements' names become directed reference edges. The Incoming/Outgoing panels now show who references the selected element and what it references (any tag, project-wide); a new MAPPA tab draws the whole reference graph — file columns ordered callers-first, nodes colored by tag, wheel zoom, drag pan, click a node to highlight its edges. Old files with INCOMING/OUTGOING comments still parse and round-trip losslessly, but nothing reads or writes them anymore.
+- BREAKING: OPEN/CLOSED markers now carry a unique `#id` (`[TAG OPEN #id] Name` / `[TAG CLOSED #id] Name`). parse_kant enforces strict LIFO nesting and id matching and raises KantParseError (with line numbers) on a mismatch instead of silently guessing; check_file_syntax surfaces the same errors, plus file-wide #id-uniqueness, through the existing syntax status bar.
+- Legacy (id-less) files migrate automatically: opening one assigns fresh ids in memory, and the next save writes them back into the source. No batch migration needed.
+- The IDE now owns KANT_<project>.md as generated output: it resyncs on every save and offers to generate one on project open if none exists, instead of only detecting whether one is present.
+- KantHighlighter now highlights the `[TAG OPEN/CLOSED #id]` marker bracket distinctly from surrounding comment text, for the rare case a marker leaks into a code block unparsed.
+
+2026-07-09
+- Python editor: removed the yellow geometric logo from the custom title bar and kept only the text branding.
+- Python editor: added a generated star icon for the app/window so Windows can show it in the taskbar.
+- Python editor: added a persistent day/night mode toggle in the custom title bar.
+- Python editor: adjusted day mode so the editable code area is slightly darker and the surrounding coding board is lighter.
+- Python editor: added recently opened project folders to the welcome screen and saves them with QSettings.
+- Python editor: restored stronger PyCharm-like syntax colors for keywords, strings, comments, and numbers.
+- Python editor: added colored KANT tag badges in both the coding board and the left outline.
+- Python editor: increased left outline indentation and padding so labels no longer sit against the border.
+- Python editor: consecutive constant sections now render as one flat coordinated block instead of separate indented rows.
+- Python editor: refreshed the interface with a more modern light style: softer borders, rounded code panels, cleaner spacing, and calmer accents.
+- Python editor: refined the dodecahedron logo into a centered faceted mark instead of the skewed polygon.
+- Python editor: clicking a section in the left outline now filters the coding board to only that section; clicking the file restores the full file view.
+- Python editor: refined the archival monochrome UI with a stronger custom title bar, better spacing, and cleaner panel borders.
+- Python editor: replaced the native Windows title bar with a custom monochrome title bar and dodecahedron logo.
+- Python editor: shifted the interface toward the provided archival monochrome reference style with thin borders and restrained yellow accents.
+- Python editor: made the neon HUD theme more readable with softer colors and better code contrast.
+- Python editor: changed the layout so the left code-outline column extends to the bottom of the window.
+- Python editor: added a right-side Claude Code panel that sends prompts through the local `claude -p` CLI.
+- Python editor: replaced the Run button text with a play symbol.
+- Python editor: restyled the interface with a neon HUD theme: dark cockpit background, cyan borders, hot Run button, and brighter syntax colors.
+- Python editor: added a top-right Run button that saves and runs the current file in the bottom terminal.
+- Python editor: syntax status now uses language-specific local checkers when available, with bracket-check fallback.
+- Python editor: added a bottom terminal panel with project-folder cwd, command execution, cd, pwd, and clear/cls.
+- Python editor: empty whitespace-only code runs are no longer shown as extra blank editor boxes.
+- Python editor: code blocks now expand to full width and resize tall enough to avoid clipping code.
+- Python editor: collapsible section titles now toggle open/closed when clicked, not only the arrow.
+- Maintenance focus moved to the Python/PySide6 version only.
+- HTML version is ignored for future development unless explicitly requested.

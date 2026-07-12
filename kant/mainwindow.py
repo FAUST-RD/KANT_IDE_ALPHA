@@ -1,49 +1,58 @@
 """MainWindow: wires the project tree, section views, toolbar, git, LSP, panes."""
 import os
-import shutil
+import re
 import subprocess
-import time
+from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, QObject, QPointF, QProcess, QRect, Qt, QSettings, QSize, Signal, QTimer
+from PySide6.QtCore import QFileSystemWatcher, Qt, QSettings, Signal, QTimer
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygonF,
-    QShortcut, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
+    QColor, QFont, QKeySequence, QShortcut, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton,
+    QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton,
+    QSizeGrip, QSplitter, QStackedWidget, QTabWidget,
     QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
 from kant import theme
 from kant.theme import set_theme
-from kant.model import Run, Node, parse_kant, serialize_kant, read_top_level_label, KantParseError
-from kant.fileio import write_file_atomic, detect_line_ending, is_safe_child_name
-from kant.syntax import check_file_syntax, check_kant_markers, run_command_for_path
-from kant.lsp import lsp_server_for_path, LspClient
-from kant.gitutil import find_git_root, parse_git_status, git_status_map
+from kant.model import Run, Node, parse_kant, serialize_kant, read_top_level_label, read_top_level_label_result, KantParseError
+from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending
+from kant.syntax import check_file_syntax, run_command_for_path
+from kant.xref import build_xref
+from kant.lsp import LSP_SERVERS_BY_EXT, file_uri, path_from_file_uri, lsp_server_for_path, LspClient
+from kant.gitutil import find_git_root, git_status_map
+from kant.dialogs import IdeDialogsMixin
+from kant.projectops import (
+    build_kant_map, definition_locations, has_any_kant_tags, iter_kant_tagged_files,
+    reference_locations, scan_project_replace, search_project, validate_kant_project,
+)
+from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback_snapshot
 from kant.widgets import (
     CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
-    ProjectTree, make_star_icon, TitleBar, FileTab,
+    ProjectTree, make_star_icon, TitleBar, FileTab, XrefMapDialog,
 )
 
 
 ROLE_KIND = Qt.UserRole
-ROLE_PATH = Qt.UserRole + 1
+# ROLE_PATH (Qt.UserRole + 1) lives in kant/workspace.py — workspace's tree-item rename/delete
+# code needs it too, and mainwindow imports workspace (not the other way around)
 ROLE_UID = Qt.UserRole + 2
-ROLE_TREE = Qt.UserRole + 4
 ROLE_LINE = Qt.UserRole + 5
 ROLE_TEXT = Qt.UserRole + 6
+ROLE_KEY = Qt.UserRole + 7   # xref element key '<rel_path>::<uid>', on Incoming/Outgoing list items
 
 
 # [FN CATEGORY] MainWindow — wires the project tree, the section view and the toolbar together;
 # owns the currently-open file's parsed tree and dirty state
 # [FN] MainWindow — the KANT Editor application window
 # [FN OPEN] MainWindow
-class MainWindow(QMainWindow):
+class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
+    backgroundFinished = Signal(object, object, object)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle('KANT Editor')
@@ -61,12 +70,28 @@ class MainWindow(QMainWindow):
         self.git_status = {}
         self.view_mode = 'code'  # left project tree: 'code' = KANT-labeled, 'file' = plain filenames
         self.kant_map_path = None
+        self._xref_cache = None  # project cross-reference graph, rebuilt lazily after invalidation
+        self._xref_generation = 0
+        self._xref_pending_generation = None
+        self._last_io_uid = None
+        self.map_dialog = None   # internal XrefMapDialog, created on first MAPPA click
+        self._closing = False
+        self._background = ThreadPoolExecutor(max_workers=2, thread_name_prefix='kant')
+        self.backgroundFinished.connect(self._finish_background)
+        self._git_refresh_pending = False
+        self._ai_snapshot = None
+        self._map_sync_generation = 0
         self.syntax_timer = QTimer(self)
         self.syntax_timer.setSingleShot(True)
         self.syntax_timer.timeout.connect(self._update_syntax_status)
         self.lsp_diagnostics = {}
+        self.lsp_pending_requests = {}
         self.lsp_client = LspClient(self)
         self.lsp_client.diagnosticsChanged.connect(self._on_lsp_diagnostics)
+        self.lsp_client.responseReceived.connect(self._on_lsp_response)
+        self.lsp_client.serverError.connect(
+            lambda message: self.terminal.write_info(f'\n# LSP: {message}\n') if hasattr(self, 'terminal') else None
+        )
         self.lsp_timer = QTimer(self)
         self.lsp_timer.setSingleShot(True)
         self.lsp_timer.timeout.connect(self._update_lsp_diagnostics)
@@ -77,6 +102,7 @@ class MainWindow(QMainWindow):
         # of changes (git checkout, a script writing many files) triggers one rebuild, not dozens
         self.fs_watcher = QFileSystemWatcher(self)
         self.fs_watcher.directoryChanged.connect(self._on_fs_directory_changed)
+        self.fs_watcher.fileChanged.connect(lambda path: QTimer.singleShot(150, lambda p=path: self._on_fs_file_changed(p)))
         self.fs_refresh_timer = QTimer(self)
         self.fs_refresh_timer.setSingleShot(True)
         self.fs_refresh_timer.timeout.connect(self._refresh_after_fs_change)
@@ -93,8 +119,6 @@ class MainWindow(QMainWindow):
         # keep short aliases so the rest of MainWindow doesn't need to know that
         self.filename_label = self.title_bar.filename_label
         self.syntax_label = self.title_bar.syntax_label
-        self.save_btn = self.title_bar.save_btn
-        self.run_btn = self.title_bar.run_btn
 
         self.stack = QStackedWidget()
         shell_layout.addWidget(self.stack, 1)
@@ -111,6 +135,7 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(saved_geometry)
         self._setup_shortcuts()
         self._check_crash_recovery()
+        self._check_pending_ai_snapshot()
 
     # [FN CATEGORY] _setup_shortcuts — window-wide keyboard shortcuts (work regardless of which
     # child widget has focus); Ctrl+F is handled separately by _build_find_bar's own Escape shortcut
@@ -129,21 +154,54 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence('Ctrl+R'), self, self._run_current_file)
         QShortcut(QKeySequence('Ctrl+Shift+F'), self, self._search_project)
         QShortcut(QKeySequence('Ctrl+Shift+H'), self, self._replace_project)
+        QShortcut(QKeySequence.Undo, self, self._undo_file)
+        QShortcut(QKeySequence.Redo, self, self._redo_file)
+        QShortcut(QKeySequence('F12'), self, lambda: self._lsp_command('definition'))
+        QShortcut(QKeySequence('Shift+F12'), self, lambda: self._lsp_command('references'))
     # [FN CLOSED] _setup_shortcuts
 
     def closeEvent(self, event):
         if not self._flush_all_tabs():
             event.ignore()
             return
+        self._closing = True
+        for timer in (self.syntax_timer, self.lsp_timer, self.fs_refresh_timer):
+            timer.stop()
+        self._background.shutdown(wait=False, cancel_futures=True)
         for proc in (self.terminal.process, self.claude_pane.process):
             if proc is not None:
                 proc.kill()
                 proc.waitForFinished(1000)
+        self.claude_pane.permission_bridge.stop()
+        # an in-flight AI run is rolled back synchronously above, by _finish_ai_review reacting to
+        # claude_pane.process finishing during waitForFinished(). If self._ai_snapshot is still set
+        # here, it's a review that was deliberately left for manual recovery after an apply/rollback
+        # OSError — leave it on disk instead of silently discarding the backup the user was just
+        # told was preserved; _check_pending_ai_snapshot offers to resolve it on the next launch.
         self.lsp_client.shutdown()
         self.settings.setValue('windowGeometry', self.saveGeometry())
         self.settings.setValue('session/cleanExit', True)
         self.settings.sync()
         super().closeEvent(event)
+
+    def _run_background(self, work, done):
+        if self._closing:
+            return
+        future = self._background.submit(work)
+
+        def complete(result):
+            try:
+                value, error = result.result(), None
+            except Exception as e:
+                value, error = None, e
+            if not self._closing:
+                self.backgroundFinished.emit(done, value, error)
+
+        future.add_done_callback(complete)
+
+    def _finish_background(self, done, value, error):
+        if not self._closing:
+            done(value, error)
 
     # [FN CATEGORY] _check_crash_recovery — a "session/cleanExit" flag is set False the moment a run
     # starts and only set True again in closeEvent; if it's still False on the NEXT startup, the
@@ -160,18 +218,48 @@ class MainWindow(QMainWindow):
         folder = self.settings.value('session/openFolder')
         if not folder or not os.path.isdir(folder):
             return
-        reply = QMessageBox.question(
-            self, 'Ripristina sessione',
+        if not self._ide_yes_no(
+            'Ripristina sessione',
             'La sessione precedente si è interrotta improvvisamente. '
             'Vuoi riprendere a lavorare da dove avevi lasciato?',
-        )
-        if reply != QMessageBox.Yes:
+        ):
             return
         self._open_project_folder(folder)
         file_path = self.settings.value('session/openFile')
         if file_path and os.path.isfile(file_path):
             self._open_file(file_path)
     # [FN CLOSED] _check_crash_recovery
+
+    # [FN CATEGORY] _check_pending_ai_snapshot — an AI snapshot survives past its own run (in
+    # QSettings, set in _prepare_ai_snapshot) whenever it wasn't cleanly resolved: a crash, or a
+    # deliberate "leave it for manual recovery" after an apply/rollback OSError. Runs on every
+    # startup regardless of the clean-exit flag, since the latter case is a clean exit.
+    # [FN] _check_pending_ai_snapshot — offers to resolve a leftover AI snapshot on startup
+    # [FN OPEN] _check_pending_ai_snapshot
+    def _check_pending_ai_snapshot(self):
+        snapshot = self.settings.value('ai/pendingSnapshot')
+        project = self.settings.value('ai/pendingSnapshotProject')
+        if not snapshot or not project or not os.path.isdir(snapshot):
+            self._clear_ai_snapshot_marker()
+            return
+        choice = self._ide_choice(
+            'Revisione AI in sospeso',
+            f'E rimasta una revisione AI non conclusa per:\n{project}\n'
+            'Vuoi ripristinare i file come erano prima delle modifiche AI, o tenere i file attuali '
+            'e scartare solo lo snapshot?',
+            [('Decidi più tardi', None), ('Ripristina originali', 'rollback'), ('Tieni i file attuali', 'discard')],
+        )
+        if choice is None:
+            return
+        if choice == 'rollback':
+            try:
+                rollback_snapshot(project, snapshot, theme.IGNORE_DIRS | {'.kant-trash'})
+            except OSError as error:
+                self._ide_message('Revisione AI in sospeso', f'Impossibile ripristinare: {error}')
+                return
+        discard_snapshot(snapshot)
+        self._clear_ai_snapshot_marker()
+    # [FN CLOSED] _check_pending_ai_snapshot
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -321,11 +409,14 @@ class MainWindow(QMainWindow):
         tree_panel_layout.setContentsMargins(0, 0, 0, 0)
         tree_panel_layout.setSpacing(0)
         tree_panel_layout.addWidget(self._build_view_mode_bar())
+        self.map_label_btn = QPushButton('MAPPA')
+        self.map_label_btn.clicked.connect(self._open_xref_window)
+        tree_panel_layout.addWidget(self.map_label_btn)
+        tree_panel_layout.addWidget(self.tree, 1)
         self.kant_map_label = QLabel('')
         self.kant_map_label.setWordWrap(True)
         self.kant_map_label.setFont(QFont('Consolas', theme.TREE_FONT_PT - 2))
         tree_panel_layout.addWidget(self.kant_map_label)
-        tree_panel_layout.addWidget(self.tree, 1)
 
         # each open file is a tab (FileTab) with its own scroll area/view/dirty state; switching
         # tabs is just switching the QTabWidget's current index, nothing to rebuild
@@ -346,37 +437,51 @@ class MainWindow(QMainWindow):
         view_panel_layout.addWidget(self.io_tabs)
 
         self.claude_pane = ClaudePane(os.getcwd())
+        self.claude_pane.before_run = self._prepare_ai_snapshot
+        self.claude_pane.finished.connect(self._finish_ai_review)
         self.claude_pane.finished.connect(self._refresh_and_validate_after_ai)
 
         self._style_io_tabs()
         self._update_io_tabs(None)
         self.terminal = TerminalPane(os.getcwd())
+        self.workspace_splitter = QSplitter(Qt.Horizontal)
+        self.workspace_splitter.addWidget(tree_panel)
+        self.workspace_splitter.addWidget(view_panel)
+        self.workspace_splitter.setStretchFactor(0, 0)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        saved_workspace_sizes = self.settings.value('workspaceSplitterSizes')
+        if saved_workspace_sizes and len(saved_workspace_sizes) == 2:
+            self.workspace_splitter.setSizes([int(x) for x in saved_workspace_sizes])
+        else:
+            self.workspace_splitter.setSizes([theme.TREE_MIN_WIDTH, 900])
+        self.workspace_splitter.splitterMoved.connect(
+            lambda *_: self.settings.setValue('workspaceSplitterSizes', self.workspace_splitter.sizes())
+        )
+
         self.main_splitter = QSplitter(Qt.Vertical)
-        self.main_splitter.addWidget(view_panel)
+        self.main_splitter.addWidget(self.workspace_splitter)
         self.main_splitter.addWidget(self.terminal)
         self.main_splitter.setStretchFactor(0, 1)
         self.main_splitter.setStretchFactor(1, 0)
-        saved_vertical_sizes = self.settings.value('verticalSplitterSizes')
-        if saved_vertical_sizes and len(saved_vertical_sizes) == 2:
-            self.main_splitter.setSizes([int(x) for x in saved_vertical_sizes])
+        saved_main_sizes = self.settings.value('mainVerticalSplitterSizes')
+        if saved_main_sizes and len(saved_main_sizes) == 2:
+            self.main_splitter.setSizes([int(x) for x in saved_main_sizes])
         else:
-            self.main_splitter.setSizes([740, 70])
+            self.main_splitter.setSizes([650, 180])
         self.main_splitter.splitterMoved.connect(
-            lambda *_: self.settings.setValue('verticalSplitterSizes', self.main_splitter.sizes())
+            lambda *_: self.settings.setValue('mainVerticalSplitterSizes', self.main_splitter.sizes())
         )
 
         self.splitter = QSplitter(Qt.Horizontal)
-        self.splitter.addWidget(tree_panel)
         self.splitter.addWidget(self.main_splitter)
         self.splitter.addWidget(self.claude_pane)
-        self.splitter.setStretchFactor(0, 0)
-        self.splitter.setStretchFactor(1, 1)
-        self.splitter.setStretchFactor(2, 0)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 0)
         saved_sizes = self.settings.value('splitterSizes')
-        if saved_sizes and len(saved_sizes) == 3:
+        if saved_sizes and len(saved_sizes) == 2:
             self.splitter.setSizes([int(x) for x in saved_sizes])
         else:
-            self.splitter.setSizes([theme.TREE_MIN_WIDTH, 900, 460])
+            self.splitter.setSizes([1320, 460])
         self.splitter.splitterMoved.connect(
             lambda *_: self.settings.setValue('splitterSizes', self.splitter.sizes())
         )
@@ -472,6 +577,9 @@ class MainWindow(QMainWindow):
         has_tab = self.active_tab is not None
         has_git_file = bool(has_tab and self.git_root)
         self.title_bar.save_menu_action.setEnabled(has_tab)
+        self.title_bar.undo_menu_action.setEnabled(bool(has_tab and self.active_tab.undo_stack))
+        self.title_bar.redo_menu_action.setEnabled(bool(has_tab and self.active_tab.redo_stack))
+        self.title_bar.validate_kant_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.run_menu_action.setEnabled(has_tab)
         self.title_bar.find_menu_action.setEnabled(has_tab)
         self.title_bar.project_search_menu_action.setEnabled(bool(self.project_root_path))
@@ -480,6 +588,14 @@ class MainWindow(QMainWindow):
         self.title_bar.git_diff_menu_action.setEnabled(has_git_file)
         self.title_bar.git_stage_menu_action.setEnabled(has_git_file)
         self.title_bar.git_unstage_menu_action.setEnabled(has_git_file)
+        for action in (
+            self.title_bar.lsp_hover_menu_action,
+            self.title_bar.lsp_definition_menu_action,
+            self.title_bar.lsp_references_menu_action,
+            self.title_bar.lsp_rename_menu_action,
+            self.title_bar.lsp_format_menu_action,
+        ):
+            action.setEnabled(has_tab)
 
     # [FN CATEGORY] _build_find_bar — Ctrl+F search across every CodeEdit currently in the view (the
     # KANT view splits a file into many small editors, so search has to hop between them, not just
@@ -587,40 +703,19 @@ class MainWindow(QMainWindow):
     def _find_prev(self):
         self._find_in_view(forward=False)
 
-    def _iter_project_text_files(self):
-        if not self.project_root_path:
-            return
-        for root, subdirs, files in os.walk(self.project_root_path):
-            subdirs[:] = [d for d in subdirs if d not in theme.IGNORE_DIRS]
-            for name in files:
-                path = os.path.join(root, name)
-                try:
-                    if os.path.getsize(path) > theme.SEARCH_MAX_BYTES:
-                        continue
-                    data = Path(path).read_bytes()
-                    if b'\0' in data:
-                        continue
-                    yield path, data.decode('utf-8')
-                except (OSError, UnicodeDecodeError):
-                    continue
-
     def _search_project(self):
         if not self.project_root_path:
             return
-        needle, ok = QInputDialog.getText(self, 'Cerca nel progetto', 'Testo da cercare:')
+        needle, ok = self._ide_text('Cerca nel progetto', 'Testo da cercare:')
         if not ok or not needle:
             return
-        matches = []
-        for path, text in self._iter_project_text_files():
-            rel = os.path.relpath(path, self.project_root_path)
-            for lineno, line in enumerate(text.splitlines(), 1):
-                if needle in line:
-                    matches.append((path, rel, lineno, line.strip()))
-                    if len(matches) >= 200:
-                        break
-            if len(matches) >= 200:
-                break
-        self._show_search_results(needle, matches)
+        project_root = self.project_root_path
+
+        self._run_background(
+            lambda: search_project(project_root, needle),
+            lambda matches, error: self._show_search_results(needle, matches or [])
+            if not error and self.project_root_path == project_root else None,
+        )
 
     def _show_search_results(self, needle, matches):
         self.results_view.clear()
@@ -640,7 +735,7 @@ class MainWindow(QMainWindow):
             QTreeWidgetItem(root, ['Nessun risultato'])
 
     def _open_result_item(self, item, _column):
-        if item.data(0, ROLE_KIND) != 'search-result':
+        if item.data(0, ROLE_KIND) not in ('search-result', 'validation-result', 'lsp-result', 'diagnostic-result'):
             return
         path = item.data(0, ROLE_PATH)
         line = item.data(0, ROLE_LINE) or 1
@@ -684,32 +779,39 @@ class MainWindow(QMainWindow):
     def _replace_project(self):
         if not self.project_root_path:
             return
-        needle, ok = QInputDialog.getText(self, 'Sostituisci nel progetto', 'Testo da sostituire:')
+        needle, ok = self._ide_text('Sostituisci nel progetto', 'Testo da sostituire:')
         if not ok or not needle:
             return
-        replacement, ok = QInputDialog.getText(self, 'Sostituisci nel progetto', 'Nuovo testo:')
+        replacement, ok = self._ide_text('Sostituisci nel progetto', 'Nuovo testo:')
         if not ok:
-            return
-        changes = []
-        for path, text in self._iter_project_text_files():
-            count = text.count(needle)
-            if count:
-                changes.append((path, text.replace(needle, replacement), count))
-        total = sum(count for _path, _text, count in changes)
-        if not total:
-            self.terminal.write_info(f'\n# Sostituisci progetto: {needle!r}\nNessuna occorrenza\n')
-            return
-        reply = QMessageBox.question(
-            self,
-            'Sostituisci nel progetto',
-            f'Sostituire {total} occorrenze in {len(changes)} file?',
-        )
-        if reply != QMessageBox.Yes:
             return
         if not self._flush_all_tabs():
             return
+        project_root = self.project_root_path
+
+        self._run_background(
+            lambda: scan_project_replace(project_root, needle, replacement),
+            lambda changes, error: self._finish_project_replace(needle, replacement, changes or [])
+            if not error and self.project_root_path == project_root else None,
+        )
+
+    def _finish_project_replace(self, needle, replacement, changes):
+        if not self._flush_all_tabs():
+            return
+        if any(file_fingerprint(path) != fingerprint for path, _text, _count, fingerprint in changes):
+            self._ide_message('Sostituisci nel progetto', 'Alcuni file sono cambiati durante la scansione. Ripeti la sostituzione.')
+            return
+        total = sum(count for _path, _text, count, _fingerprint in changes)
+        if not total:
+            self.terminal.write_info(f'\n# Sostituisci progetto: {needle!r}\nNessuna occorrenza\n')
+            return
+        if not self._ide_yes_no(
+            'Sostituisci nel progetto',
+            f'Sostituire {total} occorrenze in {len(changes)} file?',
+        ):
+            return
         changed_paths = set()
-        for path, text, _count in changes:
+        for path, text, _count, _fingerprint in changes:
             write_file_atomic(path, text)
             changed_paths.add(os.path.abspath(path))
         for path, tab in list(self.open_tabs.items()):
@@ -724,6 +826,7 @@ class MainWindow(QMainWindow):
                 self.terminal.write_info(f'\n# ATTENZIONE: {os.path.basename(path)} ha marcatori KANT non validi dopo la sostituzione: {e}\n')
                 continue
             tab.dirty = False
+            tab.disk_fingerprint = file_fingerprint(path)
             self._render_view(tab)
             self._update_tab_title(tab)
         self._refresh_after_fs_change()
@@ -746,11 +849,12 @@ class MainWindow(QMainWindow):
     # whichever builder matches self.view_mode; shared by folder-open, mode-switch and theme-switch
     # [FN] _rebuild_tree — rebuilds the project tree according to the current view mode
     # [FN OPEN] _rebuild_tree
-    def _rebuild_tree(self):
+    def _rebuild_tree(self, refresh_git=True):
         self.tree.clear()
         if not self.project_root_path:
             return
-        self._refresh_git_status()
+        if refresh_git:
+            self._refresh_git_status()
         if self.view_mode == 'code':
             self._build_project_tree(self.tree.invisibleRootItem(), self.project_root_path)
         else:
@@ -758,62 +862,17 @@ class MainWindow(QMainWindow):
         self.tree._rewrap_labels()
     # [FN CLOSED] _rebuild_tree
 
-    # [FN CATEGORY] _watch_project_tree — (re)registers every directory under the project root with
-    # QFileSystemWatcher. Directories, not files: a directory's own change event fires for any
-    # add/remove/rename of an entry inside it, which is exactly "the project structure changed" —
-    # watching every individual file too would multiply the watch count for no extra signal here.
-    # [FN] _watch_project_tree — points the filesystem watcher at the current project's directories
-    # [FN OPEN] _watch_project_tree
-    def _watch_project_tree(self):
-        watched = self.fs_watcher.directories()
-        if watched:
-            self.fs_watcher.removePaths(watched)
-        if not self.project_root_path:
-            return
-        dirs = [self.project_root_path]
-        for root, subdirs, _files in os.walk(self.project_root_path):
-            subdirs[:] = [d for d in subdirs if d not in theme.IGNORE_DIRS]
-            dirs.extend(os.path.join(root, d) for d in subdirs)
-        if dirs:
-            self.fs_watcher.addPaths(dirs)
-    # [FN CLOSED] _watch_project_tree
-
-    def _on_fs_directory_changed(self, _path):
-        self.fs_refresh_timer.start(400)  # debounce a burst of filesystem events into one rebuild
-
-    # [FN CATEGORY] _refresh_after_fs_change — rebuilds the tree and the KANT-map badge from the
-    # current filesystem state, then re-registers the watcher (new subdirectories need watching too,
-    # deleted ones can no longer be watched) — this is the actual "real-time representation" update
-    # [FN] _refresh_after_fs_change — reacts to an external filesystem change under the project
-    # [FN OPEN] _refresh_after_fs_change
-    def _refresh_after_fs_change(self):
-        if not self.project_root_path:
-            return
-        self._rebuild_tree()
-        self._check_kant_map(self.project_root_path)
-        self._watch_project_tree()
-    # [FN CLOSED] _refresh_after_fs_change
-
-    # [FN] _refresh_and_validate_after_ai — refreshes the project tree and reports KANT validation after an AI run
-    # [FN OPEN] _refresh_and_validate_after_ai
-    def _refresh_and_validate_after_ai(self):
-        self._refresh_after_fs_change()
-        if not getattr(self.claude_pane, 'validate_after_finish', False):
-            return
-        self.claude_pane.validate_after_finish = False
-        result = self._validate_kant_project()
-        if result:
-            self.claude_pane.write_info('\n' + result + '\n')
-    # [FN CLOSED] _refresh_and_validate_after_ai
-
     def _build_io_tabs(self):
-        self.incoming_view = QPlainTextEdit()
-        self.incoming_view.setReadOnly(True)
-        self.incoming_view.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+        # INCOMING lists who references the selected element (what comes IN, and from where);
+        # OUTGOING lists what the selected element references (what goes OUT, and to where). Both
+        # are lists, not text, so a row can be double-clicked to jump straight to that element.
+        self.incoming_view = QListWidget()
+        self.incoming_view.itemActivated.connect(self._open_xref_item)
+        self.incoming_view.itemDoubleClicked.connect(self._open_xref_item)
 
-        self.outgoing_view = QPlainTextEdit()
-        self.outgoing_view.setReadOnly(True)
-        self.outgoing_view.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+        self.outgoing_view = QListWidget()
+        self.outgoing_view.itemActivated.connect(self._open_xref_item)
+        self.outgoing_view.itemDoubleClicked.connect(self._open_xref_item)
 
         self.results_view = QTreeWidget()
         self.results_view.setHeaderLabels(['Risultati'])
@@ -839,9 +898,7 @@ class MainWindow(QMainWindow):
         self.incoming_label_btn.clicked.connect(lambda: self._toggle_info_popup(self.incoming_view))
         self.outgoing_label_btn = QPushButton('OUTGOING')
         self.outgoing_label_btn.clicked.connect(lambda: self._toggle_info_popup(self.outgoing_view))
-        self.results_label_btn = QPushButton('RISULTATI')
-        self.results_label_btn.clicked.connect(lambda: self._toggle_info_popup(self.results_view))
-        for btn in (self.incoming_label_btn, self.outgoing_label_btn, self.results_label_btn):
+        for btn in (self.incoming_label_btn, self.outgoing_label_btn):
             label_layout.addWidget(btn)
         label_layout.addStretch(1)
         layout.addWidget(label_bar)
@@ -850,13 +907,22 @@ class MainWindow(QMainWindow):
         return panel
 
     def _style_io_tabs(self):
+        list_style = (
+            f'QListWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:4px; '
+            f'font-family:Consolas; }} '
+            f'QListWidget::item {{ padding:5px 8px; border-radius:5px; }} '
+            f'QListWidget::item:hover {{ background:{theme.PANEL}; }} '
+            f'QListWidget::item:selected {{ background:{theme.PANEL}; color:{theme.ACCENT}; }}'
+        )
         for view in (self.incoming_view, self.outgoing_view):
-            view.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:10px;')
+            view.setStyleSheet(list_style)
         self.results_view.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:6px;')
         self.info_popup.setStyleSheet(f'background:{theme.CODE_BG}; border-top:1px solid {theme.BORDER}; border-bottom:1px solid {theme.BORDER};')
         self.io_tabs.setStyleSheet(f'background:{theme.PANEL}; border-top:1px solid {theme.BORDER};')
-        for btn in (self.incoming_label_btn, self.outgoing_label_btn, self.results_label_btn):
+        for btn in (self.incoming_label_btn, self.outgoing_label_btn, self.map_label_btn):
             btn.setStyleSheet(theme.BUTTON_STYLE + 'QPushButton { padding:4px 12px; }')
+        if self.map_dialog is not None:
+            self.map_dialog.apply_style()
 
     def _toggle_info_popup(self, widget, force_open=False):
         if self.info_popup.currentWidget() is widget and self.info_popup.isVisible() and not force_open:
@@ -865,17 +931,183 @@ class MainWindow(QMainWindow):
             return
         self.info_popup.setCurrentWidget(widget)
         self.info_popup.setVisible(True)
-        self.io_tabs.setFixedHeight(150)
+        self.io_tabs.setFixedHeight(200)
 
-    # [FN CATEGORY] _update_io_tabs — looks up a section by uid and shows its INCOMING/OUTGOING data
-    # (per the KANT convention, only meaningful for FN/TST) in the two tabs above the terminal
-    # [FN] _update_io_tabs — refreshes the Incoming/Outgoing tabs for the selected section
+    # [FN CATEGORY] _open_xref_window — MAPPA opens the cross-reference graph in a dialog internal to
+    # the IDE (parented to the main window, floating over the editor — not a strip in the coding pane
+    # nor a separate OS window), kept as a single reused instance and raised if already open. Rebuilds
+    # the graph from the (cache-backed) xref on every open so it reflects the current code, and wires
+    # double-click-a-node back to _navigate_to_element so the map doubles as a jump-to launcher.
+    # [FN] _open_xref_window — opens/raises the internal cross-reference map dialog
+    # [FN OPEN] _open_xref_window
+    def _open_xref_window(self):
+        if self.map_dialog is None:
+            self.map_dialog = XrefMapDialog(self)
+            self.map_dialog.nodeActivated.connect(self._navigate_to_element)
+        self.map_dialog.apply_style()
+        project_name = os.path.basename(self.project_root_path) if self.project_root_path else ''
+        self.map_dialog.set_graph(self._get_xref(), project_name, self.project_root_path or '')
+        self.map_dialog.show()
+        self.map_dialog.raise_()
+        self.map_dialog.activateWindow()
+    # [FN CLOSED] _open_xref_window
+
+    # [FN CATEGORY] _navigate_to_element — jumps the editor to a cross-reference element by its key
+    # ('<rel_path>::<uid>'): opens the file if needed, shows the full file view, then scrolls the
+    # section into view. Shared by the map's double-click and the Incoming/Outgoing list rows.
+    # [FN] _navigate_to_element — opens and reveals an xref element in the editor
+    # [FN OPEN] _navigate_to_element
+    def _navigate_to_element(self, key):
+        if not key or '::' not in key or not self.project_root_path:
+            return
+        rel, uid = key.rsplit('::', 1)
+        # resolve the target's document order BEFORE opening the file: opening it reparses and (for
+        # a legacy file with no #id yet) mints a fresh uid, so the key's uid can't be matched. The
+        # order index survives reparse, so it's the reliable fallback; a #id'd file matches by uid.
+        element = self._get_xref().get(key)
+        target_order = element.order if element is not None else None
+        path = os.path.join(self.project_root_path, rel.replace('/', os.sep))
+        if not os.path.isfile(path) or not self._open_file(path):
+            return
+        tab = self.open_tabs.get(path)
+        if tab is None:
+            return
+        node = self._find_node_by_uid(tab.tree, uid)
+        if node is None and target_order is not None:
+            nodes = self._nodes_in_order(tab.tree)
+            if target_order < len(nodes):
+                node = nodes[target_order]
+        if node is None:
+            return
+        self._render_view(tab)
+        self._reveal_section(tab, node.uid)
+        self._select_tree_section(path, node.uid)
+    # [FN CLOSED] _navigate_to_element
+
+    def _nodes_in_order(self, root):
+        # pre-order over tagged nodes — matches kant.xref's own walk, so element.order lines up
+        result = []
+
+        def walk(node):
+            for item in node.body:
+                if isinstance(item, Node):
+                    result.append(item)
+                    walk(item)
+
+        walk(root)
+        return result
+
+    def _select_tree_section(self, path, uid):
+        it = QTreeWidgetItemIterator(self.tree)
+        while it.value():
+            item = it.value()
+            if item.data(0, ROLE_KIND) == 'section' and item.data(0, ROLE_PATH) == path \
+                    and item.data(0, ROLE_UID) == uid:
+                self.tree.setCurrentItem(item)
+                self.tree.scrollToItem(item)
+                self._update_io_tabs(uid)
+                return
+            it += 1
+
+    def _open_xref_item(self, item):
+        self._navigate_to_element(item.data(ROLE_KEY))
+
+    # [FN CATEGORY] _get_xref — lazy cached build of the project cross-reference graph: parses every
+    # KANT-tagged file once (same walk _sync_kant_map does) and hands the trees to build_xref. Cache
+    # is dropped by _invalidate_xref on save, filesystem change, and project switch — never served
+    # stale across an edit, never rebuilt while nothing changed.
+    # ponytail: full reparse remains deterministic and now runs off the UI thread.
+    # [FN] _get_xref — returns the (cached) project cross-reference graph
+    # [FN OPEN] _get_xref
+    def _get_xref(self):
+        if self._xref_cache is None:
+            self._schedule_xref_build()
+        return self._xref_cache or {}
+    # [FN CLOSED] _get_xref
+
+    def _schedule_xref_build(self):
+        if not self.project_root_path or self._xref_pending_generation == self._xref_generation:
+            return
+        project_root = self.project_root_path
+        generation = self._xref_generation
+        self._xref_pending_generation = generation
+        open_texts = {}
+        for path, tab in self.open_tabs.items():
+            rel = os.path.relpath(path, project_root).replace(os.sep, '/')
+            if not rel.startswith('..'):
+                open_texts[rel] = serialize_kant(tab.tree)
+
+        def build():
+            trees = {}
+            for file_path in iter_kant_tagged_files(project_root):
+                label = read_top_level_label(file_path)
+                if label is not None:
+                    rel = os.path.relpath(file_path, project_root).replace(os.sep, '/')
+                    trees[rel] = label[2]
+            for rel, text in open_texts.items():
+                trees[rel] = parse_kant(text)
+            return build_xref(trees)
+
+        def apply(graph, error):
+            if self._xref_pending_generation == generation:
+                self._xref_pending_generation = None
+            if error or generation != self._xref_generation or project_root != self.project_root_path:
+                return
+            self._xref_cache = graph
+            if self.map_dialog is not None and self.map_dialog.isVisible():
+                self.map_dialog.set_graph(graph, os.path.basename(project_root), project_root)
+            if self.active_tab is not None:
+                self._update_io_tabs(self._last_io_uid)
+
+        self._run_background(build, apply)
+
+    def _invalidate_xref(self):
+        self._xref_cache = None
+        self._xref_generation += 1
+        if self.map_dialog is not None and self.map_dialog.isVisible():
+            self._schedule_xref_build()
+
+    # [FN CATEGORY] _update_io_tabs — looks the selected element up in the deterministic
+    # cross-reference graph (kant/xref.py) and fills two navigable lists: INCOMING = who references
+    # it and from which file (what comes in, and from where), OUTGOING = what it references and in
+    # which file (what goes out, and to where). Works for every tagged element — functions,
+    # constants, classes, vars — not just FN/TST, since the xref is name-based. Each row stores its
+    # target key so a double-click jumps there. Nothing is read from a comment, so it can never
+    # drift from the code.
+    # [FN] _update_io_tabs — refreshes the Incoming/Outgoing lists for the selected section
     # [FN OPEN] _update_io_tabs
     def _update_io_tabs(self, uid):
+        self._last_io_uid = uid
         tab = self.active_tab
         node = self._find_node_by_uid(tab.tree, uid) if (uid is not None and tab is not None) else None
-        self.incoming_view.setPlainText(node.incoming if node and node.incoming else '—')
-        self.outgoing_view.setPlainText(node.outgoing if node and node.outgoing else '—')
+        self.incoming_view.clear()
+        self.outgoing_view.clear()
+        if node is None or not self.project_root_path:
+            return
+        xref = self._get_xref()
+        rel = os.path.relpath(tab.path, self.project_root_path).replace(os.sep, '/')
+        element = xref.get(f'{rel}::{node.uid}')
+        if element is None:
+            return
+
+        def fill(view, keys, arrow):
+            if not keys:
+                placeholder = QListWidgetItem('—')
+                placeholder.setFlags(Qt.NoItemFlags)
+                view.addItem(placeholder)
+                return
+            # group by file so "from where" / "to where" reads at a glance; the shown name is the
+            # short description (what the left tree shows), and hovering gives the category text
+            for target_key in sorted(keys, key=lambda k: (xref[k].file, xref[k].desc)):
+                el = xref[target_key]
+                item = QListWidgetItem(f'{arrow}  [{el.tag}] {el.desc}      ·  {el.file}')
+                item.setData(ROLE_KEY, target_key)
+                item.setForeground(QColor(theme.TAG_COLORS.get(el.tag, theme.TEXT)))
+                item.setToolTip(el.category_desc or 'Doppio clic per aprire')
+                view.addItem(item)
+
+        fill(self.incoming_view, element.incoming, '←')   # ← comes from
+        fill(self.outgoing_view, element.outgoing, '→')   # → goes to
     # [FN CLOSED] _update_io_tabs
 
 
@@ -925,50 +1157,6 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(0)
     # [FN CLOSED] _go_back_to_welcome
 
-    def _ide_choice(self, title, message, choices):
-        dialog = QDialog(self)
-        dialog.setModal(True)
-        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        dialog.setMinimumWidth(460)
-        dialog.setStyleSheet(
-            f'QDialog {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; }} '
-            f'QLabel {{ color:{theme.TEXT}; }}'
-        )
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(14)
-
-        title_label = QLabel(title)
-        title_label.setFont(QFont('Consolas', theme.TREE_FONT_PT + 2, QFont.DemiBold))
-        title_label.setStyleSheet(f'color:{theme.WARN};')
-        layout.addWidget(title_label)
-
-        message_label = QLabel(message)
-        message_label.setWordWrap(True)
-        message_label.setStyleSheet(f'color:{theme.TEXT};')
-        layout.addWidget(message_label)
-
-        result = {'value': None}
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-
-        def choose(value):
-            result['value'] = value
-            dialog.accept()
-
-        for label, value in choices:
-            btn = QPushButton(label)
-            btn.setStyleSheet(theme.BUTTON_STYLE)
-            btn.clicked.connect(lambda _checked=False, v=value: choose(v))
-            buttons.addWidget(btn)
-
-        layout.addLayout(buttons)
-        return result['value'] if dialog.exec() == QDialog.Accepted else None
-
-    def _ide_yes_no(self, title, message):
-        return self._ide_choice(title, message, [('No', False), ('Si', True)]) is True
-
     def _choose_ai_agent(self):
         return self._ide_choice(
             'Motore AI',
@@ -978,10 +1166,14 @@ class MainWindow(QMainWindow):
 
     def _open_project_folder(self, path):
         path = os.path.abspath(path)
+        self._invalidate_xref()
         if self.project_root_path and os.path.abspath(self.project_root_path) != path:
             if not self._close_all_tabs(flush=True):
                 return
             self.settings.remove('session/openFile')
+        if self.project_root_path != path:
+            self.git_root = None
+            self.git_status = {}
         self.project_root_path = path
         self._remember_folder(path)
         self.settings.setValue('session/openFolder', path)
@@ -990,7 +1182,7 @@ class MainWindow(QMainWindow):
         self._rebuild_tree()
         self._check_kant_map(path)
         if self.kant_map_path is None:
-            if self._has_any_kant_tags(path):
+            if has_any_kant_tags(path):
                 # tags already exist somewhere in the project — just the map file is missing, a
                 # fast deterministic rebuild from what's already tagged, no AI call needed
                 if self._ide_yes_no(
@@ -1013,9 +1205,27 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(1)
 
     def _refresh_git_status(self):
-        self.git_root = find_git_root(self.project_root_path)
-        self.git_status = git_status_map(self.git_root)
-        self._update_action_buttons()
+        if self._git_refresh_pending or not self.project_root_path:
+            return
+        project_root = self.project_root_path
+        self._git_refresh_pending = True
+
+        def read_status():
+            git_root = find_git_root(project_root)
+            return git_root, git_status_map(git_root)
+
+        def apply_status(result, error):
+            self._git_refresh_pending = False
+            if self.project_root_path != project_root:
+                self._refresh_git_status()
+                return
+            if error:
+                return
+            self.git_root, self.git_status = result
+            self._update_action_buttons()
+            self._rebuild_tree(refresh_git=False)
+
+        self._run_background(read_status, apply_status)
 
     def _git_status_for_path(self, path):
         if not self.git_root:
@@ -1031,7 +1241,7 @@ class MainWindow(QMainWindow):
         return 'M' if any(p.startswith(prefix) for p in self.git_status) else ''
 
     # [FN CATEGORY] _check_kant_map — looks for a KANT_*.md structural map at the project root (the
-    # file /kant-code-map writes) and reflects whether one exists in the label above the project tree
+    # file /kant-code-map writes) and reflects whether one exists in the label below the project tree
     # [FN] _check_kant_map — detects the project's KANT_*.md map file, if any
     # [FN OPEN] _check_kant_map
     def _check_kant_map(self, folder):
@@ -1057,74 +1267,35 @@ class MainWindow(QMainWindow):
     # project and re-reads every KANT-tagged file's top-level label, the same way _build_project_tree
     # does, rather than trusting whatever's currently open in tabs — a save in one file shouldn't make
     # the map forget every other file.
-    # ponytail: full project rescan on every save, no incremental update — fine at the scale this
-    # tool targets (same tradeoff already accepted by read_top_level_label); revisit if it's ever slow.
+    # ponytail: full project rescan stays simple but runs off the UI thread; incremental state is not
+    # worth owning until profiling shows the background pass itself is too expensive.
     # [FN] _sync_kant_map — rewrites KANT_<project>.md from the current on-disk KANT structure
     # [FN OPEN] _sync_kant_map
     def _sync_kant_map(self):
         if not self.project_root_path:
             return
-        project_name = os.path.basename(self.project_root_path)
-        path = self.kant_map_path or os.path.join(self.project_root_path, f'KANT_{project_name}.md')
+        self._invalidate_xref()  # a save changed the code, so the reference graph may have too
+        project_root = self.project_root_path
+        project_name = os.path.basename(project_root)
+        path = self.kant_map_path or os.path.join(project_root, f'KANT_{project_name}.md')
+        self._map_sync_generation += 1
+        generation = self._map_sync_generation
 
-        entries = []
-        for file_path in self._iter_kant_tagged_files(self.project_root_path):
-            label = read_top_level_label(file_path)
-            if label is None:
-                continue
-            tag, desc, _tree, top_node = label
-            entries.append((os.path.relpath(file_path, self.project_root_path), tag, desc, top_node))
-        entries.sort(key=lambda e: e[0])
+        def build_map():
+            return build_kant_map(project_root, project_name)
 
-        lines = [f'# KANT Code Map - {project_name}', '', '## Struttura', '', '```']
-        for rel_path, tag, desc, top_node in entries:
-            lines.append(self._format_kant_map_line(0, tag, rel_path.replace(os.sep, '/'), desc))
-            self._append_map_children(lines, top_node, depth=1)
-        lines.append('```')
-        lines.append('')
+        def save_map(text, error):
+            if error or generation != self._map_sync_generation or project_root != self.project_root_path:
+                return
+            try:
+                write_file_atomic(path, text)
+            except OSError:
+                return
+            self.kant_map_path = path
+            self._update_kant_map_label()
 
-        try:
-            write_file_atomic(path, '\n'.join(lines))
-        except OSError:
-            return
-        self.kant_map_path = path
-        self._update_kant_map_label()
+        self._run_background(build_map, save_map)
     # [FN CLOSED] _sync_kant_map
-
-    # [FN] _format_kant_map_line — formats one KANT map row with skill-compatible depth prefixes
-    # [FN OPEN] _format_kant_map_line
-    def _format_kant_map_line(self, depth, tag, name, desc):
-        prefix = '-' * depth + (' ' if depth else '')
-        label = f'[{tag} {name}]' if depth == 0 else f'[{tag}] {name}'
-        return f'{prefix}{label} \u2014 {desc or name}'
-    # [FN CLOSED] _format_kant_map_line
-
-    # [FN] _append_map_children — appends nested KANT nodes to the generated KANT map
-    # [FN OPEN] _append_map_children
-    def _append_map_children(self, lines, node, depth):
-        for child in node.body:
-            if not isinstance(child, Node):
-                continue
-            lines.append(self._format_kant_map_line(depth, child.tag, child.name, child.desc))
-            self._append_map_children(lines, child, depth + 1)
-    # [FN CLOSED] _append_map_children
-
-    def _iter_kant_tagged_files(self, root):
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in theme.IGNORE_DIRS]
-            for name in filenames:
-                yield os.path.join(dirpath, name)
-
-    # [FN CATEGORY] _has_any_kant_tags — short-circuits on the first tagged file found, so an
-    # already-tagged project (the common case) answers almost instantly; only a genuinely virgin
-    # project pays for the full walk. Distinguishes "tags exist, just the map file is missing" (fast
-    # deterministic _sync_kant_map covers it) from "no KANT convention anywhere yet" (needs
-    # /kant-code-map to actually read the code and decide what to tag, not a mechanical rebuild).
-    # [FN] _has_any_kant_tags — whether any file under root already carries a KANT tag
-    # [FN OPEN] _has_any_kant_tags
-    def _has_any_kant_tags(self, root):
-        return any(read_top_level_label(f) is not None for f in self._iter_kant_tagged_files(root))
-    # [FN CLOSED] _has_any_kant_tags
 
     # [FN] _validate_kant_project — validates the generated KANT map and marker structure after AI runs
     # [FN OPEN] _validate_kant_project
@@ -1132,51 +1303,35 @@ class MainWindow(QMainWindow):
         if not self.project_root_path:
             return ''
         self._check_kant_map(self.project_root_path)
-        errors = []
-        tagged = []
-        checked_markers = 0
-        map_text = ''
+        result, errors, visual_errors = validate_kant_project(self.project_root_path, self.kant_map_path)
 
-        if self.kant_map_path is None:
-            errors.append('manca KANT_*.md nella radice del progetto')
-        else:
-            try:
-                map_text = Path(self.kant_map_path).read_text(encoding='utf-8')
-            except OSError as e:
-                errors.append(f'{os.path.basename(self.kant_map_path)} non leggibile: {e}')
-
-        for file_path in self._iter_kant_tagged_files(self.project_root_path):
-            rel_path = os.path.relpath(file_path, self.project_root_path).replace(os.sep, '/')
-            try:
-                text = Path(file_path).read_text(encoding='utf-8')
-            except UnicodeDecodeError:
-                continue
-            except OSError as e:
-                errors.append(f'{rel_path}: non leggibile: {e}')
-                continue
-            if ' OPEN]' in text or ' CLOSED]' in text:
-                checked_markers += 1
-                result = check_kant_markers(text)
-                if not result['ok']:
-                    errors.append(f"{rel_path}:{result.get('line', 1)} {result.get('message', 'marker KANT non valido')}")
-            label = read_top_level_label(file_path)
-            if label is not None:
-                tagged.append((rel_path, label[0]))
-
-        if map_text:
-            missing = [rel_path for rel_path, tag in tagged if f'[{tag} {rel_path}]' not in map_text]
-            if missing:
-                sample = ', '.join(missing[:5])
-                extra = f' (+{len(missing) - 5})' if len(missing) > 5 else ''
-                errors.append(f'KANT map non coerente: mancano {sample}{extra}')
-
-        if errors:
-            sample = '\n'.join(f'- {err}' for err in errors[:8])
-            extra = f'\n- ... altri {len(errors) - 8} errori' if len(errors) > 8 else ''
-            return f'# KANT verifica: ERRORI\n{sample}{extra}'
-        map_name = os.path.basename(self.kant_map_path) if self.kant_map_path else 'KANT_*.md'
-        return f'# KANT verifica: OK ({map_name}, {checked_markers} file con marker)'
+        self._show_validation_results(errors, visual_errors)
+        return result
     # [FN CLOSED] _validate_kant_project
+
+    def _run_kant_validation(self):
+        result = self._validate_kant_project()
+        if result:
+            self.terminal.write_info('\n' + result + '\n')
+
+    def _show_validation_results(self, errors, visual_errors):
+        if not hasattr(self, 'results_view'):
+            return
+        self.results_view.clear()
+        root = QTreeWidgetItem(self.results_view, [f'Verifica KANT: {"OK" if not errors else str(len(errors)) + " errore/i"}'])
+        for path, rel, line, message in visual_errors:
+            item = QTreeWidgetItem(root, [f'{rel}:{line}: {message}'])
+            item.setData(0, ROLE_KIND, 'validation-result')
+            item.setData(0, ROLE_PATH, path)
+            item.setData(0, ROLE_LINE, line)
+            item.setData(0, ROLE_TEXT, message)
+        for message in errors:
+            if not any(message.startswith(f'{rel}:') for _path, rel, _line, _msg in visual_errors):
+                QTreeWidgetItem(root, [message])
+        if not errors:
+            QTreeWidgetItem(root, ['Nessun errore'])
+        root.setExpanded(True)
+        self._toggle_info_popup(self.results_view, force_open=bool(errors))
 
     # [FN CATEGORY] _launch_kant_code_map — hands off to Claude Code itself rather than trying to
     # replicate its judgment: deciding what deserves a tag and writing a sensible description isn't
@@ -1195,41 +1350,37 @@ class MainWindow(QMainWindow):
             'KANT_<nome-progetto>.md alla radice del progetto.',
             extra_skills=('kant-code-map',),
             agent=agent,
+            auto_permissions_once=True,
         )
     # [FN CLOSED] _launch_kant_code_map
 
     def _build_project_tree(self, parent_item, dir_path):
-        try:
-            entries = sorted(os.scandir(dir_path), key=lambda e: (not e.is_dir(), e.name.lower()))
-        except OSError:
-            return
-        for entry in entries:
-            if entry.is_dir():
-                if entry.name in theme.IGNORE_DIRS:
-                    continue
-                marker = ' *' if self._git_status_for_dir(entry.path) else ''
-                dir_item = QTreeWidgetItem(parent_item, [entry.name + marker])
-                dir_item.setData(0, ROLE_KIND, 'dir')
-                dir_item.setData(0, ROLE_PATH, entry.path)
-                dir_item.setForeground(0, QColor(theme.DIM))
-                self._build_project_tree(dir_item, entry.path)
-            else:
-                label = read_top_level_label(entry.path)
-                if label is None:
-                    continue  # no KANT tags — only convention-tagged files show up in the tree
-                tag, desc, tree, top_node = label
+        files = sorted(iter_kant_tagged_files(dir_path), key=lambda p: os.path.relpath(p, dir_path).lower())
+        for file_path in files:
+            label, error = read_top_level_label_result(file_path)
+            if error is not None:
                 file_item = QTreeWidgetItem(parent_item)
-                file_item.setData(0, ROLE_KIND, 'file')
-                file_item.setData(0, ROLE_PATH, entry.path)
-                file_item.setData(0, ROLE_TREE, tree)
-                self.tree.setItemWidget(
-                    file_item, 0, self._tree_label(tag, desc, bold=True, git_status=self._git_status_for_path(entry.path))
+                file_item.setData(0, ROLE_KIND, 'invalidfile')
+                file_item.setData(0, ROLE_PATH, file_path)
+                self.tree.setItemWidget(file_item, 0, self._invalid_file_label(os.path.basename(file_path), error))
+                continue
+            if label is None:
+                continue  # no KANT tags — only convention-tagged files show up in the tree
+            tag, desc, _tree, top_node = label
+            file_item = QTreeWidgetItem(parent_item)
+            file_item.setData(0, ROLE_KIND, 'file')
+            file_item.setData(0, ROLE_PATH, file_path)
+            self.tree.setItemWidget(
+                file_item, 0, self._tree_label(
+                    tag, desc, bold=True, git_status=self._git_status_for_path(file_path),
+                    detail=top_node.category_desc,
                 )
-                # start from the top node's own children, not the node itself — it's already
-                # shown as this file item's own label, showing it again would duplicate it
-                self._build_outline_items(file_item, top_node, entry.path, tree)
+            )
+            # start from the top node's own children, not the node itself — it's already
+            # shown as this file item's own label, showing it again would duplicate it
+            self._build_outline_items(file_item, top_node, file_path)
 
-    def _build_outline_items(self, parent_item, node, path, tree):
+    def _build_outline_items(self, parent_item, node, path):
         for child in node.body:
             if not isinstance(child, Node):
                 continue
@@ -1237,11 +1388,10 @@ class MainWindow(QMainWindow):
             item.setData(0, ROLE_KIND, 'section')
             item.setData(0, ROLE_UID, child.uid)
             item.setData(0, ROLE_PATH, path)
-            item.setData(0, ROLE_TREE, tree)
-            self.tree.setItemWidget(item, 0, self._tree_label(child.tag, child.desc or child.name))
-            self._build_outline_items(item, child, path, tree)
+            self.tree.setItemWidget(item, 0, self._tree_label(child.tag, child.desc or child.name, detail=child.category_desc))
+            self._build_outline_items(item, child, path)
 
-    def _tree_label(self, tag, text, bold=False, git_status=''):
+    def _tree_label(self, tag, text, bold=False, git_status='', detail=''):
         color = theme.TAG_COLORS.get(tag, theme.TEXT)
         bg = theme.TAG_BACKGROUNDS.get(tag, '#eef2f7')
         weight = '700' if bold else '400'
@@ -1249,15 +1399,17 @@ class MainWindow(QMainWindow):
             f' <span style="color:{theme.WARN}; font-weight:700">[{html_escape(git_status)}]</span>'
             if git_status else ''
         )
+        detail_html = f'<br><span style="color:{theme.DIM}">{html_escape(detail)}</span>' if detail else ''
         lbl = QLabel(
             f'<span style="color:{color}; background-color:{bg}; font-weight:700; '
             f'padding:2px 6px; border-radius:5px">[{tag}]</span> '
-            f'<span style="font-weight:{weight}">{html_escape(text)}</span>{git_html}'
+            f'<span style="font-weight:{weight}">{html_escape(text)}</span>{git_html}{detail_html}'
         )
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
         lbl.setMargin(6)
         lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:4px 8px;')
         lbl.setWordWrap(True)  # long labels wrap instead of overflowing the column
+        lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         return lbl
 
     # [FN CATEGORY] _build_plain_project_tree — classic PyCharm-style file browser: every file and
@@ -1286,6 +1438,17 @@ class MainWindow(QMainWindow):
                 self.tree.setItemWidget(file_item, 0, self._plain_file_label(entry.name, self._git_status_for_path(entry.path)))
     # [FN CLOSED] _build_plain_project_tree
 
+    def _invalid_file_label(self, name, error):
+        lbl = QLabel(
+            f'<span style="color:{theme.TAG_COLORS["TST"]}; font-weight:700">[ERR]</span> '
+            f'{html_escape(name)} <span style="color:{theme.DIM}">{html_escape(str(error))}</span>'
+        )
+        lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
+        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:4px 8px;')
+        lbl.setWordWrap(True)
+        lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        return lbl
+
     def _plain_file_label(self, name, git_status=''):
         git_html = (
             f' <span style="color:{theme.WARN}; font-weight:700">[{html_escape(git_status)}]</span>'
@@ -1295,17 +1458,23 @@ class MainWindow(QMainWindow):
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
         lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:4px 8px;')
         lbl.setWordWrap(True)
+        lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         return lbl
 
     def _on_tree_item_clicked(self, item, _column):
         kind = item.data(0, ROLE_KIND)
         if kind == 'file':
-            self._open_file(item.data(0, ROLE_PATH), item.data(0, ROLE_TREE))
-        elif kind == 'plainfile':
+            path = item.data(0, ROLE_PATH)
+            if self._open_file(path):
+                tab = self.open_tabs.get(path)
+                if tab is not None:
+                    self._render_view(tab)
+                    self._update_io_tabs(None)
+        elif kind in ('plainfile', 'invalidfile'):
             self._open_file(item.data(0, ROLE_PATH))
         elif kind == 'section':
             path = item.data(0, ROLE_PATH)
-            self._open_file(path, item.data(0, ROLE_TREE))
+            self._open_file(path)
             tab = self.open_tabs.get(path)
             if tab is None:
                 return
@@ -1321,8 +1490,6 @@ class MainWindow(QMainWindow):
 
     def _on_active_tab_changed(self, _index):
         tab = self.active_tab
-        self.save_btn.setEnabled(tab is not None)
-        self.run_btn.setEnabled(tab is not None)
         self._update_action_buttons()
         self._update_filename_label()
         self._update_syntax_status()
@@ -1345,8 +1512,11 @@ class MainWindow(QMainWindow):
                 return False
         else:
             tab.autosave_timer.stop()
+        self.lsp_client.close_document(tab.path)
         if tab.path in self.open_tabs:
             del self.open_tabs[tab.path]
+        if tab.path in self.fs_watcher.files():
+            self.fs_watcher.removePath(tab.path)
         self.tabs.removeTab(index)
         tab.deleteLater()
         return True
@@ -1378,6 +1548,7 @@ class MainWindow(QMainWindow):
 
     def _on_tab_dirty_changed(self, tab):
         self._update_tab_title(tab)
+        self._update_action_buttons()
         if tab is self.active_tab:
             self._update_filename_label()
             self.syntax_timer.start(800)
@@ -1394,31 +1565,37 @@ class MainWindow(QMainWindow):
     # open (an already-open tab's live edits are never discarded/re-read from disk by re-clicking it)
     # [FN] _open_file — opens or activates a file's tab
     # [FN OPEN] _open_file
-    def _open_file(self, path, preparsed_tree=None):
+    def _open_file(self, path):
         existing = self.open_tabs.get(path)
         if existing is not None:
             self.tabs.setCurrentWidget(existing)
             return True
-        if preparsed_tree is not None:
-            tree = preparsed_tree
-        else:
-            try:
-                with open(path, 'r', encoding='utf-8', newline='') as f:
-                    tree = parse_kant(f.read())
-            except UnicodeDecodeError:
-                QMessageBox.warning(self, 'File non testuale', f'{os.path.basename(path)} non e un file UTF-8 apribile.')
-                return False
-            except OSError as e:
-                QMessageBox.critical(self, 'Apri file', f'Impossibile aprire {os.path.basename(path)}: {e}')
-                return False
-            except KantParseError as e:
-                QMessageBox.critical(self, 'Marcatori KANT non validi', f'{os.path.basename(path)}: {e}')
-                return False
+        # always re-read from disk rather than trusting a tree parsed earlier for the sidebar —
+        # the file may have changed since then (fs-watcher debounce, external edit), and a stale
+        # tree here would silently overwrite newer disk content on the next save
+        try:
+            with open(path, 'r', encoding='utf-8', newline='') as f:
+                text = f.read()
+            tree = parse_kant(text)
+        except UnicodeDecodeError:
+            self._ide_message('File non testuale', f'{os.path.basename(path)} non e un file UTF-8 apribile.')
+            return False
+        except OSError as e:
+            self._ide_message('Apri file', f'Impossibile aprire {os.path.basename(path)}: {e}')
+            return False
+        except KantParseError as e:
+            self._ide_message('Marcatori KANT non validi', f'{os.path.basename(path)}: {e}\nApro il file come testo grezzo.')
+            tree = Node(tag='ROOT', name='', open_raw=None, body=[Run(lines=text.split('\n'))])
         tab = FileTab(path, tree, detect_line_ending(path))
         tab.dirtyChanged.connect(lambda t=tab: self._on_tab_dirty_changed(t))
         tab.saveFailed.connect(lambda msg, t=tab: self._on_tab_save_failed(t, msg))
-        tab.saved.connect(self._sync_kant_map)
+        tab.saveConflict.connect(lambda t=tab: self._on_tab_save_conflict(t))
+        tab.saved.connect(lambda t=tab: self._on_tab_saved(t))
         self.open_tabs[path] = tab
+        self._watch_open_file(path)
+        # the tab's tree carries the authoritative in-memory #ids from here on (see _get_xref),
+        # so any graph built from the disk parse alone is stale the moment a tab opens
+        self._invalidate_xref()
         idx = self.tabs.addTab(tab, os.path.basename(path))
         self.tabs.setTabToolTip(idx, path)
         self._render_view(tab)
@@ -1438,6 +1615,28 @@ class MainWindow(QMainWindow):
         self._update_filename_label()
         self._update_syntax_status()
 
+    def _undo_file(self):
+        tab = self.active_tab
+        if tab is None or not tab.undo_file():
+            return
+        self._render_view(tab, tab.filter_uid)
+        self._update_tab_title(tab)
+        self._update_filename_label()
+        self._update_action_buttons()
+        self._update_syntax_status()
+        self._update_lsp_diagnostics()
+
+    def _redo_file(self):
+        tab = self.active_tab
+        if tab is None or not tab.redo_file():
+            return
+        self._render_view(tab, tab.filter_uid)
+        self._update_tab_title(tab)
+        self._update_filename_label()
+        self._update_action_buttons()
+        self._update_syntax_status()
+        self._update_lsp_diagnostics()
+
     def _update_filename_label(self):
         tab = self.active_tab
         text = tab.path if tab else ''
@@ -1452,8 +1651,21 @@ class MainWindow(QMainWindow):
         if tab is None:
             self.syntax_label.setText('')
             return
-        result = check_file_syntax(tab.path, serialize_kant(tab.tree))
-        lsp = lsp_server_for_path(tab.path)
+        path = tab.path
+        text = serialize_kant(tab.tree)
+        self.syntax_label.setText('Controllo sintassi...')
+        self._run_background(
+            lambda: check_file_syntax(path, text),
+            lambda result, error: self._apply_syntax_status(path, text, result, error),
+        )
+
+    def _apply_syntax_status(self, path, text, result, error):
+        tab = self.active_tab
+        if tab is None or tab.path != path or serialize_kant(tab.tree) != text:
+            return
+        if error:
+            result = {'ok': False, 'line': 1, 'message': str(error)}
+        lsp = lsp_server_for_path(path)
         lsp_text = self._lsp_status_text(tab.path, lsp)
         if result['ok']:
             self.syntax_label.setText(f"OK {result.get('message', 'Sintassi OK')}{lsp_text}")
@@ -1464,7 +1676,7 @@ class MainWindow(QMainWindow):
 
     def _lsp_status_text(self, path, server):
         if not server:
-            return ' | LSP -'
+            return ' | LSP locale'
         diagnostics = self.lsp_diagnostics.get(os.path.abspath(path), [])
         if not diagnostics:
             return f' | LSP {server}'
@@ -1485,6 +1697,333 @@ class MainWindow(QMainWindow):
         tab = self.active_tab
         if tab and os.path.abspath(tab.path) == os.path.abspath(path):
             self._update_syntax_status()
+            self._show_lsp_diagnostics(tab, diagnostics)
+
+    def _show_lsp_diagnostics(self, tab, diagnostics):
+        if not diagnostics or not hasattr(self, 'results_view'):
+            return
+        self.results_view.clear()
+        root = QTreeWidgetItem(self.results_view, [f'LSP diagnostics: {len(diagnostics)}'])
+        for diag in diagnostics[:100]:
+            start = diag.get('range', {}).get('start', {})
+            line = start.get('line', 0) + 1
+            message = diag.get('message', '').splitlines()[0]
+            item = QTreeWidgetItem(root, [f'{os.path.basename(tab.path)}:{line}: {message}'])
+            item.setData(0, ROLE_KIND, 'diagnostic-result')
+            item.setData(0, ROLE_PATH, tab.path)
+            item.setData(0, ROLE_LINE, line)
+            item.setData(0, ROLE_TEXT, message)
+        root.setExpanded(True)
+        self._toggle_info_popup(self.results_view, force_open=True)
+
+    def _line_count_before_run(self, node, target):
+        count = 0
+        for item in node.body:
+            if isinstance(item, Run):
+                if item is target:
+                    return count
+                count += len(item.lines)
+                continue
+            if item.category_raw:
+                count += 1
+            if item.tag_raw:
+                count += 1
+            if item.open_raw:
+                count += 1
+            inner = self._line_count_before_run(item, target)
+            if inner is not None:
+                return count + inner
+            if item.closed_raw:
+                count += 1
+            if item.incoming_raw:
+                count += 1
+            if item.outgoing_raw:
+                count += 1
+        return None
+
+    def _active_lsp_position(self):
+        tab = self.active_tab
+        if tab is None:
+            return None
+        edit = QApplication.focusWidget()
+        if not isinstance(edit, CodeEdit):
+            edits = tab.view_container.findChildren(CodeEdit)
+            edit = edits[0] if edits else None
+        if edit is None:
+            return None
+        cursor = edit.textCursor()
+        offset = self._line_count_before_run(tab.tree, getattr(edit, 'kant_item', None))
+        if offset is None:
+            offset = 0
+        return {
+            'textDocument': {'uri': file_uri(tab.path)},
+            'position': {
+                'line': offset + cursor.blockNumber(),
+                'character': len(cursor.block().text()[:cursor.columnNumber()].encode('utf-16-le')) // 2,
+            },
+        }
+
+    def _lsp_command(self, action, retry=12):
+        tab = self.active_tab
+        if tab is None:
+            self._ide_message('LSP', 'Apri un file prima di usare i comandi LSP.')
+            return
+        if not lsp_server_for_path(tab.path):
+            self._local_lsp_command(action, tab)
+            return
+        self._update_lsp_diagnostics()
+        method = {
+            'hover': 'textDocument/hover',
+            'definition': 'textDocument/definition',
+            'references': 'textDocument/references',
+            'rename': 'textDocument/rename',
+            'format': 'textDocument/formatting',
+        }[action]
+        if action == 'format':
+            params = {'textDocument': {'uri': file_uri(tab.path)}, 'options': {'tabSize': 4, 'insertSpaces': True}}
+        else:
+            params = self._active_lsp_position()
+            if params is None:
+                self._ide_message('LSP', 'Metti il cursore dentro un blocco di codice.')
+                return
+            if action == 'references':
+                params['context'] = {'includeDeclaration': True}
+            elif action == 'rename':
+                new_name, ok = self._ide_text('LSP rename', 'Nuovo nome:')
+                if not ok or not new_name.strip():
+                    return
+                params['newName'] = new_name.strip()
+        request_id = self.lsp_client.request(method, params)
+        if request_id is None:
+            if retry > 0:
+                QTimer.singleShot(350, lambda: self._lsp_command(action, retry=retry - 1))
+            else:
+                self._ide_message('LSP', 'Server LSP non pronto.')
+            return
+        self.lsp_pending_requests[request_id] = (action, tab.path)
+
+    def _lsp_missing_server_message(self, path):
+        ext = Path(path).suffix.lower()
+        servers = LSP_SERVERS_BY_EXT.get(ext, ())
+        if not servers:
+            return f'Nessun server LSP configurato per file {ext or "senza estensione"}.'
+        return (
+            f'Nessun server LSP trovato nel PATH per file {ext}.\n'
+            f'Installa uno di questi: {", ".join(servers)}.'
+        )
+
+    def _active_symbol(self):
+        tab = self.active_tab
+        edit = QApplication.focusWidget()
+        if tab is not None and not isinstance(edit, CodeEdit):
+            edits = tab.view_container.findChildren(CodeEdit)
+            edit = edits[0] if edits else None
+        if not isinstance(edit, CodeEdit):
+            return ''
+        cursor = edit.textCursor()
+        cursor.select(QTextCursor.WordUnderCursor)
+        symbol = cursor.selectedText().strip()
+        return symbol if re.fullmatch(r'[A-Za-z_]\w*', symbol) else ''
+
+    def _local_lsp_command(self, action, tab):
+        if action == 'format':
+            self._local_format(tab)
+            return
+        symbol = self._active_symbol()
+        if not symbol:
+            self._ide_message('LSP locale', 'Metti il cursore sopra un simbolo.')
+            return
+        if action == 'hover':
+            definitions = self._local_definition_locations(symbol, limit=1)
+            where = f'\nDefinizione probabile: {definitions[0][1]}:{definitions[0][2]}' if definitions else ''
+            self._ide_message('LSP hover locale', f'Simbolo: {symbol}{where}')
+        elif action == 'definition':
+            self._show_lsp_locations('definition locale', [(path, line, text) for path, _rel, line, text in self._local_definition_locations(symbol)])
+        elif action == 'references':
+            self._show_lsp_locations('references locale', [(path, line, text) for path, _rel, line, text in self._local_reference_locations(symbol)])
+        elif action == 'rename':
+            new_name, ok = self._ide_text('LSP rename locale', f'Rinomina {symbol} in:')
+            if ok and re.fullmatch(r'[A-Za-z_]\w*', new_name.strip()):
+                self._local_rename_in_tab(tab, symbol, new_name.strip())
+
+    def _local_definition_locations(self, symbol, limit=200):
+        return definition_locations(self.project_root_path, symbol, limit)
+
+    def _local_reference_locations(self, symbol, limit=200):
+        return reference_locations(self.project_root_path, symbol, limit)
+
+    def _local_rename_in_tab(self, tab, old, new):
+        text = serialize_kant(tab.tree)
+        new_text, count = re.subn(rf'\b{re.escape(old)}\b', new, text)
+        if not count:
+            self._ide_message('LSP rename locale', 'Nessuna occorrenza nel file aperto.')
+            return
+        self._apply_local_text(tab, new_text, f'Rinominate {count} occorrenze nel file aperto.')
+
+    def _local_format(self, tab):
+        text = serialize_kant(tab.tree)
+        lines = [line.rstrip() for line in text.splitlines()]
+        new_text = '\n'.join(lines).rstrip() + '\n'
+        if new_text == text:
+            self._ide_message('LSP format locale', 'Il file e gia pulito.')
+            return
+        self._apply_local_text(tab, new_text, 'Whitespace ripulito.')
+
+    def _apply_local_text(self, tab, text, message):
+        try:
+            new_tree = parse_kant(text)
+        except KantParseError as e:
+            self._ide_message('LSP locale', f'Edit rifiutato: romperebbe i marker KANT.\n{e}')
+            return
+        tab.remember_undo_state()
+        tab.tree = new_tree
+        tab.mark_dirty()
+        self._render_view(tab, tab.filter_uid)
+        self._update_tab_title(tab)
+        self._update_filename_label()
+        self._ide_message('LSP locale', message)
+
+    def _on_lsp_response(self, request_id, method, result):
+        action, path = self.lsp_pending_requests.pop(request_id, ('', ''))
+        tab = self.open_tabs.get(path)
+        if action == 'hover':
+            text = self._lsp_hover_text(result)
+            self._ide_message('LSP hover', text or 'Nessuna informazione.')
+        elif action in ('definition', 'references'):
+            self._show_lsp_locations(action, self._lsp_locations(result))
+        elif action == 'format' and tab is not None:
+            self._apply_lsp_text_edits(tab, result or [])
+        elif action == 'rename' and tab is not None:
+            self._apply_lsp_workspace_edits(result or {})
+
+    def _lsp_hover_text(self, result):
+        contents = (result or {}).get('contents') if isinstance(result, dict) else result
+        if isinstance(contents, str):
+            return contents
+        if isinstance(contents, dict):
+            return contents.get('value') or contents.get('language') or ''
+        if isinstance(contents, list):
+            return '\n'.join(self._lsp_hover_text({'contents': c}) for c in contents)
+        return ''
+
+    def _lsp_locations(self, result):
+        if not result:
+            return []
+        if isinstance(result, dict):
+            result = [result]
+        locations = []
+        for loc in result:
+            target_uri = loc.get('targetUri') or loc.get('uri')
+            target_range = loc.get('targetSelectionRange') or loc.get('range') or {}
+            start = target_range.get('start', {})
+            if target_uri:
+                locations.append((path_from_file_uri(target_uri), start.get('line', 0) + 1))
+        return locations
+
+    def _lsp_workspace_edits(self, result):
+        edits = {}
+        for uri, changes in result.get('changes', {}).items():
+            edits.setdefault(path_from_file_uri(uri), []).extend(changes)
+        for change in result.get('documentChanges', []):
+            uri = change.get('textDocument', {}).get('uri')
+            if uri:
+                edits.setdefault(path_from_file_uri(uri), []).extend(change.get('edits', []))
+        return edits
+
+    def _apply_lsp_workspace_edits(self, result):
+        grouped = self._lsp_workspace_edits(result)
+        prepared = []
+        try:
+            for path, edits in grouped.items():
+                absolute = os.path.abspath(path)
+                tab = next((t for p, t in self.open_tabs.items() if os.path.normcase(os.path.abspath(p)) == os.path.normcase(absolute)), None)
+                if tab is not None:
+                    old_text = serialize_kant(tab.tree)
+                else:
+                    with open(absolute, 'r', encoding='utf-8', newline='') as f:
+                        old_text = f.read()
+                new_text = self._text_with_lsp_edits(old_text, edits)
+                prepared.append((absolute, tab, new_text, parse_kant(new_text)))
+        except (OSError, UnicodeDecodeError, KantParseError) as e:
+            self._ide_message('LSP rename', f'Rename rifiutato: {e}')
+            return
+
+        try:
+            for path, tab, new_text, _new_tree in prepared:
+                if tab is None:
+                    write_file_atomic(path, new_text)
+        except OSError as e:
+            self._ide_message('LSP rename', f'Rename non salvato: {e}')
+            return
+
+        for _path, tab, _new_text, new_tree in prepared:
+            if tab is None:
+                continue
+            tab.remember_undo_state()
+            tab.tree = new_tree
+            tab.mark_dirty()
+            self._render_view(tab, tab.filter_uid)
+            self._update_tab_title(tab)
+        if prepared:
+            self._invalidate_xref()
+            self._update_filename_label()
+            self._update_lsp_diagnostics()
+
+    def _show_lsp_locations(self, action, locations):
+        self.results_view.clear()
+        root = QTreeWidgetItem(self.results_view, [f'LSP {action}: {len(locations)} risultato/i'])
+        for location in locations:
+            path, line = location[:2]
+            text = location[2] if len(location) > 2 else ''
+            rel = os.path.relpath(path, self.project_root_path) if self.project_root_path else path
+            item = QTreeWidgetItem(root, [f'{rel}:{line}' + (f': {text}' if text else '')])
+            item.setData(0, ROLE_KIND, 'lsp-result')
+            item.setData(0, ROLE_PATH, path)
+            item.setData(0, ROLE_LINE, line)
+            item.setData(0, ROLE_TEXT, text)
+        if not locations:
+            QTreeWidgetItem(root, ['Nessun risultato'])
+        root.setExpanded(True)
+        self._toggle_info_popup(self.results_view, force_open=True)
+
+    def _offset_for_lsp_position(self, text, pos):
+        lines = text.splitlines(keepends=True)
+        if not lines:
+            return 0
+        line = pos.get('line', 0)
+        if line >= len(lines):
+            return len(text)
+        units = max(0, pos.get('character', 0))
+        prefix = lines[line].encode('utf-16-le')[:units * 2].decode('utf-16-le', errors='ignore')
+        return sum(len(lines[i]) for i in range(line)) + len(prefix)
+
+    def _text_with_lsp_edits(self, text, edits):
+        for edit in sorted(edits, key=lambda e: (
+            e.get('range', {}).get('start', {}).get('line', 0),
+            e.get('range', {}).get('start', {}).get('character', 0),
+        ), reverse=True):
+            range_ = edit.get('range', {})
+            start = self._offset_for_lsp_position(text, range_.get('start', {}))
+            end = self._offset_for_lsp_position(text, range_.get('end', {}))
+            text = text[:start] + edit.get('newText', '') + text[end:]
+        return text
+
+    def _apply_lsp_text_edits(self, tab, edits):
+        if not edits:
+            return
+        text = self._text_with_lsp_edits(serialize_kant(tab.tree), edits)
+        try:
+            new_tree = parse_kant(text)
+        except KantParseError as e:
+            self._ide_message('LSP', f'Edit rifiutato: romperebbe i marker KANT.\n{e}')
+            return
+        tab.remember_undo_state()
+        tab.tree = new_tree
+        tab.mark_dirty()
+        self._render_view(tab, tab.filter_uid)
+        self._update_tab_title(tab)
+        self._update_filename_label()
+        self._update_lsp_diagnostics()
 
     def _run_current_file(self):
         tab = self.active_tab
@@ -1496,7 +2035,7 @@ class MainWindow(QMainWindow):
             self._update_tab_title(tab)
         command = run_command_for_path(tab.path)
         if command is None:
-            QMessageBox.information(self, 'Run', 'Nessun comando run configurato per questo tipo di file.')
+            self._ide_message('Run', 'Nessun comando run configurato per questo tipo di file.')
             return
         self.terminal.run_command(command, os.path.dirname(tab.path) or None)
 
@@ -1531,6 +2070,7 @@ class MainWindow(QMainWindow):
             run = Run(lines=[''])
             tab.tree.body.append(run)
         edit = CodeEdit('\n'.join(run.lines))
+        edit.kant_item = run
         edit.textChanged.connect(lambda e=edit, it=run, t=tab: self._on_code_changed(t, e, it))
         tab.view_layout.addWidget(edit)
 
@@ -1555,6 +2095,7 @@ class MainWindow(QMainWindow):
                     i += 1
                     continue
                 edit = CodeEdit(text)
+                edit.kant_item = item
                 edit.textChanged.connect(lambda e=edit, it=item, t=tab: self._on_code_changed(t, e, it))
                 layout.addWidget(edit)
                 i += 1
@@ -1568,6 +2109,7 @@ class MainWindow(QMainWindow):
                 has_children = any(isinstance(c, Node) for c in item.body)
                 if has_children:
                     section = CollapsibleSection(item)
+                    section.editMetadata.connect(lambda node, t=tab: self._edit_kant_metadata(t, node))
                     section.set_expanded(depth < 1)
                     layout.addWidget(section)
                     tab.collapsibles.append(section)
@@ -1575,6 +2117,7 @@ class MainWindow(QMainWindow):
                     self._build_node_widgets(tab, item, section.content_layout, depth + 1)
                 else:
                     leaf = LeafSection(item)
+                    leaf.editMetadata.connect(lambda node, t=tab: self._edit_kant_metadata(t, node))
                     layout.addWidget(leaf)
                     tab.section_widgets[item.uid] = leaf
                     self._build_node_widgets(tab, item, leaf.content_layout, depth + 1)
@@ -1619,8 +2162,54 @@ class MainWindow(QMainWindow):
         layout.addWidget(panel)
 
     def _on_code_changed(self, tab, edit, item):
+        tab.remember_undo_state(coalesce=True)
         item.lines = edit.toPlainText().split('\n')
         tab.mark_dirty()
+
+    def _rewrite_marker_line(self, raw, marker, payload):
+        if not raw:
+            return raw
+        start = raw.find('[')
+        if start == -1:
+            return raw
+        suffix = ''
+        stripped = raw.rstrip()
+        if stripped.endswith('*/'):
+            suffix = ' */'
+        elif stripped.endswith('-->'):
+            suffix = ' -->'
+        return f'{raw[:start]}{marker} {payload}{suffix}'
+
+    def _edit_kant_metadata(self, tab, node):
+        tag, ok = self._ide_text('KANT metadata', 'Tag:', text=node.tag)
+        if not ok:
+            return
+        tag = tag.strip().upper()
+        name, ok = self._ide_text('KANT metadata', 'Nome tecnico:', text=node.name)
+        if not ok:
+            return
+        name = name.strip()
+        desc, ok = self._ide_text('KANT metadata', 'Descrizione breve:', text=node.desc or node.name)
+        if not ok or not tag or not name:
+            return
+        desc = desc.strip() or name
+        tab.remember_undo_state()
+        node.tag = tag
+        node.name = name
+        node.desc = desc
+        if node.tag_raw:
+            node.tag_raw = self._rewrite_marker_line(node.tag_raw, f'[{tag}]', f'{name} — {desc}')
+        else:
+            node.tag_raw = f'# [{tag}] {name} — {desc}'
+        node.open_raw = self._rewrite_marker_line(node.open_raw, f'[{tag} OPEN #{node.uid}]', name)
+        node.closed_raw = self._rewrite_marker_line(node.closed_raw, f'[{tag} CLOSED #{node.uid}]', name)
+        if node.incoming_raw:
+            node.incoming_raw = self._rewrite_marker_line(node.incoming_raw, f'[{tag} INCOMING]', f'{name} — {node.incoming or ""}')
+        if node.outgoing_raw:
+            node.outgoing_raw = self._rewrite_marker_line(node.outgoing_raw, f'[{tag} OUTGOING]', f'{name} — {node.outgoing or ""}')
+        tab.mark_dirty()
+        self._render_view(tab, tab.filter_uid)
+        self._update_tab_title(tab)
 
     def _reveal_section(self, tab, uid):
         widget = tab.section_widgets.get(uid)
@@ -1641,7 +2230,7 @@ class MainWindow(QMainWindow):
             return self.project_root_path
         if kind == 'dir':
             return item.data(0, ROLE_PATH)
-        if kind in ('file', 'plainfile', 'section'):
+        if kind in ('file', 'plainfile', 'invalidfile', 'section'):
             return os.path.dirname(item.data(0, ROLE_PATH))
         return self.project_root_path
 
@@ -1660,8 +2249,9 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         new_file_action = menu.addAction('Nuovo file…')
         new_folder_action = menu.addAction('Nuova cartella…')
+        restore_action = menu.addAction('Ripristina dal cestino...') if self._restore_candidates() else None
         rename_action = delete_action = git_diff_action = git_stage_action = git_unstage_action = None
-        if item is not None and kind in ('file', 'plainfile', 'dir'):
+        if item is not None and kind in ('file', 'plainfile', 'invalidfile', 'dir'):
             menu.addSeparator()
             rename_action = menu.addAction('Rinomina…')
             delete_action = menu.addAction('Elimina')
@@ -1676,6 +2266,8 @@ class MainWindow(QMainWindow):
             self._create_new_file(target_dir)
         elif chosen is new_folder_action:
             self._create_new_folder(target_dir)
+        elif restore_action is not None and chosen is restore_action:
+            self._restore_from_trash()
         elif rename_action is not None and chosen is rename_action:
             self._rename_tree_item(item, kind)
         elif delete_action is not None and chosen is delete_action:
@@ -1693,46 +2285,54 @@ class MainWindow(QMainWindow):
             return None
         return os.path.relpath(path, self.git_root)
 
-    def _run_git(self, args):
-        if not self.git_root:
+    def _run_git(self, args, git_root=None):
+        git_root = git_root or self.git_root
+        if not git_root:
             return None
-        try:
-            return subprocess.run(
-                ['git', '-C', self.git_root, *args],
-                capture_output=True,
-                text=True,
-                timeout=8,
-            )
-        except (OSError, subprocess.TimeoutExpired) as e:
-            self.terminal.write_info(f'\n# git errore: {e}\n')
-            return None
+        return subprocess.run(
+            ['git', '-C', git_root, *args],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
 
     def _git_diff_file(self, path):
         rel = self._git_relpath(path)
         if not rel:
             return
-        result = self._run_git(['diff', '--', rel])
-        if result is None:
-            return
-        text = result.stdout.strip()
-        if not text:
-            cached = self._run_git(['diff', '--cached', '--', rel])
-            text = cached.stdout.strip() if cached else ''
-        self.terminal.write_info(f'\n# git diff -- {rel}\n{text or "Nessuna differenza"}\n')
+        git_root = self.git_root
+        def diff():
+            result = self._run_git(['diff', '--', rel], git_root)
+            text = result.stdout.strip() if result else ''
+            if not text:
+                cached = self._run_git(['diff', '--cached', '--', rel], git_root)
+                text = cached.stdout.strip() if cached else ''
+            return text
+
+        self._run_background(
+            diff,
+            lambda text, error: self.terminal.write_info(
+                f'\n# git diff -- {rel}\n{("Errore: " + str(error)) if error else (text or "Nessuna differenza")}\n'
+            ),
+        )
 
     def _git_stage_file(self, path, staged):
         rel = self._git_relpath(path)
         if not rel:
             return
         args = ['add', '--', rel] if staged else ['restore', '--staged', '--', rel]
-        result = self._run_git(args)
-        if result is None:
-            return
-        if result.returncode:
-            self.terminal.write_info(f'\n# git {"stage" if staged else "unstage"} {rel}\n{result.stderr or result.stdout}\n')
-            return
-        self._refresh_after_fs_change()
-        self.terminal.write_info(f'\n# git {"stage" if staged else "unstage"} {rel}: OK\n')
+        action = 'stage' if staged else 'unstage'
+        git_root = self.git_root
+
+        def done(result, error):
+            if error or result is None or result.returncode:
+                message = str(error) if error else ((result.stderr or result.stdout) if result else 'Git non disponibile')
+                self.terminal.write_info(f'\n# git {action} {rel}\n{message}\n')
+                return
+            self._refresh_after_fs_change()
+            self.terminal.write_info(f'\n# git {action} {rel}: OK\n')
+
+        self._run_background(lambda: self._run_git(args, git_root), done)
 
     def _active_file_path(self):
         tab = self.active_tab
@@ -1756,143 +2356,4 @@ class MainWindow(QMainWindow):
         path = self._active_file_path()
         if path:
             self._git_stage_file(path, staged=False)
-
-    def _create_new_file(self, target_dir):
-        if not target_dir:
-            return
-        name, ok = QInputDialog.getText(self, 'Nuovo file', 'Nome del file:')
-        name = name.strip()
-        if not ok or not name:
-            return
-        if not is_safe_child_name(name):
-            QMessageBox.warning(self, 'Nuovo file', 'Usa solo un nome file, senza percorsi.')
-            return
-        path = os.path.join(target_dir, name)
-        if os.path.exists(path):
-            QMessageBox.warning(self, 'Nuovo file', 'Esiste già un file o una cartella con questo nome.')
-            return
-        try:
-            with open(path, 'w', encoding='utf-8', newline=''):
-                pass
-        except OSError as e:
-            QMessageBox.critical(self, 'Nuovo file', f'Impossibile creare il file: {e}')
-            return
-        self._refresh_after_fs_change()
-        self._open_file(path)
-
-    def _create_new_folder(self, target_dir):
-        if not target_dir:
-            return
-        name, ok = QInputDialog.getText(self, 'Nuova cartella', 'Nome della cartella:')
-        name = name.strip()
-        if not ok or not name:
-            return
-        if not is_safe_child_name(name):
-            QMessageBox.warning(self, 'Nuova cartella', 'Usa solo un nome cartella, senza percorsi.')
-            return
-        path = os.path.join(target_dir, name)
-        try:
-            os.makedirs(path, exist_ok=False)
-        except OSError as e:
-            QMessageBox.critical(self, 'Nuova cartella', f'Impossibile creare la cartella: {e}')
-            return
-        self._refresh_after_fs_change()
-
-    # [FN CATEGORY] _rename_tree_item — renames a file or folder on disk; any open tab(s) for that
-    # path (or nested under it, if it's a folder) are flushed first and retargeted to the new path
-    # rather than left pointing at a path that no longer exists
-    # [FN] _rename_tree_item — renames the right-clicked file or folder
-    # [FN OPEN] _rename_tree_item
-    def _rename_tree_item(self, item, kind):
-        old_path = item.data(0, ROLE_PATH)
-        if not old_path:
-            return
-        old_name = os.path.basename(old_path)
-        new_name, ok = QInputDialog.getText(self, 'Rinomina', 'Nuovo nome:', text=old_name)
-        new_name = new_name.strip()
-        if not ok or not new_name or new_name == old_name:
-            return
-        if not is_safe_child_name(new_name):
-            QMessageBox.warning(self, 'Rinomina', 'Usa solo un nome, senza percorsi.')
-            return
-        new_path = os.path.join(os.path.dirname(old_path), new_name)
-        if os.path.exists(new_path):
-            QMessageBox.warning(self, 'Rinomina', 'Esiste già un file o una cartella con questo nome.')
-            return
-        is_dir = kind == 'dir'
-        affected = [t for p, t in self.open_tabs.items() if p == old_path or (is_dir and p.startswith(old_path + os.sep))]
-        for t in affected:
-            if not t.flush_pending_save():
-                return
-        try:
-            os.rename(old_path, new_path)
-        except OSError as e:
-            QMessageBox.critical(self, 'Rinomina', f'Impossibile rinominare: {e}')
-            return
-        for t in affected:
-            self._retarget_tab(t, new_path + t.path[len(old_path):])
-        self._refresh_after_fs_change()
-    # [FN CLOSED] _rename_tree_item
-
-    def _retarget_tab(self, tab, new_path):
-        del self.open_tabs[tab.path]
-        tab.path = new_path
-        self.open_tabs[new_path] = tab
-        idx = self.tabs.indexOf(tab)
-        if idx != -1:
-            self.tabs.setTabToolTip(idx, new_path)
-            self._update_tab_title(tab)
-        if tab is self.active_tab:
-            self._update_filename_label()
-
-    # [FN] _trash_target — returns a unique local trash path for a deleted project item
-    # [FN OPEN] _trash_target
-    def _trash_target(self, path):
-        root = self.project_root_path or os.path.dirname(path)
-        trash_dir = os.path.join(root, '.kant-trash')
-        os.makedirs(trash_dir, exist_ok=True)
-        base = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.path.basename(path)}"
-        target = os.path.join(trash_dir, base)
-        suffix = 1
-        while os.path.exists(target):
-            target = os.path.join(trash_dir, f'{base}-{suffix}')
-            suffix += 1
-        return target
-    # [FN CLOSED] _trash_target
-
-    # [FN] _move_to_trash — moves a file or folder into the project's reversible trash
-    # [FN OPEN] _move_to_trash
-    def _move_to_trash(self, path):
-        target = self._trash_target(path)
-        shutil.move(path, target)
-        return target
-    # [FN CLOSED] _move_to_trash
-
-    # [FN] _delete_tree_item — moves the right-clicked file or folder to .kant-trash
-    # [FN OPEN] _delete_tree_item
-    def _delete_tree_item(self, item, kind):
-        path = item.data(0, ROLE_PATH)
-        if not path:
-            return
-        is_dir = kind == 'dir'
-        reply = QMessageBox.question(
-            self, 'Elimina',
-            f'Eliminare {"la cartella" if is_dir else "il file"} "{os.path.basename(path)}"? '
-            'Sara spostato nel cestino locale .kant-trash.',
-        )
-        if reply != QMessageBox.Yes:
-            return
-        affected = [t for p, t in self.open_tabs.items() if p == path or (is_dir and p.startswith(path + os.sep))]
-        for t in affected:
-            idx = self.tabs.indexOf(t)
-            if idx != -1:
-                self._close_tab(idx, flush=False)
-        try:
-            trashed = self._move_to_trash(path)
-        except OSError as e:
-            QMessageBox.critical(self, 'Elimina', f'Impossibile eliminare: {e}')
-            return
-        self.terminal.write_info(f'\n# cestino KANT\nNel cestino: {trashed}\nPer ripristinare: {path}\n')
-        self._refresh_after_fs_change()
-    # [FN CLOSED] _delete_tree_item
 # [FN CLOSED] MainWindow

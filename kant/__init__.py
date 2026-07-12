@@ -1,0 +1,1 @@
+"""KANT IDE application package."""
