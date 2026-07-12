@@ -1,4 +1,15 @@
-"""MainWindow: wires the project tree, section views, toolbar, git, LSP, panes."""
+"""Application orchestration for KANT IDE.
+
+AI navigation:
+- UI construction and global shortcuts are near the top of ``MainWindow``.
+- Project/xref lifecycle precedes ``# ---- project tree``.
+- File tabs, open/save, diagnostics/LSP, section rendering, and workspace menus follow in that order.
+- Reusable widgets belong in ``widgets.py``; filesystem mutation belongs in ``workspace.py``;
+  deterministic scans/parsing belong in their service modules.
+
+This module owns coordination and cache invalidation, not the underlying parser, persistence,
+workspace safety, or graph algorithms.
+"""
 import os
 import re
 import subprocess
@@ -45,6 +56,9 @@ ROLE_UID = Qt.UserRole + 2
 ROLE_LINE = Qt.UserRole + 5
 ROLE_TEXT = Qt.UserRole + 6
 ROLE_KEY = Qt.UserRole + 7   # xref element key '<rel_path>::<uid>', on Incoming/Outgoing list items
+# document order (pre-order over tagged nodes, matching _nodes_in_order) of a 'section' tree item —
+# the reliable fallback when a legacy (no #id) file's uid doesn't survive _open_file's own reparse
+ROLE_ORDER = Qt.UserRole + 8
 
 
 # [FN CATEGORY] MainWindow — wires the project tree, the section view and the toolbar together;
@@ -1205,21 +1219,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         if self.map_dialog is not None and self.map_dialog.isVisible():
             self._schedule_xref_build()
 
-    # [FN CATEGORY] _update_io_tabs — looks the selected element up in the deterministic
-    # cross-reference graph (kant/xref.py) and fills two navigable lists: INCOMING = who references
-    # it and from which file (what comes in, and from where), OUTGOING = what it references and in
-    # which file (what goes out, and to where). Works for every tagged element — functions,
-    # constants, classes, vars — not just FN/TST, since the xref is name-based. Each row stores its
-    # target key so a double-click jumps there. Nothing is read from a comment, so it can never
-    # drift from the code.
-    # [FN] _update_io_tabs — refreshes the Incoming/Outgoing lists for the selected section
-    # [FN OPEN] _update_io_tabs
-    # [FN CATEGORY] _update_io_tabs — a module (or any element with nested KANT children) has its
-    # own direct incoming/outgoing plus whatever its children reference; the panel shows the union
-    # so selecting a module surfaces everything crossing its boundary, not just its own top-level
-    # code. References between two children of the same selected element are internal to it and
-    # excluded from both lists — they're not "coming from" or "going to" anywhere outside it.
-    # [FN] _update_io_tabs — fills the Incoming/Outgoing lists for the selected element
+    # [FN CATEGORY] _update_io_tabs — maps the selected node to kant/xref.py, then shows the
+    # selected subtree's boundary: INCOMING sources and OUTGOING targets outside that subtree.
+    # Internal child-to-child edges are excluded. Each row stores an xref key for navigation.
+    # The whole-file view uses its first top-level KANT node, so modules aggregate child edges too.
+    # [FN] _update_io_tabs — fills navigable Incoming/Outgoing boundary lists
     # [FN OPEN] _update_io_tabs
     def _update_io_tabs(self, uid):
         self._last_io_uid = uid
@@ -1267,7 +1271,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
     # [FN CLOSED] _update_io_tabs
 
 
-    # ---- project tree -------------------------------------------------
+    # ---- project tree (AI-NAV: project lifecycle and outline building) ---
 
     def _recent_folders(self):
         folders = self.settings.value('recentFolders', [])
@@ -1543,10 +1547,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                 )
             )
             # start from the top node's own children, not the node itself — it's already
-            # shown as this file item's own label, showing it again would duplicate it
-            self._build_outline_items(file_item, top_node, file_path)
+            # shown as this file item's own label, showing it again would duplicate it. top_node
+            # itself is document order 0 (_nodes_in_order's first result), so its children start at 1.
+            self._build_outline_items(file_item, top_node, file_path, [1])
 
-    def _build_outline_items(self, parent_item, node, path):
+    def _build_outline_items(self, parent_item, node, path, order_counter):
         for child in node.body:
             if not isinstance(child, Node):
                 continue
@@ -1554,8 +1559,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             item.setData(0, ROLE_KIND, 'section')
             item.setData(0, ROLE_UID, child.uid)
             item.setData(0, ROLE_PATH, path)
+            item.setData(0, ROLE_ORDER, order_counter[0])
+            order_counter[0] += 1
             self.tree.setItemWidget(item, 0, self._tree_label(child.tag, child.desc or child.name, detail=child.category_desc))
-            self._build_outline_items(item, child, path)
+            self._build_outline_items(item, child, path, order_counter)
 
     def _tree_label(self, tag, text, bold=False, git_status='', detail=''):
         color = theme.TAG_COLORS.get(tag, theme.TEXT)
@@ -1640,15 +1647,27 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             self._open_file(item.data(0, ROLE_PATH))
         elif kind == 'section':
             path = item.data(0, ROLE_PATH)
+            order = item.data(0, ROLE_ORDER)
             self._open_file(path)
             tab = self.open_tabs.get(path)
             if tab is None:
                 return
             uid = item.data(0, ROLE_UID)
-            self._render_view(tab, uid)
-            self._update_io_tabs(uid)
+            # a legacy (no #id) file mints a fresh uid on every reparse (_open_file always
+            # re-reads from disk rather than trusting the tree's last parse), so the tree item's
+            # uid can silently fail to match tab.tree — falling through to the whole-file view
+            # instead of isolating. Document order survives reparse and is the reliable fallback,
+            # the same pattern _navigate_to_element already uses for this exact problem.
+            node = self._find_node_by_uid(tab.tree, uid)
+            if node is None and order is not None:
+                nodes = self._nodes_in_order(tab.tree)
+                if order < len(nodes):
+                    node = nodes[order]
+            resolved_uid = node.uid if node is not None else uid
+            self._render_view(tab, resolved_uid)
+            self._update_io_tabs(resolved_uid)
 
-    # ---- tabs ------------------------------------------------------------
+    # ---- tabs (AI-NAV: active-tab ownership and close/flush lifecycle) ---
 
     @property
     def active_tab(self):
@@ -1725,7 +1744,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             self.syntax_label.setText(f'SAVE ERR: {message}')
             self.syntax_label.setStyleSheet(f'color:{theme.TAG_COLORS["TST"]}; font-weight:700;')
 
-    # ---- file open/save ------------------------------------------------
+    # ---- file open/save (AI-NAV: parse -> FileTab -> atomic save) --------
 
     # [FN CATEGORY] _open_file — opens a file as a new tab, or just switches to it if it's already
     # open (an already-open tab's live edits are never discarded/re-read from disk by re-clicking it)
@@ -2255,7 +2274,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self.terminal.run_debug_python(tab.path, lines, os.path.dirname(tab.path) or None)
     # [FN CLOSED] _debug_current_file
 
-    # ---- section view ---------------------------------------------------
+    # ---- section view (AI-NAV: Node/Run tree -> editable Qt widgets) -----
 
     def _render_view(self, tab, only_uid=None):
         tab.filter_uid = only_uid
@@ -2436,7 +2455,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         # expanding ancestors invalidates layout geometry; defer the scroll until Qt has relaid out
         QTimer.singleShot(0, lambda: tab.scroll_area.ensureWidgetVisible(widget, 50, 80))
 
-    # ---- new file / rename / delete (project tree context menu) ---------
+    # ---- workspace mutations (AI-NAV: UI delegates safety to WorkspaceMixin)
 
     def _dir_for_context(self, item, kind):
         if item is None:

@@ -1,4 +1,9 @@
-"""Pure project scanning, search, KANT-map, and validation operations."""
+"""Synchronous project scans with no Qt widgets or mutable application state.
+
+Search, replace discovery, KANT-map generation, validation, and local symbol lookup live here.
+Callers own threading, confirmation, display, and writes; ``MainWindow`` runs expensive scans in
+the background and ``WorkspaceMixin`` owns mutations.
+"""
 import os
 import re
 from pathlib import Path

@@ -1,4 +1,10 @@
-"""KANT parse/serialize model: Run, Node, parse_kant, serialize_kant."""
+"""KANT source model and its round-trip boundary.
+
+``parse_kant`` converts source into an ordered ``Node``/``Run`` tree; editors mutate only ``Run``
+text; ``serialize_kant`` reconstructs the file. Preserve ordering and raw marker lines unless the
+user explicitly edits metadata. Missing marker IDs are stamped during parsing, so callers that
+reparse legacy files must retain a document-order navigation fallback.
+"""
 import os
 import re
 import secrets

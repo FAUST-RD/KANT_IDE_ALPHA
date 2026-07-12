@@ -1,5 +1,16 @@
 KANT IDE changelog
 
+2026-07-13 (3)
+- Pin and eye icons in MAPPA are now roughly twice as large (40px normal, 60px enlarged for the drillable single pin), same drawn shapes, same proportional gap above the node.
+- Fixed: clicking the eye icon did nothing. It sits on top of its node with no item-data of its own, so the view's click handler read the click back as "clicked empty canvas" and cleared every pin — hiding the eye — before Qt ever delivered the press to the eye's own handler. The view now recognizes a click landed on the eye specifically and lets it through untouched.
+
+2026-07-13 (2)
+- Fixed the real cause of "clicking a KANT tree section doesn't isolate the coding panel": for a legacy file with no #id marker, every reparse (and _open_file always reparses from disk) mints a fresh random uid, so the tree item's uid — captured at the last tree rebuild — could silently stop matching the freshly-opened tab, falling through to the whole-file view instead of the clicked element. Tree sections now carry their document order too and fall back to it when the uid lookup misses, the same recovery _navigate_to_element already used for this exact problem.
+
+2026-07-13
+- MAPPA drill-down redesigned per feedback: the drilled element is no longer a node in its own graph. It's fully detached and rendered as a fixed title card pinned to the view's top-right corner at a constant on-screen size (immune to zoom/pan) — the graph itself now shows only its direct children and their mutual references, nothing else.
+- Added a layout direction toggle to the MAPPA toolbar: code flow reads left-to-right by default, click to flip the whole map (module rank and intra-cluster call-depth ranking) to right-to-left.
+
 2026-07-12 (4)
 - MAPPA: a node whose internal sub-elements have real cross-references between them (2+ children, at least one calling another) now shows an enlarged pin badge plus a drawn eye icon when it's the only pinned node; clicking the eye enters an internal-only "drill-down" view of just that element's own hierarchy, anchored top-left, with a way back to the full map.
 - MAPPA: pin and eye badges are now drawn shapes (filled circle + number, drawn eye) instead of emoji glyphs, bigger and with a well-defined circular click/hover area, positioned with a real gap above the node instead of touching its edge.

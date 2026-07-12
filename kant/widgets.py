@@ -1,4 +1,15 @@
-"""Qt widgets: editor, terminal, Claude pane, sections, tree, title bar, tabs."""
+"""Reusable Qt components, ordered by feature rather than application flow.
+
+AI navigation:
+- editor/terminal primitives: ``KantHighlighter`` through ``TerminalPane``;
+- agent process and review UI: ``ClaudePane`` and ``_AiReviewCard``;
+- KANT section/tree chrome: section widgets, ``ProjectTree``, and ``TitleBar``;
+- file state: ``FileTab``;
+- MAPPA: layout helpers, ``XrefMapView``, then ``XrefMapDialog``.
+
+Application-wide coordination stays in ``mainwindow.py``. Filesystem transactions and rollback
+stay in ``workspace.py``; widgets expose signals/callbacks instead of importing ``MainWindow``.
+"""
 import json
 import hashlib
 import locale
@@ -1686,8 +1697,10 @@ class FileTab(QWidget):
 # follow live. Selecting still dims non-neighbours; wheel zooms and background drag pans the scene.
 # [FN] XrefMapView — interactive graph view of the KANT cross-reference map
 # [FN OPEN] XrefMapView
-def _module_flow_seeds(elements):
-    """Place file clusters left-to-right along the condensed directed dependency graph."""
+def _module_flow_seeds(elements, rtl=False):
+    """Place file clusters left-to-right (or right-to-left when rtl) along the condensed directed
+    dependency graph. Named `rtl`, not `reverse`, to avoid shadowing the unrelated reverse-adjacency
+    dict already local to this function."""
     files = sorted({element.file for element in elements.values()})
     adjacency = {name: set() for name in files}
     flow_weights = {name: {} for name in files}
@@ -1776,17 +1789,19 @@ def _module_flow_seeds(elements):
         cursor = -total_height / 2
         for name in names:
             center_y = cursor + radii[name]
-            center_x = level * layer_gap
-            _seed_file_cluster(by_file[name], center_x, center_y, radii[name], seeds)
+            center_x = level * layer_gap * (-1 if rtl else 1)
+            _seed_file_cluster(by_file[name], center_x, center_y, radii[name], seeds, rtl)
             cursor += radii[name] * 2 + 180
     return seeds
 
 
-def _seed_file_cluster(elements_in_file, center_x, center_y, radius, seeds):
-    """Seed one file's elements around (center_x, center_y), ranking left-to-right by
-    intra-file call depth (source before target) instead of an arbitrary spiral, so the
-    starting position already reads as logical flow before the force simulation even runs —
-    the simulation's own seed-pull is strong enough that a direction-blind seed never recovers."""
+def _seed_file_cluster(elements_in_file, center_x, center_y, radius, seeds, rtl=False):
+    """Seed one file's elements around (center_x, center_y), ranking left-to-right (or
+    right-to-left when rtl) by intra-file call depth (source before target) instead of an
+    arbitrary spiral, so the starting position already reads as logical flow before the force
+    simulation even runs — the simulation's own seed-pull is strong enough that a direction-blind
+    seed never recovers. Shared by the normal multi-file map and MAPPA's drill-down (there, the
+    "file" is really the drilled element's own children, ranked by their mutual references)."""
     keys = {e.key for e in elements_in_file}
     local_targets = {e.key: [t for t in e.outgoing if t in keys and t != e.key] for e in elements_in_file}
     rank = {e.key: 0 for e in elements_in_file}
@@ -1806,7 +1821,8 @@ def _seed_file_cluster(elements_in_file, center_x, center_y, radius, seeds):
     span = radius * 1.6
     step = span / (max_rank + 1) if max_rank else 0.0
     for level, group in groups.items():
-        x = center_x - span / 2 + level * step
+        offset = level * step
+        x = center_x + span / 2 - offset if rtl else center_x - span / 2 + offset
         group_height = len(group) * 60.0
         y = center_y - group_height / 2 + 30.0
         for element in group:
@@ -1853,7 +1869,7 @@ def _element_size(el, max_degree, elements=None, active_edge_tags=None):
     return width, height
 
 
-def _force_layout_positions(elements, fixed=None, seed=None, active_edge_tags=None, use_parent_attraction=True):
+def _force_layout_positions(elements, fixed=None, seed=None, active_edge_tags=None, use_parent_attraction=True, rtl=False):
     """Directed module seeding plus local attraction/repulsion for readable organic spacing.
     `fixed` positions are pinned and never moved by the simulation (persisted/dragged nodes).
     `seed` positions are only a starting point the simulation is free to adjust — used to warm-start
@@ -1886,7 +1902,7 @@ def _force_layout_positions(elements, fixed=None, seed=None, active_edge_tags=No
     count = len(keys)
     if not count:
         return {}
-    seeds = _module_flow_seeds(elements)  # already centers
+    seeds = _module_flow_seeds(elements, rtl)  # already centers
     radius = max(320.0, 140.0 * math.sqrt(count))
     positions = {
         key: list(fixed[key] if key in fixed else seed.get(key, seeds[key]))
@@ -2077,7 +2093,7 @@ class PinBadgeItem(QGraphicsItem):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._number = 1
-        self._diameter = 20.0
+        self._diameter = 40.0
         self.setAcceptedMouseButtons(Qt.NoButton)  # decorative only; the node itself owns pin-toggling
 
     def set_appearance(self, number, diameter):
@@ -2113,7 +2129,7 @@ class EyeBadgeItem(QGraphicsItem):
         super().__init__(parent)
         self.key = key
         self._clicked = clicked
-        self._diameter = 20.0
+        self._diameter = 40.0
         self.setCursor(Qt.PointingHandCursor)
         self.setZValue(4)
         self.setAcceptedMouseButtons(Qt.LeftButton)
@@ -2209,6 +2225,7 @@ class XrefMapView(QGraphicsView):
         self._containment_edges = []  # (parent_key, child_key, path_item) — neutral, arrowless hierarchy lines
         self._active_edge_tags = None  # None = no filter yet (show all); set by the dialog's edge-tag row
         self._show_containment = True  # whether the neutral "belonging" connections draw/pull at all
+        self._rtl = False  # False = code flow reads left-to-right (default); True = right-to-left
         self._node_items = {}     # key -> rect item
         self._label_items = {}    # key -> text item
         self._pin_badges = {}     # key -> small "📌N" label shown above a pinned node
@@ -2287,6 +2304,7 @@ class XrefMapView(QGraphicsView):
         positions = _force_layout_positions(
             elements, saved_positions,
             active_edge_tags=self._active_edge_tags, use_parent_attraction=self._show_containment,
+            rtl=self._rtl,
         )
         self._laying_out = True
         for el in elements.values():
@@ -2327,13 +2345,13 @@ class XrefMapView(QGraphicsView):
                 label.setToolTip(tooltip)
                 label.setAcceptedMouseButtons(Qt.NoButton)
             pin_badge = PinBadgeItem(rect)
-            pin_badge.set_appearance(1, 20.0)
-            pin_badge.setPos(2, -27)  # a real gap above the node, not touching its top edge
+            pin_badge.set_appearance(1, 40.0)
+            pin_badge.setPos(2, -47)  # a real gap above the node, not touching its top edge
             pin_badge.setZValue(3)
             pin_badge.setVisible(False)
             eye_badge = EyeBadgeItem(el.key, lambda key: self.drillRequested.emit(key), rect)
-            eye_badge.set_diameter(20.0)
-            eye_badge.setPos(2, -27)
+            eye_badge.set_diameter(40.0)
+            eye_badge.setPos(2, -47)
             eye_badge.setZValue(4)
             eye_badge.setVisible(False)
             scene.addItem(rect)
@@ -2460,7 +2478,10 @@ class XrefMapView(QGraphicsView):
     # [FN OPEN] relayout_to
     def relayout_to(self, elements, seed_positions):
         old_on_screen = {key: item.pos() for key, item in self._node_items.items()}
-        new_positions = _force_layout_positions(elements, seed=seed_positions)
+        new_positions = _force_layout_positions(
+            elements, seed=seed_positions,
+            active_edge_tags=self._active_edge_tags, use_parent_attraction=self._show_containment, rtl=self._rtl,
+        )
         self.set_data(elements, new_positions)
         self._laying_out = True
         for key, pos in old_on_screen.items():
@@ -2560,6 +2581,13 @@ class XrefMapView(QGraphicsView):
         return item.data(0) if item is not None else None
 
     def mousePressEvent(self, event):
+        # the eye badge sits on top of its node (higher Z) with no item-data of its own, so
+        # itemAt() here would return it and _key_at would read back None — read as "clicked empty
+        # canvas" and clear every pin before Qt ever delivers the press to the eye's own handler.
+        # Recognize it explicitly and let the normal event dispatch below reach it untouched.
+        if isinstance(self.itemAt(event.position().toPoint()), EyeBadgeItem):
+            super().mousePressEvent(event)
+            return
         key = self._key_at(event.position().toPoint())
         if key is not None:
             pinned = list(self._pinned)
@@ -2600,6 +2628,11 @@ class XrefMapView(QGraphicsView):
         at all. Takes effect on the next set_data(), not retroactively."""
         self._show_containment = show
 
+    def set_direction(self, rtl):
+        """False (default) = code flow reads left-to-right; True = right-to-left. Takes effect
+        on the next set_data()/relayout_to(), not retroactively."""
+        self._rtl = rtl
+
     def set_drillable(self, key):
         """Which key (if any) is eligible for the eye icon right now — the dialog decides
         eligibility (needs the full, undisplayed graph to check for internal cross-references)
@@ -2637,7 +2670,7 @@ class XrefMapView(QGraphicsView):
             if badge is not None:
                 if k in self._pinned:
                     drillable = len(self._pinned) == 1 and k == self._drillable_key
-                    diameter = 30.0 if drillable else 20.0
+                    diameter = 60.0 if drillable else 40.0
                     badge.set_appearance(self._pinned.index(k) + 1, diameter)
                     badge.setPos(2, -diameter - 7)
                     badge.setVisible(True)
@@ -2781,6 +2814,7 @@ class XrefMapDialog(QDialog):
         self._active_tags = set(self.TAG_ORDER) - {'TST'}   # tests hidden by default
         self._active_edge_tags = set(self.TAG_ORDER)     # which tags' reference edges are drawn at all
         self._show_containment = True    # the neutral "belonging" connections, toggled alongside the tags
+        self._rtl = False    # False = code flow reads left-to-right (default); True = right-to-left
         self._expanded = set()                          # files shown expanded; set_graph() fills this with every file on each open
         self._focus_file = None
         self._isolate = False
@@ -2807,6 +2841,7 @@ class XrefMapDialog(QDialog):
         self.view = XrefMapView()
         self.view.set_active_edge_tags(self._active_edge_tags)
         self.view.set_show_containment(self._show_containment)
+        self.view.set_direction(self._rtl)
         self.view.nodesPinned.connect(self._on_nodes_pinned)
         self.view.nodeActivated.connect(self._on_node_activated)
         self.view.nodeMoved.connect(self._on_node_moved)
@@ -2823,6 +2858,24 @@ class XrefMapDialog(QDialog):
         outer.addWidget(self.view, 1)
         outer.addWidget(self._build_footer())
         self.edge_popup = EdgeFlowPopup(self)
+
+        # drill mode's detached "title card": a widget overlay (not a scene item, so it never
+        # scales with zoom) pinned to the view's top-right corner at a constant on-screen size
+        self.drill_title_card = QFrame(self)
+        self.drill_title_card.setObjectName('drillTitleCard')
+        drill_card_layout = QVBoxLayout(self.drill_title_card)
+        drill_card_layout.setContentsMargins(16, 10, 16, 12)
+        drill_card_layout.setSpacing(2)
+        self.drill_title_tag = QLabel('')
+        self.drill_title_tag.setFont(QFont('Consolas', 10, QFont.DemiBold))
+        self.drill_title_name = QLabel('')
+        self.drill_title_name.setFont(QFont('Consolas', 20, QFont.Bold))
+        self.drill_title_name.setWordWrap(True)
+        drill_card_layout.addWidget(self.drill_title_tag)
+        drill_card_layout.addWidget(self.drill_title_name)
+        self.drill_title_card.setMaximumWidth(320)
+        self.drill_title_card.hide()
+        self.resized.connect(self._position_drill_title_card)
 
     def _build_header(self):
         bar = QWidget()
@@ -2890,6 +2943,14 @@ class XrefMapDialog(QDialog):
         self.heatmap_btn.setToolTip('Colora i nodi per connettività (caldo = molti riferimenti) invece che per tag')
         self.heatmap_btn.toggled.connect(self._on_heatmap_toggle)
         top.addWidget(self.heatmap_btn)
+
+        # direction of the code flow (module rank + intra-cluster call depth): left-to-right by
+        # default, this button flips the whole layout to right-to-left
+        self.direction_btn = QPushButton('Direzione: Sx → Dx')
+        self.direction_btn.setCheckable(True)
+        self.direction_btn.setToolTip('Inverte la direzione del flusso logico del codice nella mappa')
+        self.direction_btn.toggled.connect(self._on_direction_toggle)
+        top.addWidget(self.direction_btn)
 
         top.addStretch(1)
         zoom_out = QPushButton('−')
@@ -2986,7 +3047,7 @@ class XrefMapDialog(QDialog):
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
             f'border-radius:6px; padding:4px 8px;'
         )
-        for b in (self.isolate_btn, self.heatmap_btn, self.expand_all_btn, self.collapse_all_btn, self.relayout_btn):
+        for b in (self.isolate_btn, self.heatmap_btn, self.direction_btn, self.expand_all_btn, self.collapse_all_btn, self.relayout_btn):
             b.setStyleSheet(theme.BUTTON_STYLE)
         for tag, btn in self.tag_buttons.items():
             color = theme.TAG_COLORS.get(tag, theme.DIM)
@@ -3016,6 +3077,11 @@ class XrefMapDialog(QDialog):
         )
         self.view.apply_style()
         self.edge_popup.apply_style()
+        self.drill_title_card.setStyleSheet(
+            f'#drillTitleCard {{ background:{theme.PANEL}; border:2px solid {theme.ACCENT}; border-radius:10px; }}'
+        )
+        self.drill_title_tag.setStyleSheet(f'color:{theme.ACCENT}; letter-spacing:1px; border:none;')
+        self.drill_title_name.setStyleSheet(f'color:{theme.TEXT}; border:none;')
 
     # ---- frameless header drag ------------------------------------------
     def mousePressEvent(self, event):
@@ -3309,37 +3375,32 @@ class XrefMapDialog(QDialog):
         return disp
     # [FN CLOSED] _display_elements
 
-    # [FN CATEGORY] _drill_display — the internal-only view for one element: itself plus every
-    # descendant at any depth, with only the reference edges where BOTH ends fall inside that set
-    # — no outside callers/callees, no sibling clusters, just "what goes inside what" for this one
-    # element. Node-visibility/edge-tag/isolate filters don't apply here; drilling in is its own lens.
-    # [FN] _drill_display — builds the filtered node set for drill-down mode
+    # [FN CATEGORY] _drill_display — the internal-only view for one element: ONLY its direct
+    # children, with only the reference edges where BOTH ends are children (no outside callers/
+    # callees, no sibling clusters, no grandchildren) — just the geography of how the children
+    # relate to each other. The parent itself is deliberately excluded from this set: it's not a
+    # node in this graph at all, it's rendered as a fixed title card instead (see _enter_drill_mode).
+    # Node-visibility/edge-tag/isolate filters don't apply here; drilling in is its own lens.
+    # [FN] _drill_display — builds the children-only node set for drill-down mode
     # [FN OPEN] _drill_display
     def _drill_display(self):
         if self._drill_key not in self._elements:
             return {}
-        keep = {self._drill_key}
-        changed = True
-        while changed:
-            changed = False
-            for key, element in self._elements.items():
-                if key not in keep and element.parent in keep:
-                    keep.add(key)
-                    changed = True
+        children = {key for key, element in self._elements.items() if element.parent == self._drill_key}
         disp = {}
-        for key in keep:
+        for key in children:
             e = self._elements[key]
             node = XrefElement(
                 key=e.key, uid=e.uid, tag=e.tag, name=e.name, desc=e.desc,
                 file=e.file, order=e.order, category_desc=e.category_desc,
-                parent=e.parent if e.parent in keep else None,
+                parent=None,  # the real parent is excluded from this graph entirely
             )
             node.outgoing_detail = []
             node.incoming_detail = []
             disp[key] = node
-        for key in keep:
+        for key in children:
             for target in self._elements[key].outgoing:
-                if target in keep and target != key:
+                if target in children and target != key:
                     if target not in disp[key].outgoing:
                         disp[key].outgoing.append(target)
                     if key not in disp[target].incoming:
@@ -3350,9 +3411,10 @@ class XrefMapDialog(QDialog):
     # [FN CLOSED] _drill_display
 
     # [FN CATEGORY] _enter_drill_mode / _exit_drill_mode — switches the map between the full
-    # project graph and one element's internal-only view. The drilled element is force-laid-out
-    # like any other node, then explicitly moved to the top-left corner as the fixed reference
-    # point the request asked for, reusing the same move+redraw path node dragging already uses.
+    # project graph and one element's internal-only view. The drilled element is detached from
+    # the graph entirely: it becomes a fixed title card (drill_title_card) pinned to the
+    # viewport's top-right corner at a constant on-screen size, independent of zoom/pan — a
+    # widget overlay, not a scene item, since scene items scale with the view's transform.
     # [FN] _enter_drill_mode / _exit_drill_mode
     # [FN OPEN] drill mode
     def _enter_drill_mode(self, key):
@@ -3360,20 +3422,32 @@ class XrefMapDialog(QDialog):
             return
         self._drill_key = key
         self.view.set_pinned([])
+        element = self._elements[key]
+        self.drill_title_tag.setText(f'[{element.tag}]')
+        self.drill_title_name.setText(element.desc or element.name)
+        self.drill_title_card.show()
+        self._position_drill_title_card()
         self.title_label.setText(f'Mappa KANT — dentro {self._element_label(key)}')
-        self._refresh(relayout=True)
-        if key in self.view._node_items:
-            self.view._node_items[key].setPos(0, 0)
-            self.view._redraw_edges()
+        self._refresh(relayout=True, fit=True)
         self.drill_back_btn.show()
-        self.view.fit()
 
     def _exit_drill_mode(self):
         self._drill_key = None
         self.drill_back_btn.hide()
+        self.drill_title_card.hide()
         self.title_label.setText(f'Mappa KANT — {self._project_name}' if self._project_name else 'Mappa KANT')
         self._refresh(fit=True, relayout=True)
     # [FN CLOSED] drill mode
+
+    def _position_drill_title_card(self):
+        if not self.drill_title_card.isVisible():
+            return
+        self.drill_title_card.adjustSize()
+        view_geo = self.view.geometry()
+        x = view_geo.right() - self.drill_title_card.width() - 20
+        y = view_geo.top() + 20
+        self.drill_title_card.move(x, y)
+        self.drill_title_card.raise_()
 
     # [FN CATEGORY] _add_common_origin_anchors — a filter/collapse can remove an element's own
     # parent from the displayed set while leaving several of its siblings visible; without this
@@ -3466,6 +3540,12 @@ class XrefMapDialog(QDialog):
     def _on_containment_toggle(self, checked):
         self._show_containment = checked
         self.view.set_show_containment(checked)
+        self._refresh(relayout=True)
+
+    def _on_direction_toggle(self, checked):
+        self._rtl = checked
+        self.direction_btn.setText('Direzione: Dx → Sx' if checked else 'Direzione: Sx → Dx')
+        self.view.set_direction(checked)
         self._refresh(relayout=True)
 
     def _on_file_filter(self, _index):

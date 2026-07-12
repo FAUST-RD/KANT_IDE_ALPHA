@@ -12,11 +12,11 @@ from PySide6.QtCore import Qt, QSettings
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QGraphicsItem, QListWidget, QToolButton, QTreeWidgetItem
 
-from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH
+from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID
 from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
 from kant.xref import build_xref, XrefElement
-from kant.widgets import FileTab, XrefMapDialog, XrefMapView, _AiReviewCard, _agent_command, _force_layout_positions
+from kant.widgets import FileTab, XrefMapDialog, XrefMapView, _AiReviewCard, _agent_command, _force_layout_positions, CodeEdit
 from kant.workspace import (
     apply_ai_review, build_ai_review, create_snapshot, discard_snapshot, rollback_snapshot,
     render_review_text, safe_project_path,
@@ -195,6 +195,39 @@ def main():
         plain.write_text('def helper():\n    return helper()\n', encoding='utf-8')
         assert tree_window._local_definition_locations('helper')[0][2] == 1
         assert len(tree_window._local_reference_locations('helper')) == 2
+
+        # legacy (no #id) file: parse_kant mints a fresh random uid every reparse, and _open_file
+        # always reparses from disk — so a tree item's uid (captured at the last tree rebuild) can
+        # silently stop matching tab.tree. _on_tree_item_clicked must fall back to document order
+        # (ROLE_ORDER) to still isolate the right section, instead of falling through to the
+        # whole-file view.
+        legacy = source_dir / 'legacy.py'
+        legacy.write_text('\n'.join([
+            '# [MOD OPEN] legacy.py',
+            '# [FN OPEN] alpha', 'def alpha(): pass', '# [FN CLOSED] alpha',
+            '# [FN OPEN] beta', 'def beta(): pass', '# [FN CLOSED] beta',
+            '# [MOD CLOSED] legacy.py',
+        ]), encoding='utf-8')
+        tree_window.tree.clear()
+        tree_window._build_project_tree(tree_window.tree.invisibleRootItem(), str(root))
+        beta_item = None
+        it = tree_window.tree.invisibleRootItem()
+        stack = [it.child(i) for i in range(it.childCount())]
+        while stack:
+            candidate = stack.pop()
+            if candidate.data(0, ROLE_KIND) == 'section' and 'beta' in tree_window.tree.itemWidget(candidate, 0).text():
+                beta_item = candidate
+            for i in range(candidate.childCount()):
+                stack.append(candidate.child(i))
+        assert beta_item is not None and beta_item.data(0, ROLE_ORDER) is not None
+        stale_uid = beta_item.data(0, ROLE_UID)
+        tree_window._on_tree_item_clicked(beta_item, 0)
+        legacy_tab = tree_window.open_tabs[str(legacy)]
+        assert legacy_tab.filter_uid is not None and legacy_tab.filter_uid != stale_uid  # reparse minted a new uid
+        assert legacy_tab.view_layout.count() == 1
+        isolated_widget = legacy_tab.view_layout.itemAt(0).widget()
+        isolated_codes = [c.toPlainText().strip() for c in isolated_widget.findChildren(CodeEdit)]
+        assert isolated_codes == ['def beta(): pass']  # not alpha too — the whole-file fallback would show both
         tree_window.close()
 
         tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
@@ -397,16 +430,35 @@ def main():
         app.processEvents()
         assert drill_dialog._is_drillable('cls') is True
         assert drill_dialog._is_drillable('lone') is False
-        drill_dialog._enter_drill_mode('cls')
+        # real clicks end-to-end, not a direct _enter_drill_mode() call: the eye sits on top of its
+        # node with no item-data of its own, so a naive itemAt()-based click handler reads it back
+        # as "clicked empty canvas" and wipes the pin before the eye ever sees the press — exercise
+        # the actual pin-then-click-eye path to catch that regression.
+        cls_node = drill_dialog.view._node_items['cls']
+        cls_viewport_pos = drill_dialog.view.mapFromScene(cls_node.sceneBoundingRect().center())
+        QTest.mouseClick(drill_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, cls_viewport_pos)
         app.processEvents()
-        assert set(drill_dialog._display) == {'cls', 'm1', 'm2'}  # lone excluded — not a descendant
+        eye = drill_dialog.view._eye_badges['cls']
+        assert eye.isVisible()
+        eye_viewport_pos = drill_dialog.view.mapFromScene(eye.mapToScene(eye.boundingRect().center()))
+        QTest.mouseClick(drill_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, eye_viewport_pos)
+        app.processEvents()
+        assert drill_dialog._drill_key == 'cls'
+        # the parent ('cls') is detached from the graph entirely — only its children remain,
+        # 'lone' stays excluded (not a child of 'cls')
+        assert set(drill_dialog._display) == {'m1', 'm2'}
         assert drill_dialog._display['m1'].outgoing == ['m2']
-        assert drill_dialog.view._node_items['cls'].pos().x() == 0 and drill_dialog.view._node_items['cls'].pos().y() == 0
+        assert 'cls' not in drill_dialog.view._node_items
+        # the parent becomes the fixed title card instead of a graph node
+        assert drill_dialog.drill_title_card.isVisible()
+        assert drill_dialog.drill_title_tag.text() == '[CLS]'
+        assert drill_dialog.drill_title_name.text() == 'classe'
         assert drill_dialog.drill_back_btn.isVisible()
         drill_dialog._exit_drill_mode()
         app.processEvents()
         assert set(drill_dialog._display) == {'cls', 'm1', 'm2', 'lone'}
         assert not drill_dialog.drill_back_btn.isVisible()
+        assert not drill_dialog.drill_title_card.isVisible()
         drill_dialog.close()
         QSettings('KANT', 'KANT Editor').remove(drill_dialog._position_key)
 

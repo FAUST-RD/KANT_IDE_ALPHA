@@ -1,4 +1,10 @@
-"""Workspace safety helpers for AI snapshots, rollback, and restore paths."""
+"""Filesystem trust boundary and AI-change transaction lifecycle.
+
+AI navigation: pure snapshot/review/apply helpers come first; ``WorkspaceMixin`` then owns file
+watchers, conflict handling, create/rename/trash, and rollback orchestration for ``MainWindow``.
+All caller-provided relative paths must pass ``safe_project_path`` before mutation. Symlinks are
+excluded from snapshots and removed after agent runs to prevent writes escaping the project root.
+"""
 import difflib
 import os
 import shutil

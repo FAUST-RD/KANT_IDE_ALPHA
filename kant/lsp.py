@@ -1,4 +1,8 @@
-"""LSP client and per-language server configuration."""
+"""Minimal JSON-RPC/LSP process transport and per-language server lookup.
+
+``LspClient`` owns process framing, document versions, pending requests, and diagnostics signals.
+UI actions, local fallbacks, and workspace-edit application remain in ``MainWindow``.
+"""
 import json
 import os
 import shutil
