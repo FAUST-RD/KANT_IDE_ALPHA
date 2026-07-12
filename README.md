@@ -1,70 +1,69 @@
 # KANT IDE
 
-> **Code already has a structure. KANT makes it visible.**
+> **A cognitive interface for code.**
 
-KANT IDE is a desktop editor that turns structured comments into an explorable map of your codebase. Open a project and move between modules, classes, functions, constants, and tests without losing sight of how they fit together.
+KANT IDE is a desktop environment for understanding, directing, and reviewing software—not only editing its text.
 
-It works on ordinary source files and stays out of your runtime:
+It adds explicit structure to ordinary source files and turns that structure into a navigable outline, focused editing views, dependency lenses, and an interactive project map.
 
 ```text
-structured comments  ->  navigable outline  ->  focused editor  ->  project map
+source code  ->  explicit structure  ->  cognitive interface  ->  informed action
 ```
 
 No custom file format. No generated runtime code. No lock-in.
 
-## Why KANT?
+## Why a cognitive interface?
 
-Large files are easy to write and hard to understand. Traditional file trees show where code is stored, but not what is inside each file or how those pieces relate.
+For most of software history, code was written manually, line by line. That work was slow, but it continuously produced knowledge. By writing, reading, debugging, and revising each part, developers formed a mental model of the system almost as a by-product of the labor itself.
 
-KANT adds a small amount of explicit structure where it matters. The IDE uses it to provide:
+Generative tools change that relationship. We can now create and transform code at a scale that was previously impossible for one person. We work at a higher level of abstraction: describing outcomes, delegating implementation, and reviewing results instead of micromanaging every line.
 
-| Need | KANT IDE |
+The magnitude of our actions has increased, while the manual contact that once created understanding has decreased. Production and comprehension can drift apart.
+
+The answer is not to force people back into line-by-line supervision of everything a machine produces. That would discard the leverage of the new tools. Instead, we need new ways to know a codebase from this higher level of abstraction.
+
+This changes what an IDE needs to be.
+
+An IDE can no longer be only a better surface for manipulating text. It must become a **cognitive interface**: a place that exposes structure, responsibilities, boundaries, dependencies, and change in forms that help a person build and maintain an accurate mental model—even when they did not manually author every line.
+
+As our tools expand the reach of our actions, our development environment must expand our **cognitive reach** with them.
+
+## What KANT makes visible
+
+KANT gives both people and tools stable coordinates inside a codebase.
+
+| Cognitive need | KANT IDE |
 | --- | --- |
-| Understand a large file | Browse its named sections instead of scrolling |
-| Work on one responsibility | Open only the relevant function, class, or block |
-| Follow dependencies | Inspect deterministic Incoming and Outgoing references |
-| See the bigger picture | Explore the codebase in the interactive **MAPPA** view |
-| Let an AI edit safely | Review file and hunk changes, then apply or roll back |
+| See what a system contains | A project outline organized by modules, classes, functions, constants, types, and tests |
+| Focus on one responsibility | Section-level editing without losing the surrounding hierarchy |
+| Understand relationships | Deterministic Incoming and Outgoing references |
+| Move between detail and overview | An interactive **MAPPA** with filtering, clustering, and drill-down |
+| Direct powerful tools | Explicit boundaries and descriptions that provide usable context |
+| Verify delegated work | AI snapshots, file/hunk review, atomic application, and rollback |
 
-## Highlights
+The goal is not to make AI produce as much code as possible. It is to channel what these tools produce into forms that remain navigable, reviewable, and comprehensible to people.
 
-### Navigate by meaning
+## The KANT convention
 
-The **Codice** tree is built from KANT markers such as `[FN OPEN]` and `[CLS CLOSED]`. Switch back to **File** whenever you want a conventional folder view.
-
-### Edit without losing context
-
-Open a single tagged section in a focused editor. Changes update the original source file through atomic autosaves, with undo/redo and external-change detection.
-
-### Explore relationships
-
-Incoming/Outgoing panels show what crosses a section's boundary. **MAPPA** turns the same deterministic reference graph into a filterable, draggable view with module clustering and drill-down.
-
-### Bring your existing tools
-
-KANT IDE includes Git actions, a terminal, lightweight syntax checks, optional LSP integration, and Python debugging. Claude Code and Codex can run inside the IDE with permission prompts, snapshots, change review, and rollback.
-
-## How the KANT convention works
-
-KANT describes the structure of a codebase with ordinary comments. The source remains valid for its language and continues to work with normal editors, compilers, formatters, and version control.
+KANT describes software structure with ordinary comments. Tagged files remain valid source code and continue to work with normal editors, compilers, formatters, and version control.
 
 A section can use four markers:
 
 ```text
 [TAG CATEGORY] detailed purpose or architectural context
-[TAG] short description shown in the IDE
+[TAG] short human-readable description
 [TAG OPEN #stable-id] exact-name
 ...section source code...
 [TAG CLOSED #stable-id] exact-name
 ```
 
 - `TAG` identifies the kind of element. Common tags are `MOD` (module), `CLS` (class), `FN` (function), `TYP` (type), `CST` (constant), `VAR` (variable), `CFG` (configuration), and `TST` (test).
-- `CATEGORY` is optional long-form context. It is useful for explaining responsibility, assumptions, or relationships that are not obvious from the code.
-- `[TAG]` is an optional concise description used as the human-readable label in the project tree and map.
-- `OPEN` starts the section and `CLOSED` ends it. Their tag, name, and optional ID must match.
-- `#stable-id` lets the IDE recognize the same section across reparses and name edits. KANT IDE automatically adds an ID when an older marker does not have one.
+- `CATEGORY` records responsibility, assumptions, or architectural context that is not obvious from the implementation.
+- `[TAG]` supplies the concise label shown in the project tree and map.
+- `OPEN` and `CLOSED` define the source span. Their tag, name, and optional ID must match.
+- `#stable-id` preserves the identity of a section across reparses and name edits. KANT IDE adds one when it encounters an older marker without an ID.
 
-Sections can be nested. For example, functions can live inside a class and classes inside a module. They must close in reverse order: the most recently opened section is always closed first.
+Sections can be nested: functions inside classes, classes inside modules, and so on. They close in reverse order, so the most recently opened section always closes first.
 
 ```python
 # [MOD] User service
@@ -85,9 +84,35 @@ class UserService:
 # [MOD CLOSED #users-module] users.py
 ```
 
-Marker lines may use the host language's normal comment syntax, including `#`, `//`, `--`, `;`, `/* ... */`, and `<!-- ... -->`. KANT IDE preserves marker text and all unedited source while converting the marked regions into its navigable outline.
+Marker lines can use the host language's normal comment syntax, including `#`, `//`, `--`, `;`, `/* ... */`, and `<!-- ... -->`. KANT IDE preserves marker text and all unedited source while turning marked regions into its navigable model.
 
-## Installation
+## One structure, several ways of knowing
+
+The same KANT structure supports multiple views of the codebase:
+
+### Outline
+
+The **Codice** tree shows conceptual elements and their hierarchy. Switch to **File** whenever the physical folder layout is the more useful perspective.
+
+### Focus
+
+Open one tagged section as an editable unit. The IDE updates the original source through atomic autosaves, with undo/redo and external-change detection.
+
+### Relationships
+
+The **INCOMING** and **OUTGOING** panels show references crossing the selected section's boundary. Their graph is produced by deterministic source analysis rather than AI output.
+
+### Map
+
+**MAPPA** turns the project graph into a spatial overview. Filter it, rearrange it, change flow direction, isolate elements, or drill into the direct children of a component.
+
+### Delegation and review
+
+Claude Code and Codex can run inside the IDE. Permission prompts, project snapshots, file/hunk review, atomic application, and rollback keep delegated work visible and reversible.
+
+KANT IDE also includes Git actions, a terminal, lightweight syntax checks, optional language-server integration, Python debugging, and day/night themes.
+
+## Quick start
 
 KANT IDE requires Python 3 and PySide6.
 
@@ -100,21 +125,22 @@ python kant_editor.py
 
 On Linux or macOS, `./install.sh` installs the Python dependency and prints the launch command.
 
-Language-server features are enabled only when a compatible server is already available on `PATH`. The editor itself works without one.
+Language-server features activate only when a compatible server is already available on `PATH`. The editor works without one.
 
 ## A first five-minute tour
 
 1. Launch `kant_editor.py` and open a project folder.
-2. Open any source file. Untagged files remain editable as normal.
-3. Add `OPEN` and `CLOSED` markers around one useful function or class.
-4. Select **Codice** and open the new section directly from the project tree.
-5. Use **INCOMING**, **OUTGOING**, and **MAPPA** to explore its relationships.
+2. Open any source file; untagged files remain editable as normal.
+3. Add matching `OPEN` and `CLOSED` markers around one useful function or class.
+4. Select **Codice** and open that section directly from the project tree.
+5. Add a short `[TAG]` description and `CATEGORY` context.
+6. Use **INCOMING**, **OUTGOING**, and **MAPPA** to move from local code to system-level understanding.
 
-Start small: KANT does not require tagging an entire project before it becomes useful. The legacy `index.html` prototype is kept for reference; current development targets the Python application.
+Start small. A project does not need to be fully tagged before KANT becomes useful.
 
 ## Development
 
-- [`PROJECT_MAP.md`](PROJECT_MAP.md) explains where each feature lives and how the main flows connect.
+- [`PROJECT_MAP.md`](PROJECT_MAP.md) shows where each feature lives and how the main flows connect.
 - [`DESIGN.md`](DESIGN.md) records architectural decisions and safety invariants.
 - [`AGENTS.md`](AGENTS.md) contains repository instructions for AI coding agents.
 
@@ -125,7 +151,9 @@ $env:QT_QPA_PLATFORM='offscreen'
 python test_kant_smoke.py
 ```
 
-On Linux or macOS, use `export QT_QPA_PLATFORM=offscreen` before the test command.
+On Linux or macOS, set `QT_QPA_PLATFORM=offscreen` before running the test.
+
+The legacy `index.html` prototype remains in the repository for reference. Current development targets the Python/PySide6 application.
 
 ## License
 
