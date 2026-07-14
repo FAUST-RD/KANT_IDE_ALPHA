@@ -25,7 +25,7 @@ from html import escape as html_escape
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QElapsedTimer, QFileSystemWatcher, QObject, QPointF, QProcess, QRect, QRectF, Qt, QSettings, QSize,
+    QElapsedTimer, QEvent, QFileSystemWatcher, QObject, QPointF, QProcess, QRect, QRectF, Qt, QSettings, QSize,
     QStringListModel, Signal, QTimer,
 )
 from PySide6.QtGui import (
@@ -532,6 +532,27 @@ class TerminalPane(QPlainTextEdit):
         self.process.write(b'continue\n')
         return True
     # [FN CLOSED] run_debug_python
+
+    # [FN CATEGORY] run_python_repl — starts a plain interactive Python process (-i keeps it
+    # interactive even with no real tty attached, -u unbuffers stdout so output streams as it's
+    # produced instead of only flushing at exit) — the same stdin-forwarding keyPressEvent already
+    # uses for pdb makes this pane a working REPL with no extra input handling of its own.
+    # [FN] run_python_repl — starts an interactive `python -i` session in this pane
+    # [FN OPEN] run_python_repl
+    def run_python_repl(self):
+        if self.process is not None:
+            return False
+        self._append(f'{sys.executable} -i\n')
+        self.process = QProcess(self)
+        self.process.setWorkingDirectory(self.cwd)
+        self.process.readyReadStandardOutput.connect(self._read_stdout)
+        self.process.readyReadStandardError.connect(self._read_stderr)
+        self.process.errorOccurred.connect(self._error)
+        self.process.finished.connect(self._finished)
+        self.process.start(sys.executable, ['-i', '-u'])
+        self.prompt_start = len(self.toPlainText())
+        return True
+    # [FN CLOSED] run_python_repl
 
     def _cd(self, target):
         path = os.path.expandvars(os.path.expanduser(target or os.path.expanduser('~')))
@@ -1329,17 +1350,21 @@ def _tag_header_html(tag, name, desc, bold_name=False):
 # menu) since it currently has exactly one action.
 # [FN] _build_header_row — builds the tag/name label plus a ⋮ metadata button for a KANT element
 # [FN OPEN] _build_header_row
-def _build_header_row(owner, node):
-    # the name/short-description is the element's headline — bigger than the extended
-    # [TAG CATEGORY] description below it (CODE_FONT_PT - 2), not just the same size in a bolder weight
-    header = QLabel(_tag_header_html(node.tag, node.name, node.desc))
-    header.setTextFormat(Qt.RichText)
-    header.setFont(QFont('Consolas', theme.CODE_FONT_PT + 1))
-    header.setWordWrap(True)
+def _build_header_row(owner, node, show_label=True):
     header_row = QHBoxLayout()
     header_row.setContentsMargins(0, 0, 0, 0)
     header_row.setSpacing(1)
-    header_row.addWidget(header, 1)
+    header = None
+    if show_label:
+        # the name/short-description is the element's headline — bigger than the extended
+        # [TAG CATEGORY] description below it (CODE_FONT_PT - 1), not just the same size in a bolder weight
+        header = QLabel(_tag_header_html(node.tag, node.name, node.desc))
+        header.setTextFormat(Qt.RichText)
+        header.setFont(QFont('Consolas', theme.CODE_FONT_PT + 1))
+        header.setWordWrap(True)
+        header_row.addWidget(header, 1)
+    else:
+        header_row.addStretch(1)
     meta_btn = QToolButton()
     meta_btn.setText('⋮')
     meta_btn.setToolTip('Modifica metadati KANT')
@@ -1366,10 +1391,11 @@ def _build_header_row(owner, node):
 class CollapsibleSection(QWidget):
     editMetadata = Signal(object)
 
-    # show_header=False skips the "[TAG] name" title row entirely (fold arrow and ⋮ metadata
-    # button included) — used for the outermost element of an isolated/whole-file view, whose
-    # identity is already announced by the tab label / split header / title bar, so repeating it
-    # here would be pure redundancy. The panel then starts directly with the category description.
+    # show_header=False skips the "[TAG] name" title and fold arrow — used for the outermost
+    # element of an isolated/whole-file view, whose identity is already announced by the tab label
+    # / split header / title bar, so repeating it here would be pure redundancy. The panel then
+    # starts directly with the category description. The ⋮ metadata button stays, right-aligned on
+    # its own row — it's still the only way to edit this element's tag/name/description.
     def __init__(self, node: Node, show_header=True):
         super().__init__()
         self.setObjectName('collapsible')
@@ -1397,12 +1423,14 @@ class CollapsibleSection(QWidget):
             outer.addLayout(header_row)
         else:
             self.toggle_btn = None
+            meta_row, _label = _build_header_row(self, node, show_label=False)
+            outer.addLayout(meta_row)
 
         if node.category_desc:
             cat = QLabel(html_escape(node.category_desc))
             cat.setWordWrap(True)
             cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 12px;')
-            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT - 2))
+            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT - 1))
             outer.addWidget(cat)
 
         self.content = QWidget()
@@ -1434,9 +1462,10 @@ class CollapsibleSection(QWidget):
 class LeafSection(QWidget):
     editMetadata = Signal(object)
 
-    # show_header=False skips the "[TAG] name" title row (same redundancy this is skipped for on
+    # show_header=False skips the "[TAG] name" title (same redundancy this is skipped for on
     # CollapsibleSection) — the outermost element of an isolated/whole-file view already has its
-    # identity shown in the tab label / split header / title bar
+    # identity shown in the tab label / split header / title bar. The ⋮ metadata button still
+    # shows, right-aligned on its own row — still the only way to edit this element's metadata.
     def __init__(self, node: Node, compact=False, show_header=True):
         super().__init__()
         self.setObjectName('leafCompact' if compact else 'leafSection')
@@ -1453,12 +1482,15 @@ class LeafSection(QWidget):
             if compact:
                 header.setStyleSheet(f'padding:4px 0; border-bottom:1px solid #eef2f7;')
             outer.addLayout(header_row)
+        else:
+            meta_row, _label = _build_header_row(self, node, show_label=False)
+            outer.addLayout(meta_row)
 
         if node.category_desc:
             cat = QLabel(html_escape(node.category_desc))
             cat.setWordWrap(True)
             cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 4px;')
-            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT - 2))
+            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT - 1))
             outer.addWidget(cat)
 
         self.content = QWidget()
@@ -1522,27 +1554,44 @@ def make_star_icon():
     return QIcon(pixmap)
 
 
-# [FN CATEGORY] make_save_icon — draws a small stylized floppy-disk glyph in the given color, same
-# vector-drawing style as make_star_icon; used as a save-state badge next to the titlebar logo
-# [FN] make_save_icon — renders a colored save-state icon
-# [FN OPEN] make_save_icon
-def make_save_icon(color):
-    pixmap = QPixmap(40, 40)
-    pixmap.fill(Qt.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.Antialiasing)
-    painter.setPen(Qt.NoPen)
-    painter.setBrush(QBrush(QColor(color)))
-    painter.drawRoundedRect(3, 3, 34, 34, 6, 6)
-    painter.setBrush(QBrush(QColor('#ffffff')))
-    painter.drawRect(9, 3, 22, 11)
-    painter.setBrush(QBrush(QColor(color)))
-    painter.drawRect(13, 6, 10, 5)
-    painter.setBrush(QBrush(QColor('#ffffff')))
-    painter.drawRoundedRect(9, 19, 22, 14, 3, 3)
-    painter.end()
-    return QIcon(pixmap)
-# [FN CLOSED] make_save_icon
+# [FN CATEGORY] RecentFolderCard — a clickable row for the welcome screen's recent-projects list:
+# bold folder name over a dim full path, the same two-tier hierarchy already used for KANT element
+# name/description. QPushButton can't bold just one line of its own text, so this is a small QFrame
+# with its own click handling instead (same forwarding shape as the tree row labels).
+# [FN] RecentFolderCard — a two-line clickable card: folder name over its full path
+# [FN OPEN] RecentFolderCard
+class RecentFolderCard(QFrame):
+    clicked = Signal(str)
+
+    def __init__(self, path):
+        super().__init__()
+        self._path = path
+        self.setObjectName('recentFolderCard')
+        self.setCursor(Qt.PointingHandCursor)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 9, 16, 9)
+        layout.setSpacing(1)
+        name = QLabel(os.path.basename(path.rstrip('/\\')) or path)
+        name.setFont(QFont('Consolas', 12, QFont.DemiBold))
+        name.setStyleSheet(f'color:{theme.TEXT}; border:none; background:transparent;')
+        path_label = QLabel(path)
+        path_label.setFont(QFont('Consolas', 9))
+        path_label.setStyleSheet(f'color:{theme.DIM}; border:none; background:transparent;')
+        layout.addWidget(name)
+        layout.addWidget(path_label)
+        self.apply_style()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self._path)
+        super().mousePressEvent(event)
+
+    def apply_style(self):
+        self.setStyleSheet(
+            f'#recentFolderCard {{ background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; border-radius:8px; }} '
+            f'#recentFolderCard:hover {{ border-color:{theme.ACCENT}; }}'
+        )
+# [FN CLOSED] RecentFolderCard
 
 
 class TitleBar(QWidget):
@@ -1562,18 +1611,12 @@ class TitleBar(QWidget):
         layout.setSpacing(12)
 
         self.back_btn = QPushButton('')
-        self.back_btn.setIcon(draw_icon('arrow-left', 16))
+        self.back_btn.setIcon(draw_icon('home', 16))
         self.back_btn.setIconSize(QSize(16, 16))
         self.back_btn.setFixedSize(32, 28)
         self.back_btn.setToolTip('Torna al menu iniziale')
         self.back_btn.clicked.connect(window._go_back_to_welcome)
         layout.addWidget(self.back_btn)
-
-        self.save_icon = QLabel()
-        self.save_icon.setFixedSize(22, 22)
-        self.save_icon.setScaledContents(True)
-        self.save_icon.setPixmap(make_save_icon(theme.DIM).pixmap(22, 22))
-        layout.addWidget(self.save_icon)
 
         title_box = QVBoxLayout()
         title_box.setContentsMargins(0, 0, 0, 0)
@@ -1655,6 +1698,12 @@ class TitleBar(QWidget):
         self.git_commit_menu_action.triggered.connect(window._git_commit)
         self.git_branch_menu_action = git_menu.addAction('Cambia branch...')
         self.git_branch_menu_action.triggered.connect(window._git_switch_branch)
+        # clicking Git opens the one-window panel (branch/stage/diff/commit together, or the git-init
+        # flow if this project has no repo yet) instead of this dropdown; hovering still shows the
+        # dropdown's quick actions without needing a click, via the eventFilter below
+        self.git_menu_btn.clicked.disconnect()
+        self.git_menu_btn.clicked.connect(window._open_git_panel)
+        self.git_menu_btn.installEventFilter(self)
         layout.addWidget(self.git_menu_btn)
 
         self.filename_label = QLabel('')
@@ -1693,6 +1742,21 @@ class TitleBar(QWidget):
         if menu is not None:
             menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
+    # [FN CATEGORY] eventFilter — QToolButton has no built-in "show menu on hover" popup mode (only
+    # click-driven ones), so the Git button's quick-actions dropdown is surfaced on QEvent.Enter
+    # here instead — the button's own click is wired to open the git panel, not this menu, so this
+    # is the only way to reach the individual quick actions from the button itself now.
+    # [FN] eventFilter — shows the Git button's dropdown on mouse-enter instead of click
+    # [FN OPEN] eventFilter
+    def eventFilter(self, obj, event):
+        if obj is self.git_menu_btn and event.type() == QEvent.Enter:
+            menu = self.git_menu_btn.menu()
+            if menu is not None and not menu.isVisible():
+                menu.exec(self.git_menu_btn.mapToGlobal(self.git_menu_btn.rect().bottomLeft()))
+            return False
+        return super().eventFilter(obj, event)
+    # [FN CLOSED] eventFilter
+
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
         self.theme_menu_action.setText('Giorno' if self.window.night_mode else 'Notte')
@@ -1708,22 +1772,6 @@ class TitleBar(QWidget):
         active = self.window.active_tab if hasattr(self.window, 'tabs') else None
         dirty = active.dirty if active else False
         self.filename_label.setStyleSheet(f'color:{theme.ACCENT if dirty else theme.DIM};')
-        self.set_save_state(active is not None, dirty)
-
-    # [FN CATEGORY] set_save_state — recolors the save-state badge: dim with no file open, accent
-    # while a change is pending autosave, green once it's been written to disk
-    # [FN] set_save_state — updates the titlebar save icon to reflect current save state
-    # [FN OPEN] set_save_state
-    def set_save_state(self, has_file, dirty):
-        if not has_file:
-            color, tip = theme.DIM, 'Nessun file aperto'
-        elif dirty:
-            color, tip = theme.ACCENT, 'Modifiche in attesa di salvataggio automatico'
-        else:
-            color, tip = theme.OK, 'Salvato'
-        self.save_icon.setPixmap(make_save_icon(color).pixmap(22, 22))
-        self.save_icon.setToolTip(tip)
-    # [FN CLOSED] set_save_state
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:

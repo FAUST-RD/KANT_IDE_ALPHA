@@ -22,14 +22,16 @@ from PySide6.QtWidgets import (
 import kant_editor
 from kant import theme
 from kant import mainwindow as kant_mainwindow_module
-from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT
+from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT, ROLE_LINE
 from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
 from kant.xref import build_xref, XrefElement
 from kant.widgets import (
-    CollapsibleSection, FileTab, LeafSection, _AiReviewCard, _agent_command, CodeEdit,
+    CollapsibleSection, FileTab, LeafSection, RecentFolderCard, _AiReviewCard, _agent_command, CodeEdit,
 )
 from kant.mappa import XrefMapDialog, XrefMapView, _force_layout_positions
+from kant import gitops as kant_gitops_module
+from kant.gitops import GitPanelDialog
 from kant.workspace import (
     apply_ai_review, build_ai_review, create_snapshot, discard_snapshot, rollback_snapshot,
     render_review_text, safe_project_path,
@@ -96,7 +98,8 @@ class KantSmokeTest(unittest.TestCase):
         assert window.splitter.widget(1) is window.claude_pane
         assert window.main_splitter.orientation() == Qt.Vertical
         assert window.main_splitter.widget(0) is window.workspace_splitter
-        assert window.main_splitter.widget(1) is window.terminal
+        assert window.main_splitter.widget(1) is window.terminal_dock
+        assert window.terminal_stack.widget(0) is window.terminal
         assert window.kant_map_label.parent() is window.statusBar()
         assert window.map_tab_btn.parent() is window.shell
         assert window.map_tab_btn.isHidden()  # only shown once a project is open
@@ -147,6 +150,42 @@ class KantSmokeTest(unittest.TestCase):
         assert one_shot_request['response']['behavior'] == 'allow'
         assert len(window.claude_pane._permission_cards) == cards_before
         window.claude_pane._auto_permissions_once = False
+        window.close()
+
+    def test_terminal_dock_sidebar_and_errors_view(self):
+        window = MainWindow()
+        assert window.terminal_stack.currentIndex() == 0
+        assert window.terminal_sidebar_group.button(0).isChecked()
+
+        # switching to the Python-REPL tab starts a real interactive python process lazily, only
+        # on first switch — not at construction, since most sessions never open it
+        assert window.python_terminal.process is None
+        window._switch_terminal_tab(1)
+        assert window.terminal_stack.currentIndex() == 1
+        assert window.terminal_stack.currentWidget() is window.python_terminal
+        assert window.python_terminal.process is not None
+        window.python_terminal.process.kill()
+        window.python_terminal.process.waitForFinished(2000)
+
+        window._switch_terminal_tab(2)
+        assert window.terminal_stack.currentIndex() == 2
+        assert window.terminal_stack.currentWidget() is window.errors_view
+
+        # the errors tab mirrors whatever _apply_syntax_status just decided for the active file —
+        # exercised directly here with a synthetic bad result, same as a real failed local check
+        source_dir = Path(tempfile.mkdtemp())
+        source = _write_app_py(source_dir)
+        errors_tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
+        window.tabs.addTab(errors_tab, 'app.py')
+        window.tabs.setCurrentWidget(errors_tab)
+        window._apply_syntax_status(str(source), serialize_kant(errors_tab.tree), {'ok': False, 'line': 3, 'message': 'boom'}, None)
+        assert window.errors_view.topLevelItemCount() == 1
+        error_item = window.errors_view.topLevelItem(0)
+        assert 'boom' in error_item.text(0) and error_item.data(0, ROLE_LINE) == 3
+
+        # a clean result clears the list instead of leaving a stale error behind
+        window._apply_syntax_status(str(source), serialize_kant(errors_tab.tree), {'ok': True, 'message': 'Sintassi OK'}, None)
+        assert window.errors_view.topLevelItemCount() == 0
         window.close()
 
     def test_kant_code_map_launch_args(self):
@@ -378,6 +417,10 @@ class KantSmokeTest(unittest.TestCase):
             assert isinstance(cls_widget, CollapsibleSection) and cls_widget.toggle_btn is None
             cls_labels = ' '.join(l.text() for l in cls_widget.findChildren(QLabel))
             assert '[CLS]' not in cls_labels and 'a class that does stuff' in cls_labels  # no title, category kept
+            # the "[TAG] name" title is suppressed here (redundant with the tab/split header), but the
+            # metadata-edit (⋮) button must still be reachable — it's the only way to edit this
+            # element's tag/name/description, whether or not a title is shown for it
+            assert any(btn.text() == '⋮' for btn in cls_widget.findChildren(QToolButton))
             assert isinstance(fn_widget, LeafSection)
             fn_labels = ' '.join(l.text() for l in fn_widget.findChildren(QLabel))
             assert '[FN]' in fn_labels  # nested element still gets its own header
@@ -952,6 +995,22 @@ class KantSmokeTest(unittest.TestCase):
             MainWindow._delete_tree_item(delete_window, delete_item, 'file')
             assert events == ['flush', ('close', False), 'move']
 
+    def test_git_button_hover_shows_dropdown(self):
+        # QToolButton has no built-in "show menu on hover" mode, so this is a manual eventFilter —
+        # QMenu.exec is monkeypatched (instance-level, a plain Python call site so this shadows it
+        # fine) to a non-blocking recorder, since the real exec() opens a blocking modal loop
+        window = MainWindow()
+        menu = window.title_bar.git_menu_btn.menu()
+        calls = []
+        original_exec = menu.exec
+        menu.exec = lambda *args, **kwargs: calls.append(args)
+        try:
+            window.title_bar.eventFilter(window.title_bar.git_menu_btn, QEvent(QEvent.Enter))
+        finally:
+            menu.exec = original_exec
+        assert len(calls) == 1
+        window.close()
+
     def test_git_commit_and_branch_switch(self):
         # real repo, real `git` subprocess calls (_run_git shells out), only the modal dialogs are
         # stubbed to bypass .exec()
@@ -982,6 +1041,114 @@ class KantSmokeTest(unittest.TestCase):
             ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=git_root, capture_output=True, text=True, check=True,
         )
         assert branch.stdout.strip() == 'feature-x'
+
+    def test_git_panel_dialog(self):
+        # the one-window Git panel: real repo, real git subprocess calls throughout (refresh,
+        # stage-via-checkbox, diff-on-click, commit) — nothing here is mocked except the window
+        # it's attached to, matching the other git tests' style
+        git_root = Path(tempfile.mkdtemp())
+        subprocess.run(['git', 'init', '-q'], cwd=git_root, check=True)
+        subprocess.run(['git', 'config', 'user.email', 'test@test.local'], cwd=git_root, check=True)
+        subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=git_root, check=True)
+        (git_root / 'tracked.txt').write_text('one\n', encoding='utf-8')
+        subprocess.run(['git', 'add', 'tracked.txt'], cwd=git_root, check=True)
+        subprocess.run(['git', 'commit', '-m', 'initial'], cwd=git_root, check=True)
+        (git_root / 'tracked.txt').write_text('two\n', encoding='utf-8')  # unstaged modification
+        (git_root / 'new.txt').write_text('brand new\n', encoding='utf-8')  # untracked
+
+        # GitPanelDialog(window) parents itself to window (a real QDialog(parent) call) — needs an
+        # actually-constructed MainWindow, not a bare MainWindow.__new__ stub, for shiboken to accept it
+        window = MainWindow()
+        window.git_root = str(git_root)
+        window._refresh_after_fs_change = lambda: None
+
+        panel = GitPanelDialog(window)
+        panel.refresh()
+        branches = [panel.branch_combo.itemText(i) for i in range(panel.branch_combo.count())]
+        assert branches and panel.branch_combo.currentText() in branches
+
+        assert panel.files_list.topLevelItemCount() == 2
+        items_by_rel = {}
+        for i in range(panel.files_list.topLevelItemCount()):
+            item = panel.files_list.topLevelItem(i)
+            items_by_rel[item.data(0, kant_gitops_module._ROLE_PATH)] = item
+        assert set(items_by_rel) == {'tracked.txt', 'new.txt'}
+        assert all(item.checkState(0) == Qt.Unchecked for item in items_by_rel.values())  # nothing staged yet
+
+        panel._on_item_clicked(items_by_rel['tracked.txt'], 0)
+        assert 'two' in panel.diff_view.toPlainText()
+
+        # checking the box stages the file for real (real `git add`)
+        items_by_rel['new.txt'].setCheckState(0, Qt.Checked)
+        status = subprocess.run(
+            ['git', 'status', '--porcelain=v1'], cwd=git_root, capture_output=True, text=True, check=True,
+        )
+        assert 'A  new.txt' in status.stdout
+
+        panel.message_field.setPlainText('add new file')
+        panel._commit()
+        log = subprocess.run(
+            ['git', 'log', '--oneline', '--format=%s'], cwd=git_root, capture_output=True, text=True, check=True,
+        )
+        assert log.stdout.strip().splitlines()[0] == 'add new file'
+        panel.close()
+        window.close()
+
+    def test_git_init_flow_from_button_click(self):
+        # clicking Git with no repository routes into a real `git init` instead of just refusing —
+        # GitPanelDialog is swapped for a lightweight fake so this doesn't need a real Qt-parented
+        # MainWindow just to reach the init logic (same shiboken constraint test_git_panel_dialog
+        # hit — GitPanelDialog(window) needs an actually-constructed parent)
+        project_root = Path(tempfile.mkdtemp())
+        window = MainWindow.__new__(MainWindow)
+        window.git_root = None
+        window.git_status = {}
+        window.project_root_path = str(project_root)
+        window.git_panel = None
+        window._ide_yes_no = lambda *_args, **_kwargs: True
+        messages = []
+        window._ide_message = lambda title, msg: messages.append(msg)
+        window._refresh_after_fs_change = lambda: None
+        window._refresh_git_status = lambda: None
+
+        opened = []
+
+        class FakePanel:
+            def __init__(self, _window):
+                opened.append(True)
+
+            def refresh(self):
+                pass
+
+            def show(self):
+                pass
+
+            def raise_(self):
+                pass
+
+            def activateWindow(self):
+                pass
+
+        original_dialog_cls = kant_gitops_module.GitPanelDialog
+        kant_gitops_module.GitPanelDialog = FakePanel
+        try:
+            MainWindow._open_git_panel(window)
+        finally:
+            kant_gitops_module.GitPanelDialog = original_dialog_cls
+
+        assert (project_root / '.git').is_dir()  # a real `git init` actually ran
+        assert window.git_root == str(project_root)
+        assert opened == [True]
+        assert not messages  # no error message on the success path
+
+        # no project open at all -> a message, not a crash trying to init nothing
+        none_window = MainWindow.__new__(MainWindow)
+        none_window.git_root = None
+        none_window.project_root_path = None
+        none_messages = []
+        none_window._ide_message = lambda title, msg: none_messages.append(msg)
+        MainWindow._open_git_panel(none_window)
+        assert none_messages
 
     def test_run_tests_pytest_integration(self):
         # a real pytest subprocess against an isolated temp project with one passing and one failing
@@ -1091,6 +1258,23 @@ class KantSmokeTest(unittest.TestCase):
         assert 'File: Disabilitato' not in palette_labels
         assert 'File: Salva' in palette_labels
         assert fired == ['Commit...']
+
+    def test_welcome_page_recent_folder_cards(self):
+        # RecentFolderCard has its own mousePressEvent (QPushButton can't bold just one line of its
+        # own text), so a real click needs exercising end-to-end rather than trusting a signal exists
+        recent_a = Path(tempfile.mkdtemp())
+        recent_b = Path(tempfile.mkdtemp())
+        QSettings('KANT', 'KANT Editor').setValue('recentFolders', [str(recent_a), str(recent_b)])
+        window = MainWindow()
+        assert window.recent_layout.count() == 2
+        opened = []
+        window._open_project_folder = lambda path: opened.append(path)
+        card = window.recent_layout.itemAt(0).widget()
+        assert isinstance(card, RecentFolderCard)
+        QTest.mouseClick(card, Qt.LeftButton)
+        assert opened == [str(recent_a)]
+        window.close()
+        QSettings('KANT', 'KANT Editor').remove('recentFolders')
 
     def test_crash_handler_writes_log_and_shows_dialog(self):
         # PySide6 routes an uncaught exception from a Qt slot through sys.excepthook same as any

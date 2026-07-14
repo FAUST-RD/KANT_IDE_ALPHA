@@ -161,6 +161,64 @@ def draw_icon(kind, size=16, color=None):
     elif kind in ('expand', 'collapse'):
         _corner_arrows(p, size, color, outward=(kind == 'expand'))
 
+    elif kind == 'terminal':
+        p.setBrush(Qt.transparent)
+        pen = QPen(QColor(color))
+        pen.setWidthF(size * 0.1)
+        p.setPen(pen)
+        p.drawRoundedRect(QRectF(m * 0.4, m * 0.7, size - m * 0.8, size - m * 1.4), 2, 2)
+        pen.setWidthF(size * 0.13)
+        p.setPen(pen)
+        p.drawLine(int(m * 1.1), int(mid - size * 0.05), int(mid - size * 0.05), int(mid + size * 0.08))
+        p.drawLine(int(m * 1.1), int(mid + size * 0.21), int(mid - size * 0.05), int(mid + size * 0.08))
+        p.drawLine(int(mid + size * 0.02), int(size - m * 1.1), int(size - m * 1.1), int(size - m * 1.1))
+
+    elif kind == 'repl':  # python/interactive terminal — ">>>" prompt glyph
+        pen = QPen(QColor(color))
+        pen.setWidthF(size * 0.11)
+        p.setPen(pen)
+        p.setBrush(Qt.transparent)
+        for i in range(3):
+            x0 = m * 0.5 + i * size * 0.24
+            p.drawLine(int(x0), int(mid - size * 0.16), int(x0 + size * 0.14), int(mid))
+            p.drawLine(int(x0), int(mid + size * 0.16), int(x0 + size * 0.14), int(mid))
+
+    elif kind == 'warning':
+        pen = QPen(QColor(color))
+        pen.setWidthF(size * 0.09)
+        p.setPen(pen)
+        p.setBrush(Qt.transparent)
+        path = QPainterPath()
+        path.moveTo(mid, m * 0.5)
+        path.lineTo(size - m * 0.5, size - m * 0.6)
+        path.lineTo(m * 0.5, size - m * 0.6)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(color))
+        p.drawRoundedRect(QRectF(mid - size * 0.05, mid - size * 0.12, size * 0.1, size * 0.24), 1, 1)
+        r = size * 0.055
+        p.drawEllipse(QRectF(mid - r, size - m * 0.95, r * 2, r * 2))
+
+    elif kind == 'home':
+        # outline-only (like target/nest/warning above), not a solid fill — a filled silhouette's
+        # door would need to be cut out in the exact backdrop color, which varies with theme/hover
+        # state; an outline never has that problem
+        p.setBrush(Qt.transparent)
+        pen = QPen(QColor(color))
+        pen.setWidthF(size * 0.1)
+        p.setPen(pen)
+        house = QPainterPath()
+        house.moveTo(mid, m * 0.4)
+        house.lineTo(size - m * 0.4, mid * 0.9)
+        house.lineTo(size - m * 0.4, size - m * 0.5)
+        house.lineTo(m * 0.4, size - m * 0.5)
+        house.lineTo(m * 0.4, mid * 0.9)
+        house.closeSubpath()
+        p.drawPath(house)
+        door_w, door_h = size * 0.22, size * 0.32
+        p.drawRect(QRectF(mid - door_w / 2, size - m * 0.5 - door_h, door_w, door_h))
+
     p.end()
     return QIcon(pm)
 # [FN CLOSED] draw_icon

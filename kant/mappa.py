@@ -20,7 +20,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFrame, QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem,
-    QGraphicsView, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizeGrip, QVBoxLayout, QWidget,
+    QGraphicsView, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
 from kant import theme
@@ -1139,7 +1139,6 @@ class EdgeFlowPopup(QFrame):
 # [FN OPEN] XrefMapDialog
 class XrefMapDialog(QDialog):
     TAG_ORDER = ('MOD', 'CFG', 'CLS', 'TYP', 'FN', 'CST', 'VAR', 'TST')
-    HEADER_H = 38
 
     nodeActivated = Signal(str)
     resized = Signal()  # lets the main window keep the close-tab (reparented onto this dialog) positioned
@@ -1159,7 +1158,6 @@ class XrefMapDialog(QDialog):
         self._isolate = False
         self._selected = None       # most-recently-pinned key — read by selected_key() for map-close navigation
         self._pinned_nodes = []     # full ordered multi-pin set (mirrors XrefMapView._pinned)
-        self._drag_offset = None
         self._positioned = False
         self._position_key = None
         self._positions = {}
@@ -1192,7 +1190,6 @@ class XrefMapDialog(QDialog):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(self._build_header())
         outer.addWidget(self._build_toolbar())
         outer.addWidget(self.view, 1)
         outer.addWidget(self._build_footer())
@@ -1216,31 +1213,6 @@ class XrefMapDialog(QDialog):
         self.drill_title_card.hide()
         self.resized.connect(self._position_drill_title_card)
 
-    def _build_header(self):
-        bar = QWidget()
-        bar.setObjectName('mapHeader')
-        bar.setFixedHeight(self.HEADER_H)
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(14, 0, 8, 0)
-        self.title_label = QLabel('Mappa KANT')
-        self.title_label.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-        self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)  # let drags pass through
-        row.addWidget(self.title_label)
-        self.drill_back_btn = QPushButton(' Torna alla mappa completa')
-        self.drill_back_btn.setIcon(draw_icon('arrow-left', 14))
-        self.drill_back_btn.setIconSize(QSize(14, 14))
-        self.drill_back_btn.setFixedHeight(26)
-        self.drill_back_btn.clicked.connect(self._exit_drill_mode)
-        self.drill_back_btn.hide()  # only shown while drilled into one element's internals
-        row.addWidget(self.drill_back_btn)
-        row.addStretch(1)
-        self.close_btn = QPushButton('×')
-        self.close_btn.setFixedSize(30, 26)
-        self.close_btn.clicked.connect(self.close)
-        row.addWidget(self.close_btn)
-        self._header = bar
-        return bar
-
     def _build_toolbar(self):
         bar = QWidget()
         bar.setObjectName('mapToolbar')
@@ -1250,6 +1222,15 @@ class XrefMapDialog(QDialog):
 
         top = QHBoxLayout()
         top.setSpacing(8)
+        # only visible while drilled into one element's internals — takes the header's old spot
+        # now that the window has no header row (fixed position, no title/close-button chrome)
+        self.drill_back_btn = QPushButton(' Torna alla mappa completa')
+        self.drill_back_btn.setIcon(draw_icon('arrow-left', 14))
+        self.drill_back_btn.setIconSize(QSize(14, 14))
+        self.drill_back_btn.setFixedHeight(28)
+        self.drill_back_btn.clicked.connect(self._exit_drill_mode)
+        self.drill_back_btn.hide()
+        top.addWidget(self.drill_back_btn)
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText('Cerca per nome o descrizione…')
         self.search_box.setClearButtonEnabled(True)
@@ -1375,7 +1356,6 @@ class XrefMapDialog(QDialog):
         self.hint_label.setStyleSheet(f'color:{theme.DIM};')
         row.addWidget(self.hint_label)
         row.addStretch(1)
-        row.addWidget(QSizeGrip(bar), 0, Qt.AlignBottom | Qt.AlignRight)
         self._footer = bar
         return bar
 
@@ -1383,11 +1363,6 @@ class XrefMapDialog(QDialog):
         self.setStyleSheet(
             f'XrefMapDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}'
         )
-        self._header.setStyleSheet(
-            f'#mapHeader {{ background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER}; }}'
-        )
-        self.title_label.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px;')
-        self.close_btn.setStyleSheet(theme.BUTTON_STYLE)
         self.drill_back_btn.setStyleSheet(theme.BUTTON_STYLE)
         self._toolbar.setStyleSheet(
             f'#mapToolbar {{ background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER}; }} '
@@ -1438,23 +1413,6 @@ class XrefMapDialog(QDialog):
         self.drill_title_tag.setStyleSheet(f'color:{theme.ACCENT}; letter-spacing:1px; border:none;')
         self.drill_title_name.setStyleSheet(f'color:{theme.TEXT}; border:none;')
 
-    # ---- frameless header drag ------------------------------------------
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and event.position().y() <= self.HEADER_H:
-            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-        else:
-            self._drag_offset = None
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        self._drag_offset = None
-        super().mouseReleaseEvent(event)
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.resized.emit()
@@ -1489,7 +1447,6 @@ class XrefMapDialog(QDialog):
         self._selected = None
         self._pinned_nodes = []
         self._project_name = project_name
-        self.title_label.setText(f'Mappa KANT — {project_name}' if project_name else 'Mappa KANT')
         files = sorted({el.file for el in elements.values()})
         # every open starts fully expanded, regardless of how it was left last time
         self._expanded = set(files)
@@ -1788,7 +1745,6 @@ class XrefMapDialog(QDialog):
         self.drill_title_name.setText(element.desc or element.name)
         self.drill_title_card.show()
         self._position_drill_title_card()
-        self.title_label.setText(f'Mappa KANT — dentro {self._element_label(key)}')
         self._refresh(relayout=True, fit=True)
         self.drill_back_btn.show()
 
@@ -1796,7 +1752,6 @@ class XrefMapDialog(QDialog):
         self._drill_key = None
         self.drill_back_btn.hide()
         self.drill_title_card.hide()
-        self.title_label.setText(f'Mappa KANT — {self._project_name}' if self._project_name else 'Mappa KANT')
         self._refresh(fit=True, relayout=True)
     # [FN CLOSED] drill mode
 

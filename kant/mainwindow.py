@@ -47,7 +47,7 @@ from kant.projectops import (
 from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback_snapshot
 from kant.widgets import (
     CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
-    ProjectTree, make_star_icon, TitleBar, FileTab,
+    ProjectTree, make_star_icon, RecentFolderCard, TitleBar, FileTab,
     MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html,
 )
 from kant.mappa import XrefMapDialog
@@ -174,6 +174,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._xref_pending_generation = None
         self._last_io_uid = None
         self.map_dialog = None   # internal XrefMapDialog, created on first MAPPA click
+        self.git_panel = None    # internal GitPanelDialog, created on first Git click
         self._closing = False
         self._background = ThreadPoolExecutor(max_workers=2, thread_name_prefix='kant')
         self.backgroundFinished.connect(self._finish_background)
@@ -381,10 +382,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _position_claude_tab(self):
         if not hasattr(self, 'claude_tab_btn'):
             return
-        self.claude_tab_btn.move(
-            self.shell.width() - self.claude_tab_btn.width(),
-            (self.shell.height() - self.claude_tab_btn.height()) // 2,
-        )
+        # sits at the AI pane's own inner-left edge (splitter.widget(0)'s width), not a fixed
+        # shell coordinate — collapsed, that edge coincides with the shell's right edge (same spot
+        # as before); expanded, it tracks wherever the splitter divider actually is instead of
+        # floating past it, out over the pane's own content
+        x = self.splitter.widget(0).width() - self.claude_tab_btn.width()
+        self.claude_tab_btn.move(x, (self.shell.height() - self.claude_tab_btn.height()) // 2)
         self.claude_tab_btn.raise_()
 
     def _position_map_tab(self):
@@ -520,17 +523,42 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         for btn in self.action_toolbar_buttons.values():
             btn.setStyleSheet(style)
 
+    # [FN CATEGORY] _build_welcome_page — a centered card (not widgets floating directly on the
+    # raw background) holds title/description/CTA, with the recent-projects list as its own
+    # distinct section below — the same "one bordered panel, not loose elements" treatment already
+    # used for the project tree and coding panels, just applied to the very first screen too.
+    # [FN] _build_welcome_page — the startup screen: open-folder CTA plus recent projects
+    # [FN OPEN] _build_welcome_page
     def _build_welcome_page(self):
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(20)
+        outer = QVBoxLayout(page)
+        outer.setAlignment(Qt.AlignCenter)
+
+        card = QWidget()
+        card.setObjectName('welcomeCard')
+        card.setFixedWidth(620)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(48, 44, 48, 40)
+        layout.setSpacing(22)
+        layout.setAlignment(Qt.AlignHCenter)
+
+        badge = QLabel('KANT')
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setFixedSize(64, 64)
+        badge.setFont(QFont('Consolas', 15, QFont.Black))
+        badge.setStyleSheet(
+            f'background:{theme.ACCENT}; color:#ffffff; border-radius:32px; letter-spacing:1px;'
+        )
+        badge_row = QHBoxLayout()
+        badge_row.setAlignment(Qt.AlignCenter)
+        badge_row.addWidget(badge)
+        layout.addLayout(badge_row)
 
         self.welcome_title = QLabel('KANT Editor')
         title = self.welcome_title
         title.setAlignment(Qt.AlignCenter)
-        title.setFont(QFont('Consolas', 28, QFont.DemiBold))
-        title.setStyleSheet(f'color:{theme.ACCENT}; letter-spacing:3px;')
+        title.setFont(QFont('Consolas', 26, QFont.DemiBold))
+        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:3px; border:none;')
         layout.addWidget(title)
 
         self.welcome_desc = QLabel(
@@ -541,28 +569,28 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         desc = self.welcome_desc
         desc.setAlignment(Qt.AlignCenter)
         desc.setWordWrap(True)
-        desc.setMaximumWidth(560)
-        desc.setStyleSheet(f'color:{theme.DIM};')
-        desc.setFont(QFont('Consolas', 14))
-        desc_row = QHBoxLayout()
-        desc_row.setAlignment(Qt.AlignCenter)
-        desc_row.addWidget(desc)
-        layout.addLayout(desc_row)
+        desc.setStyleSheet(f'color:{theme.DIM}; border:none;')
+        desc.setFont(QFont('Consolas', 12))
+        layout.addWidget(desc)
 
         open_btn = QPushButton('Apri cartella…')
-        open_btn.setFont(QFont('Consolas', 18))
-        open_btn.setStyleSheet(theme.BUTTON_STYLE + 'QPushButton { padding:16px 32px; }')
+        open_btn.setFont(QFont('Consolas', 15, QFont.DemiBold))
+        open_btn.setCursor(Qt.PointingHandCursor)
+        open_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.ACCENT}; color:#ffffff; border:none; '
+            f'border-radius:9px; padding:14px 30px; }} '
+            f'QPushButton:hover {{ background:{theme.ACCENT}; }}'
+        )
         open_btn.clicked.connect(self._open_folder)
         btn_row = QHBoxLayout()
         btn_row.setAlignment(Qt.AlignCenter)
         btn_row.addWidget(open_btn)
         layout.addLayout(btn_row)
 
-        self.recent_title = QLabel('Cartelle recenti')
+        self.recent_title = QLabel('CARTELLE RECENTI')
         recent_title = self.recent_title
-        recent_title.setAlignment(Qt.AlignCenter)
-        recent_title.setFont(QFont('Consolas', 11, QFont.DemiBold))
-        recent_title.setStyleSheet(f'color:{theme.DIM};')
+        recent_title.setFont(QFont('Consolas', 9, QFont.DemiBold))
+        recent_title.setStyleSheet(f'color:{theme.DIM}; letter-spacing:2px; border:none;')
         layout.addWidget(recent_title)
 
         self.recent_wrap = QWidget()
@@ -570,8 +598,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.recent_layout.setContentsMargins(0, 0, 0, 0)
         self.recent_layout.setSpacing(6)
         layout.addWidget(self.recent_wrap)
+
+        card.setStyleSheet(
+            f'#welcomeCard {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:16px; }}'
+        )
+        outer.addWidget(card)
         self._refresh_recent_folders()
         return page
+    # [FN CLOSED] _build_welcome_page
 
     def _build_main_page(self):
         central = QWidget()
@@ -617,12 +651,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.map_tab_btn.hide()  # only relevant once a project is open
 
         # same tab-on-the-edge pattern as MAPPA's, but on the right edge for the AI terminal pane:
-        # one button whose arrow flips between flattening the pane to zero width and restoring it
+        # one button whose arrow flips between flattening the pane to zero width and restoring it.
+        # Starts pointing right (arrow-right) to match the pane's default-expanded state.
         self._claude_pane_width = None
         self.claude_tab_btn = QPushButton('', self.shell)
-        self.claude_tab_btn.setIcon(draw_icon('arrow-left', 14))
-        self.claude_tab_btn.setIconSize(QSize(14, 14))
-        self.claude_tab_btn.setFixedSize(22, 90)
+        self.claude_tab_btn.setIcon(draw_icon('arrow-right', 12))
+        self.claude_tab_btn.setIconSize(QSize(12, 12))
+        self.claude_tab_btn.setFixedSize(16, 60)
         self.claude_tab_btn.setCursor(Qt.PointingHandCursor)
         self.claude_tab_btn.setToolTip('Comprimi/espandi il terminale AI')
         self.claude_tab_btn.clicked.connect(self._toggle_claude_pane)
@@ -670,9 +705,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.claude_pane.finished.connect(self._finish_ai_review)
         self.claude_pane.finished.connect(self._refresh_and_validate_after_ai)
 
+        self.terminal_dock = self._build_terminal_dock()
         self._style_io_tabs()
         self._update_io_tabs(None)
-        self.terminal = TerminalPane(os.getcwd())
         self.workspace_splitter = QSplitter(Qt.Horizontal)
         self.workspace_splitter.addWidget(tree_panel)
         self.workspace_splitter.addWidget(view_panel)
@@ -689,7 +724,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
         self.main_splitter = QSplitter(Qt.Vertical)
         self.main_splitter.addWidget(self.workspace_splitter)
-        self.main_splitter.addWidget(self.terminal)
+        self.main_splitter.addWidget(self.terminal_dock)
         self.main_splitter.setStretchFactor(0, 1)
         self.main_splitter.setStretchFactor(1, 0)
         saved_main_sizes = self.settings.value('mainVerticalSplitterSizes')
@@ -714,6 +749,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.splitter.splitterMoved.connect(
             lambda *_: self.settings.setValue('splitterSizes', self.splitter.sizes())
         )
+        self.splitter.splitterMoved.connect(lambda *_: self._position_claude_tab())
         root_layout.addWidget(self.splitter, 1)
         self._build_status_bar()
         return central
@@ -1299,8 +1335,73 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             f'border-top-left-radius:8px; border-bottom-left-radius:8px; font-weight:700; }} '
             f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
         )
+        self.terminal_sidebar.setStyleSheet(f'background:{theme.PANEL}; border-right:1px solid {theme.BORDER};')
+        for btn in self.terminal_sidebar_group.buttons():
+            btn.setStyleSheet(
+                f'QToolButton {{ border:none; border-radius:4px; background:transparent; }} '
+                f'QToolButton:hover {{ background:{theme.CODE_BG}; }} '
+                f'QToolButton:checked {{ background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; }}'
+            )
+        self.errors_view.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:6px;')
         if self.map_dialog is not None:
             self.map_dialog.apply_style()
+
+    # [FN CATEGORY] _build_terminal_dock — a narrow left sidebar (3 icon buttons, exclusive like a
+    # vertical tab bar) switches a QStackedWidget between the real shell (self.terminal), a second
+    # TerminalPane running an interactive Python REPL, and a live list of the active file's
+    # diagnostics — so the bottom panel isn't only ever the shell. The Python REPL process starts
+    # lazily on first switch to that tab, not at construction, since most sessions never open it.
+    # [FN] _build_terminal_dock — sidebar + stacked terminal/REPL/errors panel
+    # [FN OPEN] _build_terminal_dock
+    def _build_terminal_dock(self):
+        self.terminal = TerminalPane(os.getcwd())
+        self.python_terminal = TerminalPane(os.getcwd())
+        self.errors_view = QTreeWidget()
+        self.errors_view.setHeaderHidden(True)
+        self.errors_view.itemClicked.connect(self._open_result_item)
+
+        self.terminal_stack = QStackedWidget()
+        self.terminal_stack.addWidget(self.terminal)
+        self.terminal_stack.addWidget(self.python_terminal)
+        self.terminal_stack.addWidget(self.errors_view)
+
+        sidebar = QWidget()
+        sidebar.setFixedWidth(28)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(2, 4, 2, 0)
+        sidebar_layout.setSpacing(2)
+        self.terminal_sidebar_group = QButtonGroup(sidebar)
+        self.terminal_sidebar_group.setExclusive(True)
+        for index, (icon_name, tooltip) in enumerate((
+            ('terminal', 'Terminale'), ('repl', 'Terminale Python'), ('warning', 'Errori nel file aperto'),
+        )):
+            btn = QToolButton()
+            btn.setCheckable(True)
+            btn.setIcon(draw_icon(icon_name, 15))
+            btn.setIconSize(QSize(15, 15))
+            btn.setFixedSize(24, 24)
+            btn.setToolTip(tooltip)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _checked=False, i=index: self._switch_terminal_tab(i))
+            self.terminal_sidebar_group.addButton(btn, index)
+            sidebar_layout.addWidget(btn)
+        sidebar_layout.addStretch(1)
+        self.terminal_sidebar_group.button(0).setChecked(True)
+        self.terminal_sidebar = sidebar
+
+        dock = QWidget()
+        dock_layout = QHBoxLayout(dock)
+        dock_layout.setContentsMargins(0, 0, 0, 0)
+        dock_layout.setSpacing(0)
+        dock_layout.addWidget(sidebar)
+        dock_layout.addWidget(self.terminal_stack, 1)
+        return dock
+    # [FN CLOSED] _build_terminal_dock
+
+    def _switch_terminal_tab(self, index):
+        self.terminal_stack.setCurrentIndex(index)
+        if index == 1 and self.python_terminal.process is None:
+            self.python_terminal.run_python_repl()
 
     def _toggle_info_popup(self, widget, force_open=False):
         if self.info_popup.currentWidget() is widget and self.info_popup.isVisible() and not force_open:
@@ -1366,12 +1467,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if sizes[1] > 0:
             self._claude_pane_width = sizes[1]
             self.splitter.setSizes([sizes[0] + sizes[1], 0])
-            self.claude_tab_btn.setIcon(draw_icon('arrow-right', 14))
+            self.claude_tab_btn.setIcon(draw_icon('arrow-left', 12))
         else:
             restore = self._claude_pane_width or 360
             total = sum(sizes)
             self.splitter.setSizes([max(200, total - restore), restore])
-            self.claude_tab_btn.setIcon(draw_icon('arrow-left', 14))
+            self.claude_tab_btn.setIcon(draw_icon('arrow-right', 12))
+        self._position_claude_tab()
     # [FN CLOSED] _toggle_claude_pane
 
     # [FN CATEGORY] _navigate_to_element — jumps the editor to a cross-reference element by its key
@@ -1564,11 +1666,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             if widget:
                 widget.deleteLater()
         for path in self._recent_folders()[:5]:
-            btn = QPushButton(path)
-            btn.setMaximumWidth(720)
-            btn.setStyleSheet(theme.BUTTON_STYLE)
-            btn.clicked.connect(lambda _checked=False, p=path: self._open_project_folder(p))
-            self.recent_layout.addWidget(btn)
+            card = RecentFolderCard(path)
+            card.clicked.connect(self._open_project_folder)
+            self.recent_layout.addWidget(card)
 
     def _open_folder(self):
         path = QFileDialog.getExistingDirectory(self, 'Apri cartella')
@@ -2192,13 +2292,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             text += '  ●'
         self.filename_label.setText(text)
         self.filename_label.setStyleSheet(f'color:{theme.ACCENT if (tab and tab.dirty) else theme.DIM};')
-        self.title_bar.set_save_state(tab is not None, tab.dirty if tab else False)
         self.file_path_label.setText(os.path.basename(tab.path) if tab else '')
 
     def _update_syntax_status(self):
         tab = self.active_tab
         if tab is None:
             self.syntax_label.setText('')
+            if hasattr(self, 'errors_view'):
+                self.errors_view.clear()
             return
         path = tab.path
         text = serialize_kant(tab.tree)
@@ -2236,7 +2337,35 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         else:
             self.syntax_label.setText(f"ERR riga {result.get('line', 1)}: {result['message']}{lsp_text}")
             self.syntax_label.setStyleSheet(f'color:{theme.TAG_COLORS["TST"]}; font-weight:700;')
+        self._refresh_errors_view(tab, result)
     # [FN CLOSED] _apply_syntax_status
+
+    # [FN CATEGORY] _refresh_errors_view — mirrors whatever _apply_syntax_status just decided is
+    # authoritative for the active file into the terminal dock's errors tab: the full LSP
+    # diagnostics list when a server is running and has any, otherwise the single local syntax
+    # error (same source result already merged into syntax_label, just as a clickable list here).
+    # [FN] _refresh_errors_view — populates the errors tab from the active file's current status
+    # [FN OPEN] _refresh_errors_view
+    def _refresh_errors_view(self, tab, local_result):
+        if not hasattr(self, 'errors_view'):
+            return
+        self.errors_view.clear()
+        path = tab.path
+        diagnostics = self.lsp_diagnostics.get(os.path.abspath(path), [])
+        entries = diagnostics[:100] if diagnostics else (
+            [] if local_result.get('ok', True) else [{
+                'range': {'start': {'line': local_result.get('line', 1) - 1}}, 'message': local_result.get('message', ''),
+            }]
+        )
+        for diag in entries:
+            line = diag.get('range', {}).get('start', {}).get('line', 0) + 1
+            message = diag.get('message', '').splitlines()[0]
+            item = QTreeWidgetItem(self.errors_view, [f'{os.path.basename(path)}:{line}: {message}'])
+            item.setData(0, ROLE_KIND, 'diagnostic-result')
+            item.setData(0, ROLE_PATH, path)
+            item.setData(0, ROLE_LINE, line)
+            item.setData(0, ROLE_TEXT, message)
+    # [FN CLOSED] _refresh_errors_view
 
     def _lsp_first_error(self, path):
         """First Error-severity (LSP severity 1, or unspecified) diagnostic for path, or None."""

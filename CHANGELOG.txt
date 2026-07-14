@@ -1,5 +1,18 @@
 KANT IDE changelog
 
+2026-07-13 (22)
+- Fixed the AI terminal tab: it now sits at the pane's own inner-left edge (tracking the splitter divider) instead of floating at the shell's outer-right edge over the pane's own content when expanded, and is smaller (16x60 vs 22x90). Its arrow now points right while expanded, left while collapsed.
+- Added a left sidebar inside the bottom terminal panel to switch between the real shell, a Python REPL (a second TerminalPane running `python -i -u`, started lazily on first switch), and a live list of the active file's errors (LSP diagnostics or local syntax check, whichever applies) — clicking an error jumps to that line.
+- Made the MAPPA window fixed: removed its header row (title text, drag-to-move, and the x close button) and its resize grip — it now only ever occupies the toolbar-to-statusbar band _position_map_dialog already computes, never dragged or resized by the user. The drill-mode "back to full map" button moved into the toolbar. Closing/reopening stays on the MAPPA tab handle, unaffected.
+- Removed the save-state icon next to the logo (redundant with the existing dirty-dot already shown in the filename label) and replaced the back button's arrow with a house icon.
+- Modernized the welcome screen: a centered card (badge, title, description, accent-colored "Apri cartella" button) instead of loose centered widgets, and recent projects are now two-line cards (bold name over dim full path, hover-highlighted) instead of plain buttons showing the raw path.
+- The Git button now routes into a `git init` flow when the project has no repository yet, instead of just refusing. Hovering the button (not just clicking) shows its quick-actions dropdown.
+
+2026-07-13 (21)
+- Added a one-window Git panel (GitPanelDialog): clicking the Git title-bar button now opens branch switch, a checkbox list of every changed file (checked = staged), a diff preview for the selected file, and a commit box, all together — instead of a dropdown of six separate actions each needing its own click-and-remember-which-file. The individual Git menu actions stay wired underneath for the command palette and the tree's right-click menu.
+- Made KANT element descriptions in the coding panel bigger (CODE_FONT_PT-2 -> CODE_FONT_PT-1).
+- Fixed a regression from round 11: suppressing the redundant "[TAG] name" title on an isolated view's outermost element also silently removed its ⋮ metadata-edit button, the only way to edit that element's tag/name/description. The button now stays, right-aligned on its own row, even with the title gone.
+
 2026-07-13 (20)
 - Added a global crash handler (kant_editor._install_crash_handler): an uncaught exception anywhere in the app now writes a timestamped log to ~/.kant_ide/crash_logs and shows an error dialog, instead of vanishing silently on a windowed (no console) launch.
 - Split test_kant_smoke.py's single ~950-line test into 26 focused test_* methods, one per feature area, so a failing assertion names what broke and individual tests are runnable in isolation (pytest -k). Also fixed a Windows-only flake where a MainWindow's QFileSystemWatcher could keep its temp directory locked past the test's own cleanup.
