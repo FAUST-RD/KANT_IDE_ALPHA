@@ -28,7 +28,7 @@ from pathlib import Path
 import shiboken6
 
 from PySide6.QtCore import (
-    QElapsedTimer, QEvent, QFileSystemWatcher, QObject, QPointF, QProcess, QRect, QRectF, Qt, QSettings, QSize,
+    QElapsedTimer, QFileSystemWatcher, QObject, QPointF, QProcess, QRect, QRectF, Qt, QSettings, QSize,
     QStringListModel, Signal, QTimer,
 )
 from PySide6.QtGui import (
@@ -681,8 +681,9 @@ def _agent_command(agent, prompt, auto_permissions=False, model=None, effort=Non
     model_args = ('--model', model) if model else ()
     if agent == 'codex':
         effort_args = ('-c', f'model_reasoning_effort="{effort}"') if effort else ()
+        permission_args = ('--sandbox', 'workspace-write', '--ask-for-approval', 'never') if auto_permissions else ()
         return 'codex', [
-            'exec', *session_args, *(('--full-auto',) if auto_permissions else ()),
+            'exec', *session_args, *permission_args,
             *model_args, *effort_args, prompt,
         ]
     effort_args = ('--effort', effort) if effort else ()
@@ -724,24 +725,22 @@ MODEL_DEFAULT = '(predefinito)'
 
 # [CST] CLAUDE_MODELS — current Claude model IDs accepted by `claude -p --model`, per Anthropic's
 # own model catalog (Fable 5, Opus 4.8, Sonnet 5, Haiku 4.5, and the immediately preceding Opus/
-# Sonnet releases). The combo stays editable so an older/newer ID can always be typed in directly.
+# Sonnet releases). Keep this compact preset list aligned with the supported CLI catalog.
 CLAUDE_MODELS = (
     MODEL_DEFAULT, 'claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5',
     'claude-fable-5', 'claude-opus-4-7', 'claude-sonnet-4-6',
 )
-# ponytail: unlike Claude's model list, there's no equivalent verified live catalog for Codex here
-# — these are the most recent OpenAI Codex CLI model names known at the time this was written, not
-# a guaranteed-current source. The combo is editable specifically so this list can go stale
-# gracefully: type the real value over it instead of waiting for a code update.
+# Current recommended Codex models; keep this compact preset list aligned with the CLI catalog.
 CODEX_MODELS = (
-    MODEL_DEFAULT, 'gpt-5.1-codex-max', 'gpt-5.1-codex', 'gpt-5-codex', 'o4-mini',
+    MODEL_DEFAULT, 'gpt-5.6', 'gpt-5.4', 'gpt-5.6-terra', 'gpt-5.3-codex-spark',
 )
 
 # [CST] EFFORT_LEVELS — a real flag for claude (--effort), a config override for codex
-# (model_reasoning_effort) — both applied by _agent_command. Codex has no 'xhigh'/'max' tier.
+# (model_reasoning_effort) — both applied by _agent_command. Availability depends on the selected
+# model and is ultimately validated by the installed CLI.
 EFFORT_LEVELS = {
-    'claude': (MODEL_DEFAULT, 'low', 'medium', 'high', 'xhigh', 'max'),
-    'codex': (MODEL_DEFAULT, 'low', 'medium', 'high'),
+    'claude': (MODEL_DEFAULT, 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'),
+    'codex': (MODEL_DEFAULT, 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'),
 }
 
 
@@ -826,21 +825,14 @@ class ClaudePane(QWidget):
         self.agent_select.setToolTip('Quale CLI AI usare per i messaggi inviati da questa plancia')
         header.addWidget(self.agent_select)
         self.model_select = QComboBox()
-        self.model_select.setEditable(True)
-        self.model_select.setToolTip("Modello per l'agente selezionato (modificabile: puoi scrivere un ID non in elenco)")
+        self.model_select.setToolTip("Modello per l'agente selezionato")
         self.model_select.addItems(CLAUDE_MODELS)
-        # editable QComboBox: the internal line edit shows an I-beam text cursor by default, which
-        # reads as "select/copy this text" — it's a dropdown picker, not a text field, so both the
-        # combo box and its line edit need the pointer cursor explicitly
         self.model_select.setCursor(Qt.PointingHandCursor)
-        self.model_select.lineEdit().setCursor(Qt.PointingHandCursor)
         header.addWidget(self.model_select)
         self.effort_select = QComboBox()
-        self.effort_select.setEditable(True)
         self.effort_select.setToolTip("Reasoning effort per l'agente selezionato")
         self.effort_select.addItems(EFFORT_LEVELS['claude'])
         self.effort_select.setCursor(Qt.PointingHandCursor)
-        self.effort_select.lineEdit().setCursor(Qt.PointingHandCursor)
         header.addWidget(self.effort_select)
         header.addStretch(1)
         self.auto_permissions = QCheckBox('Automatico')
@@ -883,14 +875,17 @@ class ClaudePane(QWidget):
         self.send_btn.setIcon(draw_icon('arrow-right', 14))
         self.send_btn.setIconSize(QSize(14, 14))
         self.send_btn.setCursor(Qt.PointingHandCursor)
-        self.send_btn.setToolTip('Invia il messaggio (Ctrl+Return); se un comando e in corso, lo interrompe')
+        self.send_btn.setToolTip('Invia il messaggio (Invio); se un comando è in corso, lo interrompe')
         self.send_btn.clicked.connect(self._send)
         self.send_btn.setFixedHeight(42)
         composer.addWidget(self.send_btn, 0, Qt.AlignBottom)
         layout.addLayout(composer)
 
         self.agent_select.currentIndexChanged.connect(self._agent_changed)
-        self._agent_changed()
+        if not shutil.which('claude') and shutil.which('codex'):
+            self.set_agent('codex')
+        else:
+            self._agent_changed()
         self.apply_style()
 
     def apply_style(self):
@@ -943,13 +938,10 @@ class ClaudePane(QWidget):
         self.auto_permissions.setEnabled(self._agent() == 'claude')
         current = self.model_select.currentText().strip()
         models = CODEX_MODELS if is_codex else CLAUDE_MODELS
-        other_models = CLAUDE_MODELS if is_codex else CODEX_MODELS
         self.model_select.clear()
         self.model_select.addItems(models)
         if current in models:
             self.model_select.setCurrentText(current)
-        elif current and current != MODEL_DEFAULT and current not in other_models:
-            self.model_select.setEditText(current)  # a genuinely custom string — keep it
         else:
             self.model_select.setCurrentIndex(0)  # a preset from the other agent doesn't carry over
         current_effort = self.effort_select.currentText().strip()
@@ -1047,6 +1039,7 @@ class ClaudePane(QWidget):
         self.cwd = cwd
         self._claude_session_id = None
         self._codex_resumable = False
+        self._session_allowed_tools.clear()
         self._append(f'Cartella di lavoro: {cwd}')
 
     def refresh_focus_label(self):
@@ -1164,18 +1157,31 @@ class ClaudePane(QWidget):
         command = _agent_executable(agent)
         executable = shutil.which(command)
         self.current_agent = agent
-        self._session_allowed_tools.clear()
         self._add_message(prompt, 'user')
         self._write_log(f'\n[{agent_label}]> {prompt}\n')
         if not executable:
-            self._append(f'{command} non trovato nel PATH.\n')
+            self._append(
+                f'{command} non trovato nel PATH. Installa e autentica la CLI, poi riavvia KANT IDE; '
+                f'puoi intanto selezionare l’altro agente dal menu.\n'
+            )
             return False
         self._auto_permissions_once = bool(auto_permissions_once and agent == 'claude')
         # context_hint (the coding panel's current file/element, unless GLOBAL is on) rides the
         # same hidden system-prompt channel as the KANT comment standard — never part of the
         # visible prompt/chat bubble, reaches the model the identical way for both providers
         skill_prompts = [_load_skill_prompt(name) for name in ('kant-comment-standard', *extra_skills)]
-        system_prompt = '\n\n'.join(p for p in (*skill_prompts, context_hint) if p)
+        # context_hint FIRST, skill bodies after — verified live (direct CLI runs, 6/6 vs 6/6):
+        # with the hint placed after the ~3.5KB kant-comment-standard body (comment-tagging rules,
+        # entirely unrelated to answering a question), the model reliably ignored it and asked the
+        # user to paste code instead of reading the focused file itself — no wording of the hint
+        # fixed that, including an explicit "this overrides your default instinct" flagged block.
+        # Moving the hint first fixed it 3/3; a long, off-topic block placed after clearly wins out
+        # over an earlier instruction more than that instruction's own wording strength does.
+        system_prompt = '\n\n'.join(p for p in (context_hint, *skill_prompts) if p)
+        # logged so a "the AI ignored my focus" report can be checked against what was actually sent,
+        # instead of guessing — this is the one piece of the hidden system prompt that changes per
+        # message and per coding-panel state, unlike the static skill bodies
+        self._write_log(f'[{agent_label} context_hint]> {context_hint!r}\n')
         if agent == 'codex' and system_prompt:
             try:
                 self.system_prompt_file = _write_system_prompt_file(system_prompt)
@@ -2008,7 +2014,7 @@ class TitleBar(QWidget):
         self.lsp_lint_menu_action.triggered.connect(window._run_lint_check)
         layout.addWidget(self.lsp_menu_btn)
 
-        self.git_menu_btn = self._menu_button('Git', 'Clic: apri il pannello Git completo. Passaggio del mouse: azioni rapide (stage, commit, branch...)')
+        self.git_menu_btn = self._menu_button('Git', 'Apri il pannello Git completo')
         git_menu = self.git_menu_btn.menu()
         git_menu.setToolTipsVisible(True)
         self.git_refresh_menu_action = git_menu.addAction('Refresh')
@@ -2033,12 +2039,10 @@ class TitleBar(QWidget):
         self.git_more_menu_action = git_menu.addAction('Altro...')
         self.git_more_menu_action.setToolTip('Apri il pannello Git completo')
         self.git_more_menu_action.triggered.connect(window._open_git_panel)
-        # clicking Git opens the one-window panel (branch/stage/diff/commit together, or the git-init
-        # flow if this project has no repo yet) instead of this dropdown; hovering still shows the
-        # dropdown's quick actions without needing a click, via the eventFilter below
+        # Clicking Git opens the one-window panel (branch/stage/diff/commit together, or the git-init
+        # flow if this project has no repo yet) instead of this dropdown.
         self.git_menu_btn.clicked.disconnect()
         self.git_menu_btn.clicked.connect(window._open_git_panel)
-        self.git_menu_btn.installEventFilter(self)
         layout.addWidget(self.git_menu_btn)
 
         self.filename_label = QLabel('')
@@ -2054,15 +2058,50 @@ class TitleBar(QWidget):
             self.appearance_menu_btn, self.lsp_menu_btn, self.git_menu_btn,
         ]
 
+        # top-right corner: window chrome (minimize/maximize/close) with Run/Debug in a second row
+        # directly beneath it, so both are reachable from the same corner without a full-width
+        # toolbar row for just two icons — a QVBoxLayout keeps the rows aligned under each other.
+        corner = QWidget()
+        corner_layout = QVBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.setSpacing(2)
+
+        chrome_row = QHBoxLayout()
+        chrome_row.setContentsMargins(0, 0, 0, 0)
+        chrome_row.setSpacing(0)
         chrome_tooltips = {'−': 'Riduci a icona', '□': 'Massimizza/ripristina la finestra', '×': "Chiudi l'IDE"}
         for text, callback in (('−', window.showMinimized), ('□', self._toggle_maximized), ('×', window.close)):
             btn = QPushButton(text)
-            btn.setFixedSize(36, 28)
+            btn.setFixedSize(36, 26)
             btn.setToolTip(chrome_tooltips[text])
             btn.clicked.connect(callback)
             self.buttons.append(btn)
             btn.setStyleSheet(theme.BUTTON_STYLE)
-            layout.addWidget(btn)
+            chrome_row.addWidget(btn)
+        corner_layout.addLayout(chrome_row)
+
+        run_debug_row = QHBoxLayout()
+        run_debug_row.setContentsMargins(0, 0, 0, 0)
+        run_debug_row.setSpacing(2)
+        run_debug_row.addStretch(1)
+        self.run_btn = QToolButton()
+        self.run_btn.setIcon(draw_icon('run', 16))
+        self.run_btn.setIconSize(QSize(16, 16))
+        self.run_btn.setFixedSize(28, 24)
+        self.run_btn.setToolTip('Esegui (Ctrl+R)')
+        self.run_btn.clicked.connect(window._run_current_file)
+        run_debug_row.addWidget(self.run_btn)
+        self.debug_btn = QToolButton()
+        self.debug_btn.setIcon(draw_icon('debug', 16))
+        self.debug_btn.setIconSize(QSize(16, 16))
+        self.debug_btn.setFixedSize(28, 24)
+        self.debug_btn.setToolTip('Debug (F5)')
+        self.debug_btn.clicked.connect(window._debug_current_file)
+        run_debug_row.addWidget(self.debug_btn)
+        corner_layout.addLayout(run_debug_row)
+
+        self.buttons.extend([self.run_btn, self.debug_btn])
+        layout.addWidget(corner)
         self.apply_style()
 
     def _menu_button(self, text, tooltip=None):
@@ -2081,21 +2120,6 @@ class TitleBar(QWidget):
         if menu is not None:
             menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
-    # [FN CATEGORY] eventFilter — QToolButton has no built-in "show menu on hover" popup mode (only
-    # click-driven ones), so the Git button's quick-actions dropdown is surfaced on QEvent.Enter
-    # here instead — the button's own click is wired to open the git panel, not this menu, so this
-    # is the only way to reach the individual quick actions from the button itself now.
-    # [FN] eventFilter — shows the Git button's dropdown on mouse-enter instead of click
-    # [FN OPEN] eventFilter
-    def eventFilter(self, obj, event):
-        if obj is self.git_menu_btn and event.type() == QEvent.Enter:
-            menu = self.git_menu_btn.menu()
-            if menu is not None and not menu.isVisible():
-                menu.exec(self.git_menu_btn.mapToGlobal(self.git_menu_btn.rect().bottomLeft()))
-            return False
-        return super().eventFilter(obj, event)
-    # [FN CLOSED] eventFilter
-
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
         self.theme_menu_action.setText('Giorno' if self.window.night_mode else 'Notte')
@@ -2104,8 +2128,8 @@ class TitleBar(QWidget):
         # label) was squeezing its 16px icon down to a sliver inside the fixed 32x28 button
         icon_button_style = theme.BUTTON_STYLE.replace('padding:7px 13px;', 'padding:4px;')
         for btn in self.buttons:
-            if btn is self.back_btn:
-                btn.setStyleSheet(icon_button_style)
+            if btn in (self.back_btn, self.run_btn, self.debug_btn):
+                btn.setStyleSheet(icon_button_style.replace('QPushButton', 'QToolButton') if isinstance(btn, QToolButton) else icon_button_style)
             else:
                 btn.setStyleSheet(tool_button_style if isinstance(btn, QToolButton) else theme.BUTTON_STYLE)
         active = self.window.active_tab if hasattr(self.window, 'tabs') else None

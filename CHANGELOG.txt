@@ -1,5 +1,46 @@
 KANT IDE changelog
 
+2026-07-15 (44)
+- Found and fixed the actual remaining cause of the AI ignoring the focused file/element and asking the user to paste code instead: the hidden context_hint was joined AFTER the ~3.5KB kant-comment-standard skill body in the system prompt (`system_prompt = skill_prompts + context_hint`). Verified live via direct CLI runs against a reproduction project that this ordering made Claude ask the user to paste code instead of reading the focused file itself, reliably (6/6 runs across two hint wordings, including an explicit "this overrides your default instinct" flagged block) — no wording fix alone resolved it. Reordering so context_hint comes FIRST and the skill body follows fixed it 6/6 times across the same wordings, including the exact production hint text unchanged. A long, off-topic instruction block positioned after a shorter one can silently override it regardless of that shorter instruction's own wording strength — order mattered far more than emphasis here. Affects both Claude (--append-system-prompt/-file) and Codex (temp-file-read instruction), since both build system_prompt through the same join.
+
+2026-07-15 (43)
+- Moved the results panel's close X to a new thin top row above the incoming/outgoing bar, so it sits at the same height as the results list's own "Risultati" header instead of down at the bottom.
+- Moved Run and Debug from the action toolbar into the title bar's top-right corner, in their own row directly beneath minimize/maximize/close; added a new ladybug-style "debug" icon (kant/icons.py). Also fixed a stale tooltip while touching this: Run's tooltip said "(F5)" but F5 has always triggered Debug (Ctrl+R runs) — Run now correctly says "(Ctrl+R)" and Debug says "(F5)".
+
+2026-07-15 (42)
+- Strengthened the hidden AI context hint (_build_ai_context_hint) that scopes chat replies to the currently focused file/element: it now explicitly states the assistant already has read access to the project and to read the target file itself rather than asking the user to paste code. Verified via direct CLI testing that the delivery mechanism itself (--append-system-prompt, with/without --resume, with/without the permission-approval flags, with the full real skill-body + hint combined) works correctly in every configuration tried; the softer previous wording ("Esaminalo nel progetto; non chiedere allegati") still left room for a model to default to asking for pasted code on a vague, non-editing question. Also logs the actual context_hint sent for each message (kant-ai-terminal.log) so a future "AI ignored my focus" report can be checked against what was really sent instead of guessed at.
+
+2026-07-15 (41)
+- MAPPA: module-to-module connections (the aggregate arrow a collapsed file's node carries, summing every underlying element's own in/out) now start hidden by default when the map opens, so it shows individual element-level references first rather than a wall of module-to-module summary arrows. The existing "Connessioni: MOD" toolbar toggle re-enables them; the aggregation itself (every sub-element's in/out, however deeply nested, folded onto the collapsed root) was already correct, only the default visibility changed.
+
+2026-07-15 (40)
+- Enlarged the terminal dock's sidebar icons (Terminale/Terminale Python/Errori) from 15px (in a 24px button) to 22px (in a 32px button), sidebar widened 28px -> 36px to fit.
+
+2026-07-15 (39)
+- Increased MAPPA's automatic minimum gap between nodes from 10 to 30 pixels.
+
+2026-07-15 (38)
+- Fixed AI context for nested coding-board sections: when a parent module tab stays active, the focused or most-visible inner code block now supplies its real symbols (for example `__all__` and `TEST_USER_EMAIL`) to the compact hidden prompt.
+
+2026-07-15 (37)
+- Fixed deictic AI requests such as "queste variabili". Variable tabs now contribute their real assigned identifiers to the compact hidden focus (`__init__.py::__all__,TEST_USER_EMAIL,...`) instead of the KANT group label. GLOBAL no longer suppresses context: it sends the absolute project root and retains the active view as the immediate focus.
+
+2026-07-15 (36)
+- Reduced the hidden coding-plancia AI context to one localized line: project-relative file path plus the element's real code name (`path::symbol`). Removed KANT tags/descriptions and source payloads to minimize prompt usage; wording follows the persisted `language` setting, defaulting to English.
+
+2026-07-15 (35)
+- Fixed AI requests about the coding plancia being answered with "no module attached": the hidden context now includes the exact in-memory source of the active file or KANT element (including unsaved edits), tells the agent to use it without requesting an attachment, and remains absent from the visible chat. The existing Claude system-prompt and Codex temporary-file delivery paths are reused.
+
+2026-07-15 (34)
+- Removed the separate element-tab panel from the coding plancia. Parent files and their KANT elements now open in the same native coding tab bar, while sharing one parsed document, undo state, dirty state, and save lifecycle per file.
+
+2026-07-15 (33)
+- Fixed MAPPA selection highlighting: visible parent/child belonging connections now count as direct neighbours, so selecting an element also keeps its connected container or child fully highlighted.
+
+2026-07-15 (32)
+- Fixed section navigation overwriting the module view: selecting functions/classes from the KANT tree now opens one independent split tab per `(file, element)` while keeping the file/module tab intact, so multiple views of the same file can coexist.
+- Fixed AI focus ignoring split tabs: the visible `Focus:` summary and hidden context instruction now follow the last selected main or split editor page, including switches between multiple elements from the same file.
+
 2026-07-15 (31)
 - Fixed the hidden context_hint (scoping AI edits to the currently isolated file/element, unless GLOBAL is on) being effectively ignored on Codex: every single Codex message — not just genuine /kant-code-map runs — was unconditionally rewritten into "this is an explicit request to run /kant-code-map on the current project... create or update KANT_<project>.md", burying both the real request and the hidden scoping instruction underneath an unrelated project-wide tagging task. Confirmed Claude's own delivery mechanism (--append-system-prompt) is unaffected by --resume via a direct CLI check, so this was Codex-only. The /kant-code-map wrapper now only applies when the call actually is one (extra_skills contains 'kant-code-map'); every other Codex message gets a neutral "read this temp file for context, then answer the request below" framing instead.
 

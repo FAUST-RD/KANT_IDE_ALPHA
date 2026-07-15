@@ -66,7 +66,7 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 
 ### Navigate a KANT section
 
-The project tree stores path, UID, and document order. `_on_tree_item_clicked` opens the file and resolves the node by UID; legacy files whose generated UID changed on reparse fall back to document order. `_render_view` then isolates that node.
+The project tree stores path, UID, and document order. `_on_tree_item_clicked` opens the file and resolves the node by UID; legacy files whose generated UID changed on reparse fall back to document order. The file and each selected KANT section use the same main coding tab bar; element tabs share their parent `FileTab` tree, undo state, and save lifecycle.
 
 ### Build Incoming/Outgoing and MAPPA
 
@@ -74,7 +74,7 @@ The project tree stores path, UID, and document order. `_on_tree_item_clicked` o
 
 ### Run an AI edit safely
 
-`WorkspaceMixin._prepare_ai_snapshot` snapshots the project before `ClaudePane.run_prompt` starts a CLI process. On completion, `build_ai_review` computes deterministic file/hunk choices, `_AiReviewCard` collects the decision, and `apply_ai_review` or `rollback_snapshot` finishes the transaction.
+`MainWindow._build_ai_context_hint` sends Claude/Codex one compact hidden line containing the active project-relative path and real code symbol names; variable groups use their assigned identifiers. Within a parent module tab, the focused or most-visible inner code block refines that context automatically. GLOBAL adds the absolute project root while retaining the active view as the immediate focus. `WorkspaceMixin._prepare_ai_snapshot` snapshots the project before `ClaudePane.run_prompt` starts a CLI process. On completion, `build_ai_review` computes deterministic file/hunk choices, `_AiReviewCard` collects the decision, and `apply_ai_review` or `rollback_snapshot` finishes the transaction.
 
 ### React to external filesystem changes
 

@@ -192,6 +192,7 @@ def _element_degree(el, elements=None, active_edge_tags=None):
 # matches what was laid out).
 MIN_NODE_W, MAX_NODE_W = 170, 320
 MIN_NODE_H, MAX_NODE_H = 22, 42
+MIN_NODE_GAP = 30.0
 ANCHOR_SIZE = 16  # small unmarked "common origin" circle footprint — fixed, not traffic-scaled
 
 
@@ -334,7 +335,7 @@ def _force_layout_positions(elements, fixed=None, seed=None, active_edge_tags=No
         # soft aesthetic preference above, so two boxes never actually overlap on screen. Defined as
         # a closure (not inlined once) because the median-Y pass below moves nodes again afterward
         # and can reintroduce overlaps — it needs re-running, not just running once.
-        margin = 10.0
+        margin = MIN_NODE_GAP
 
         def resolve_overlaps():
             for _ in range(40):
@@ -401,6 +402,19 @@ def _force_layout_positions(elements, fixed=None, seed=None, active_edge_tags=No
                 median_y = ys[len(ys) // 2]
                 positions[key][1] += (median_y - positions[key][1]) * 0.12
             resolve_overlaps()
+        # Pairwise pushes can cycle in dense graphs; one ordered sweep makes the gap a hard bound.
+        # Persisted/dragged positions are fixed by design and are never silently rearranged.
+        if not fixed:
+            placed = []
+            for key in sorted(keys, key=lambda k: (positions[k][1], positions[k][0], k)):
+                width, height = sizes[key]
+                positions[key][1] = max((
+                    positions[other][1] + (sizes[other][1] + height) / 2 + margin
+                    for other in placed
+                    if abs(positions[key][0] - positions[other][0])
+                    < (width + sizes[other][0]) / 2 + margin
+                ), default=positions[key][1])
+                placed.append(key)
     if not fixed and not seed:
         min_x = min(point[0] for point in positions.values())
         min_y = min(point[1] for point in positions.values())
@@ -1041,6 +1055,9 @@ class XrefMapView(QGraphicsView):
             if key in self._elements:
                 el = self._elements[key]
                 neighbours |= {key} | set(el.incoming) | set(el.outgoing)
+        for parent, child, _line in self._containment_edges:
+            if parent in self._pinned or child in self._pinned:
+                neighbours |= {parent, child}
         for k, rect in self._node_items.items():
             active = show_all or k in neighbours
             rect.setOpacity(1.0 if active else 0.18)
@@ -1191,7 +1208,11 @@ class XrefMapDialog(QDialog):
         self._elements = {}
         self._display = {}                              # last rendered display nodes
         self._active_tags = set(self.TAG_ORDER) - {'TST'}   # tests hidden by default
-        self._active_edge_tags = set(self.TAG_ORDER)     # which tags' reference edges are drawn at all
+        # MOD edges include the aggregated module-to-module connections a collapsed file's node
+        # carries (the sum of every underlying element's own in/out, via _display_elements' dkey
+        # remap) — start those hidden so the map opens showing individual element-level references,
+        # not a wall of module-to-module summary arrows; the "Connessioni: MOD" toggle re-enables them.
+        self._active_edge_tags = set(self.TAG_ORDER) - {'MOD'}
         self._show_containment = True    # the neutral "belonging" connections, toggled alongside the tags
         self._rtl = False    # False = code flow reads left-to-right (default); True = right-to-left
         self._expanded = set()                          # files shown expanded; set_graph() fills this with every file on each open

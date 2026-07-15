@@ -200,6 +200,27 @@ def draw_icon(kind, size=16, color=None):
         r = size * 0.055
         p.drawEllipse(QRectF(mid - r, size - m * 0.95, r * 2, r * 2))
 
+    elif kind == 'debug':
+        # a simple ladybug glyph (oval body + antennae + three legs per side) — the common
+        # "debug" shorthand across IDEs, distinct enough from 'run' (a plain play triangle) at a
+        # glance even at small sizes
+        p.setBrush(QColor(color))
+        body_w, body_h = size * 0.42, size * 0.56
+        p.drawEllipse(QRectF(mid - body_w / 2, mid - body_h / 2, body_w, body_h))
+        p.setBrush(Qt.transparent)
+        pen = QPen(QColor(color))
+        pen.setWidthF(max(1.0, size * 0.07))
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        top = mid - body_h / 2
+        for dx, dy in ((-1, -1), (-1, 0), (-1, 1), (1, -1), (1, 0), (1, 1)):
+            p.drawLine(
+                int(mid + dx * body_w * 0.45), int(mid + dy * body_h * 0.28),
+                int(mid + dx * body_w * 0.9), int(mid + dy * body_h * 0.42),
+            )
+        p.drawLine(int(mid - body_w * 0.18), int(top), int(mid - body_w * 0.35), int(top - size * 0.12))
+        p.drawLine(int(mid + body_w * 0.18), int(top), int(mid + body_w * 0.35), int(top - size * 0.12))
+
     elif kind == 'home':
         # outline-only (like target/nest/warning above), not a solid fill — a filled silhouette's
         # door would need to be cut out in the exact backdrop color, which varies with theme/hover

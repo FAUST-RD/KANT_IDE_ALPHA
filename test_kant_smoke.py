@@ -37,7 +37,7 @@ from kant.widgets import (
     ClaudePane, CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard,
     _AiReviewCard, _agent_command, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
 )
-from kant.mappa import XrefMapDialog, XrefMapView, _force_layout_positions, _element_degree, _element_size
+from kant.mappa import MIN_NODE_GAP, XrefMapDialog, XrefMapView, _force_layout_positions, _element_degree, _element_size
 from kant import gitops as kant_gitops_module
 from kant.gitops import GitPanelDialog
 from kant.workspace import (
@@ -203,13 +203,15 @@ class KantSmokeTest(unittest.TestCase):
     def test_claude_pane_effort_selector_and_send_shortcut(self):
         window = MainWindow()
         pane = window.claude_pane
+        pane.set_agent('claude')
+        assert not pane.model_select.isEditable() and not pane.effort_select.isEditable()
         # effort options sync per agent, same shape as the existing model selector
         assert pane.effort_select.currentText() == MODEL_DEFAULT
         claude_efforts = [pane.effort_select.itemText(i) for i in range(pane.effort_select.count())]
         assert 'xhigh' in claude_efforts and 'max' in claude_efforts
         pane.agent_select.setCurrentIndex(pane.agent_select.findData('codex'))
         codex_efforts = [pane.effort_select.itemText(i) for i in range(pane.effort_select.count())]
-        assert 'xhigh' not in codex_efforts and 'high' in codex_efforts  # codex has no xhigh/max tier
+        assert 'xhigh' in codex_efforts and 'ultra' in codex_efforts
         pane.agent_select.setCurrentIndex(pane.agent_select.findData('claude'))
 
         pane.effort_select.setCurrentText('high')
@@ -287,13 +289,18 @@ class KantSmokeTest(unittest.TestCase):
         assert launch_args[1][1]['effort'] == 'high'
 
     def test_agent_command_building(self):
-        assert '--full-auto' in _agent_command('codex', 'tagga', True)[1]
+        automatic = _agent_command('codex', 'tagga', True)[1]
+        assert '--full-auto' not in automatic
+        assert automatic[:5] == ['exec', '--sandbox', 'workspace-write', '--ask-for-approval', 'never']
         # --model must precede the trailing prompt positional for both agents, or the CLI would
         # consume the flag/value as the prompt itself instead of the actual prompt text
         claude_args = _agent_command('claude', 'ciao', model='claude-opus-4-8')[1]
         assert claude_args == ['--model', 'claude-opus-4-8', '-p', 'ciao']
-        codex_args = _agent_command('codex', 'ciao', True, 'gpt-5.1-codex')[1]
-        assert codex_args == ['exec', '--full-auto', '--model', 'gpt-5.1-codex', 'ciao']
+        codex_args = _agent_command('codex', 'ciao', True, 'gpt-5.6')[1]
+        assert codex_args == [
+            'exec', '--sandbox', 'workspace-write', '--ask-for-approval', 'never',
+            '--model', 'gpt-5.6', 'ciao',
+        ]
         assert _agent_command('claude', 'ciao')[1] == ['-p', 'ciao']  # no --model when unset
         # effort: a real flag for claude, a config override for codex — both come after --model,
         # before the trailing prompt positional
@@ -334,7 +341,9 @@ class KantSmokeTest(unittest.TestCase):
                 pass
 
         original_process_cls = kant_widgets_module.QProcess
+        original_which = kant_widgets_module.shutil.which
         kant_widgets_module.QProcess = _ProcessStub
+        kant_widgets_module.shutil.which = lambda command: command
         pane = ClaudePane(os.getcwd())
         try:
             pane.set_agent('claude')
@@ -358,10 +367,16 @@ class KantSmokeTest(unittest.TestCase):
 
             # switching project resets both providers' tracked session
             pane.process = None
+            pane._session_allowed_tools.add('Edit')
+            assert pane.run_prompt('mantieni permesso')
+            assert 'Edit' in pane._session_allowed_tools
+            pane.process = None
             pane.set_cwd(os.getcwd())
             assert pane._claude_session_id is None and pane._codex_resumable is False
+            assert not pane._session_allowed_tools
         finally:
             kant_widgets_module.QProcess = original_process_cls
+            kant_widgets_module.shutil.which = original_which
             pane.deleteLater()
 
     def test_codex_context_hint_not_reframed_as_kant_code_map(self):
@@ -406,6 +421,11 @@ class KantSmokeTest(unittest.TestCase):
             with open(pane.system_prompt_file, encoding='utf-8') as f:
                 saved_instructions = f.read()
             assert 'applica le modifiche solo a [FN] alpha' in saved_instructions
+            # context_hint must come BEFORE the kant-comment-standard skill body: verified live
+            # (direct CLI runs) that a long, unrelated skill body positioned before the hint made
+            # Claude ignore it and ask the user to paste code instead of reading the focused file
+            # itself, 6/6 times across two hint wordings; reordering hint-first fixed it 6/6 times.
+            assert saved_instructions.index('applica le modifiche solo a [FN] alpha') < saved_instructions.index('KANT comment standard')
 
             pane.process = None
             assert pane.run_prompt(
@@ -417,23 +437,92 @@ class KantSmokeTest(unittest.TestCase):
             kant_widgets_module.QProcess = original_process_cls
             pane.deleteLater()
 
+    def test_claude_context_hint_precedes_skill_body(self):
+        # same bug, Claude's own delivery path (--append-system-prompt / --append-system-prompt-file
+        # instead of a temp-file-read instruction): verified live that the hint being positioned
+        # AFTER the ~3.5KB kant-comment-standard body made Claude reliably (6/6 runs, two wordings)
+        # ask the user to paste code instead of reading the coding panel's focused file itself, no
+        # matter how strongly the hint was worded; reordering hint-first fixed it 6/6 times.
+        class _ProcessStub:
+            captured = []
+
+            def __init__(self, _parent=None):
+                self.readyReadStandardOutput = self.readyReadStandardError = self
+                self.errorOccurred = self.finished = self
+
+            def connect(self, *_args):
+                pass
+
+            def setWorkingDirectory(self, _cwd):
+                pass
+
+            def start(self, _executable, args):
+                _ProcessStub.captured.append(args)
+
+            def closeWriteChannel(self):
+                pass
+
+        original_process_cls = kant_widgets_module.QProcess
+        kant_widgets_module.QProcess = _ProcessStub
+        pane = ClaudePane(os.getcwd())
+        try:
+            pane.set_agent('claude')
+            assert pane.run_prompt(
+                'cosa ne pensi di queste variabili',
+                context_hint='Implicit context: shop/__init__.py::__all__. Read it yourself.',
+            )
+            args = _ProcessStub.captured[-1]
+            system_prompt = args[args.index('--append-system-prompt') + 1]
+            assert system_prompt.index('Implicit context') < system_prompt.index('KANT comment standard')
+        finally:
+            kant_widgets_module.QProcess = original_process_cls
+            pane.deleteLater()
+
     def test_ai_context_hint(self):
         hint_tree = parse_kant('\n'.join([
             '# [MOD OPEN #hm1] hint.py',
             '# [FN OPEN #hf1] alpha', 'def alpha(): pass', '# [FN CLOSED #hf1] alpha',
+            '# [FN OPEN #hf2] beta', 'def beta(): pass', '# [FN CLOSED #hf2] beta',
+            '# [VAR OPEN #hv1] exported package modules',
+            '__all__ = ["server"]', 'TEST_USER_EMAIL = "test@example.com"',
+            '# [VAR CLOSED #hv1] exported package modules',
             '# [MOD CLOSED #hm1] hint.py',
         ]))
         hint_tab = type('Tab', (), {'tree': hint_tree, 'path': 'hint.py', 'filter_uid': None})()
         hint_window = MainWindow.__new__(MainWindow)
         hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: hint_tab})()
         hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
+        hint_window.settings = type('Settings', (), {'value': lambda _self, _key, _default: 'it'})()
         whole_file_hint = MainWindow._build_ai_context_hint(hint_window)
-        assert 'hint.py' in whole_file_hint and 'non menzionarlo' in whole_file_hint
+        assert whole_file_hint == (
+            'Contesto implicito: hint.py. Hai accesso in lettura al progetto in questa cartella — se '
+            'il messaggio non nomina esplicitamente un file diverso, leggi tu stesso hint.py dal '
+            'filesystem per rispondere. Non chiedere all\'utente di incollare il codice.'
+        )
         hint_tab.filter_uid = 'hf1'
         element_hint = MainWindow._build_ai_context_hint(hint_window)
-        assert 'alpha' in element_hint and 'FN' in element_hint
+        assert element_hint == (
+            'Contesto implicito: hint.py::alpha. Hai accesso in lettura al progetto in questa '
+            'cartella — se il messaggio non nomina esplicitamente un file diverso, leggi tu stesso '
+            'hint.py::alpha dal filesystem per rispondere. Non chiedere all\'utente di incollare il codice.'
+        )
+        assert 'FN' not in element_hint and 'def alpha' not in element_hint  # no KANT or source payload
+        hint_tab.filter_uid = None
+        hint_tab._ai_focus_uid = 'hv1'  # focused inner block while the whole module tab stays open
+        focused_variable_hint = MainWindow._build_ai_context_hint(hint_window)
+        assert 'hint.py::__all__,TEST_USER_EMAIL' in focused_variable_hint
+        hint_tab.filter_uid = 'hv1'
+        variable_hint = MainWindow._build_ai_context_hint(hint_window)
+        assert 'hint.py::__all__,TEST_USER_EMAIL' in variable_hint
+        assert 'VAR' not in variable_hint and 'exported package modules' not in variable_hint
+        hint_window.settings = type('Settings', (), {'value': lambda _self, _key, _default: 'en'})()
+        assert MainWindow._build_ai_context_hint(hint_window).startswith('Implicit context: hint.py::__all__,TEST_USER_EMAIL.')
         hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: True})()
-        assert MainWindow._build_ai_context_hint(hint_window) is None  # GLOBAL suppresses the hint entirely
+        hint_window.project_root_path = 'C:/project'
+        hint_tab.path = 'C:/project/hint.py'
+        global_hint = MainWindow._build_ai_context_hint(hint_window)
+        assert global_hint.startswith('Root: C:/project | View: hint.py::__all__,TEST_USER_EMAIL.')
+        assert 'Use the whole root' in global_hint
         hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: None})()
         hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
         assert MainWindow._build_ai_context_hint(hint_window) is None  # no open tab -> nothing to scope to
@@ -520,7 +609,7 @@ class KantSmokeTest(unittest.TestCase):
             assert len(tree_window._local_reference_locations('helper')) == 2
             tree_window.close()
 
-    def test_legacy_file_uid_fallback_tab_identity_and_split_pane(self):
+    def test_legacy_file_uid_fallback_and_shared_coding_tabs(self):
         with _temp_dir() as tmp:
             root = Path(tmp)
             source_dir = root / 'src'
@@ -565,14 +654,18 @@ class KantSmokeTest(unittest.TestCase):
             stale_uid = beta_item.data(0, ROLE_UID)
             tree_window._on_tree_item_clicked(beta_item, 0)
             legacy_tab = tree_window.open_tabs[str(legacy)]
-            assert legacy_tab.filter_uid is not None and legacy_tab.filter_uid != stale_uid  # reparse minted a new uid
-            assert legacy_tab.view_layout.count() == 1
-            isolated_widget = legacy_tab.view_layout.itemAt(0).widget()
-            isolated_codes = [c.toPlainText().strip() for c in isolated_widget.findChildren(CodeEdit)]
-            assert isolated_codes == ['def beta(): pass']  # not alpha too — the whole-file fallback would show both
+            assert legacy_tab.filter_uid is None  # the module remains open in the main page
+            beta_page = tree_window.tabs.currentWidget()
+            resolved_uid = beta_page._element_key[1]
+            assert resolved_uid != stale_uid  # document order recovered the uid minted by the reparse
+            assert [c.toPlainText().strip() for c in beta_page.findChildren(CodeEdit)] == ['def beta(): pass']
+            tree_window._close_tab(tree_window.tabs.indexOf(beta_page))
+
+            # Exercise isolated-main-view chrome independently; section clicks no longer mutate it.
+            tree_window._render_view(legacy_tab, resolved_uid)
 
             # the main tab's own title (next to its close x) follows the isolated KANT element's
-            # identity too, not the filename — matching the split pane's header convention. The plain
+            # identity too, not the filename — matching the element-tab convention. The plain
             # tab text is cleared in favor of a rich-HTML label (_tab_label) using the same
             # colored/bold "[TAG] name" convention as the tree and coding panel.
             legacy_idx = tree_window.tabs.indexOf(legacy_tab)
@@ -608,7 +701,7 @@ class KantSmokeTest(unittest.TestCase):
             assert tree_window.file_path_label.text() == 'legacy.py'
 
             # the outermost element of an isolated view has its "[TAG] name" title suppressed — the
-            # tab/title-bar/split-header already announce that identity, so repeating it inline would
+            # tab and title bar already announce that identity, so repeating it inline would
             # be redundant; the panel starts directly with the category description instead. A NESTED
             # element (not the one being isolated) keeps its own header, since nothing else names it.
             nested_source = source_dir / 'nested.py'
@@ -629,18 +722,21 @@ class KantSmokeTest(unittest.TestCase):
             assert isinstance(cls_widget, CollapsibleSection) and cls_widget.toggle_btn is None
             cls_labels = ' '.join(l.text() for l in cls_widget.findChildren(QLabel))
             assert '[CLS]' not in cls_labels and 'a class that does stuff' in cls_labels  # no title, category kept
-            # the "[TAG] name" title is suppressed here (redundant with the tab/split header), but the
+            # the "[TAG] name" title is suppressed here (redundant with the tab label), but the
             # metadata-edit (⋮) button must still be reachable — it's the only way to edit this
             # element's tag/name/description, whether or not a title is shown for it
             assert any(btn.text() == '⋮' for btn in cls_widget.findChildren(QToolButton))
             assert isinstance(fn_widget, LeafSection)
+            fn_edit = fn_widget.findChild(CodeEdit)
+            assert fn_edit.kant_node is fn_node
+            assert tree_window._visible_ai_context_uid(nested_tab) == fn_node.uid
+            tree_window._on_focus_changed(None, fn_edit)
+            assert tree_window._ai_context_target() == (nested_tab, fn_node.uid)
             fn_labels = ' '.join(l.text() for l in fn_widget.findChildren(QLabel))
             assert '[FN]' in fn_labels  # nested element still gets its own header
 
-            # split tabs: identity is the KANT element, not a filename tab, and it must not disturb
-            # whatever the main pane currently has active. A different element gets its OWN tab
-            # instead of overwriting whichever one is currently showing; double-clicking the SAME
-            # element again switches to its existing tab instead of duplicating it.
+            # Element views use the same coding tab bar as their parent file: no secondary menu or
+            # panel. A different element gets its own tab; reopening the same one reuses it.
             alpha_section = None
             beta_section = None
             it = tree_window.tree.invisibleRootItem()
@@ -656,38 +752,53 @@ class KantSmokeTest(unittest.TestCase):
                 for i in range(candidate.childCount()):
                     stack.append(candidate.child(i))
             assert alpha_section is not None and beta_section is not None
+            assert not hasattr(tree_window, 'split_tabs')  # one native coding tab bar, no ad-hoc menu
             main_filter_before = legacy_tab.filter_uid
-            assert tree_window.split_tabs.isHidden()  # tree_window is never shown, so isVisible() is unusable here
-            tree_window._on_tree_item_double_clicked(alpha_section, 0)
-            assert not tree_window.split_tabs.isHidden()
-            assert tree_window.split_tabs.count() == 1
-            assert tree_window.split_tabs.tabText(0) == '[FN] alpha'  # KANT identity, not "legacy.py"
+            tab_count_before = tree_window.tabs.count()
+            tree_window._on_tree_item_clicked(alpha_section, 0)
+            assert tree_window.tabs.count() == tab_count_before + 1
             assert legacy_tab.filter_uid == main_filter_before  # main pane untouched
-            alpha_page = tree_window.split_tabs.widget(0)
+            alpha_page = tree_window.tabs.currentWidget()
+            assert '[FN]' in alpha_page._tab_label.text() and 'alpha' in alpha_page._tab_label.text()
+            assert alpha_page._file_tab is legacy_tab
             split_codes = [c.toPlainText().strip() for c in alpha_page.findChildren(CodeEdit)]
             assert split_codes == ['def alpha(): pass']
 
             # double-clicking the SAME element again switches to its existing tab, no duplicate
             tree_window._on_tree_item_double_clicked(alpha_section, 0)
-            assert tree_window.split_tabs.count() == 1
+            assert tree_window.tabs.count() == tab_count_before + 1
+            assert tree_window.tabs.currentWidget() is alpha_page
 
             # a DIFFERENT element (same parent module) opens its own tab alongside the first
-            tree_window._on_tree_item_double_clicked(beta_section, 0)
-            assert tree_window.split_tabs.count() == 2
-            assert tree_window.split_tabs.tabText(1) == '[FN] beta'
-            beta_page = tree_window.split_tabs.widget(1)
+            tree_window._on_tree_item_clicked(beta_section, 0)
+            assert tree_window.tabs.count() == tab_count_before + 2
+            beta_page = tree_window.tabs.currentWidget()
+            assert '[FN]' in beta_page._tab_label.text() and 'beta' in beta_page._tab_label.text()
+            assert tree_window.active_tab is legacy_tab and tree_window._active_filter_uid() == beta_page._element_key[1]
             beta_codes = [c.toPlainText().strip() for c in beta_page.findChildren(CodeEdit)]
             assert beta_codes == ['def beta(): pass']
-            assert tree_window.split_tabs.widget(0) is alpha_page  # first tab untouched by the second
+            assert tree_window.tabs.indexOf(alpha_page) != -1  # first tab untouched by the second
+            assert 'beta' in tree_window._build_ai_focus_summary()
+            assert 'beta' in tree_window._build_ai_context_hint()
+            assert tree_window.filename_label.text() == '[FN] beta'
 
-            tree_window._close_split_tab(0)
-            assert tree_window.split_tabs.count() == 1
-            assert not tree_window.split_tabs.isHidden()  # one tab still open
+            # Both tabs are views of one document: switching refreshes the destination from the
+            # shared tree instead of exposing a stale second copy of the file.
+            beta_page.findChildren(CodeEdit)[0].setPlainText('def beta(): return 1')
+            tree_window.tabs.setCurrentWidget(legacy_tab)
+            assert 'def beta(): return 1' in [c.toPlainText().strip() for c in legacy_tab.findChildren(CodeEdit)]
+            tree_window.tabs.setCurrentWidget(beta_page)
+            assert beta_page.findChildren(CodeEdit)[0].toPlainText().strip() == 'def beta(): return 1'
+
+            tree_window._close_tab(tree_window.tabs.indexOf(alpha_page))
+            assert tree_window.tabs.indexOf(alpha_page) == -1
+            assert tree_window.tabs.indexOf(beta_page) != -1
 
             # closing the tab the remaining split page is showing must close that page too, not
             # leave it pointing at a tab that's been torn down
             tree_window._close_tab(tree_window.tabs.indexOf(legacy_tab), flush=False)
-            assert tree_window.split_tabs.isHidden() and tree_window.split_tabs.count() == 0
+            assert tree_window.tabs.indexOf(beta_page) == -1
+            assert not any(page._file_tab is legacy_tab for page in tree_window._element_pages.values())
             tree_window.close()
 
     def test_mappa_geometry_drag_reorder_and_tab_label_leak(self):
@@ -717,7 +828,10 @@ class KantSmokeTest(unittest.TestCase):
             toolbar_bottom = mappa_window.action_toolbar.mapToGlobal(mappa_window.action_toolbar.rect().bottomLeft()).y()
             status_top = mappa_window.statusBar().mapToGlobal(mappa_window.statusBar().rect().topLeft()).y()
             assert abs(dialog.geometry().top() - toolbar_bottom) <= 1
-            assert abs(dialog.geometry().bottom() - status_top) <= 1
+            # Qt's offscreen Windows plugin can retain a 5px invisible top-level frame margin.
+            assert abs(dialog.geometry().bottom() - status_top) <= 6, (
+                dialog.geometry().bottom(), status_top, dialog.geometry(), mappa_window.geometry()
+            )
             assert dialog.width() == window_width_at_show
 
             # the MAPPA tab sits centered on the dialog's own top edge while open (pointing down
@@ -1085,6 +1199,16 @@ class KantSmokeTest(unittest.TestCase):
             moved = []
             map_view.nodeMoved.connect(lambda *args: moved.append(args))
             map_view.set_data(graph)
+            containment_graph = {
+                'parent': XrefElement('parent', 'parent', 'CLS', 'parent', 'Parent', 'a.py', 0),
+                'child': XrefElement('child', 'child', 'FN', 'child', 'Child', 'a.py', 1, parent='parent'),
+                'other': XrefElement('other', 'other', 'FN', 'other', 'Other', 'b.py', 0),
+            }
+            map_view.set_data(containment_graph)
+            map_view.select('child')
+            assert map_view._node_items['parent'].opacity() == 1.0
+            assert map_view._node_items['other'].opacity() == 0.18
+            map_view.set_data(graph)
             assert all(item.flags() & QGraphicsItem.ItemIsMovable for item in map_view._node_items.values())
             old_edge = map_view._edges[0][2].path().boundingRect()
             map_view._node_items['a'].moveBy(100, 60)
@@ -1166,6 +1290,9 @@ class KantSmokeTest(unittest.TestCase):
                 rw, rh = sizes[right]
                 overlapping = lx < rx + rw and lx + lw > rx and ly < ry + rh and ly + lh > ry
                 assert not overlapping, f'{left} and {right} overlap: {positions[left]} vs {positions[right]}'
+                gap_x = max(rx - lx - lw, lx - rx - rw, 0)
+                gap_y = max(ry - ly - lh, ly - ry - rh, 0)
+                assert gap_x ** 2 + gap_y ** 2 >= (MIN_NODE_GAP - 0.02) ** 2
 
     def test_xref_map_dialog_expand_collapse(self):
         with _temp_dir() as tmp:
@@ -1198,6 +1325,56 @@ class KantSmokeTest(unittest.TestCase):
             assert len(expand_dialog._display) == 2  # double-click again re-expands it
             expand_dialog.close()
             QSettings('KANT', 'KANT Editor').remove(expand_dialog._position_key)
+
+    def test_xref_map_module_edges_aggregate_but_hidden_by_default(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            app = self.app
+            # two files, each with a module root and two children; only the CHILDREN reference
+            # across files (the module roots themselves have no direct edge of their own) — this is
+            # exactly the case that needs aggregation: a real module-to-module connection only
+            # exists once the underlying elements' in/out are summed onto the collapsed roots.
+            graph = {
+                'mod_a': XrefElement('mod_a', 'mod_a', 'MOD', 'a.py', 'Modulo A', 'a.py', 0),
+                'a1': XrefElement('a1', 'a1', 'FN', 'a1', 'A uno', 'a.py', 1, outgoing=['b1']),
+                'a2': XrefElement('a2', 'a2', 'FN', 'a2', 'A due', 'a.py', 2, outgoing=['b2']),
+                'mod_b': XrefElement('mod_b', 'mod_b', 'MOD', 'b.py', 'Modulo B', 'b.py', 0),
+                'b1': XrefElement('b1', 'b1', 'FN', 'b1', 'B uno', 'b.py', 1, incoming=['a1']),
+                'b2': XrefElement('b2', 'b2', 'FN', 'b2', 'B due', 'b.py', 2, incoming=['a2']),
+            }
+            dialog = XrefMapDialog()
+            dialog.resize(900, 650)
+            # MOD connections must start disabled — the map should open showing individual
+            # element-level references, not module-to-module summary arrows
+            assert 'MOD' not in dialog._active_edge_tags
+            assert dialog.edge_tag_buttons['MOD'].isChecked() is False
+            dialog.set_graph(graph, 'agg', str(root / 'agg-project'))
+            dialog.show()
+            app.processEvents()
+            assert len(dialog._display) == 6  # every open starts fully expanded
+
+            # collapse both modules (double-click each root), aggregating their children's edges
+            for key in ('mod_a', 'mod_b'):
+                node = dialog.view._node_items[key]
+                click = dialog.view.mapFromScene(node.sceneBoundingRect().center())
+                QTest.mouseDClick(dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, click)
+                app.processEvents()
+            assert set(dialog._display) == {'mod_a', 'mod_b'}
+            # the DATA must show the full sum of both children's connections (a1->b1, a2->b2), not
+            # just one of them and not a dropped/partial aggregate
+            assert dialog._display['mod_a'].outgoing == ['mod_b']
+            assert sorted(dialog._display['mod_a'].outgoing_detail) == ['b1', 'b2']
+            assert sorted(dialog._display['mod_b'].incoming_detail) == ['a1', 'a2']
+            # but the RENDERED edge between the two collapsed (MOD-tagged) roots must stay hidden
+            # since the MOD edge-tag toggle defaults off
+            assert dialog.view._edges == []
+
+            # re-enabling the toggle reveals the very same aggregated connection
+            dialog.edge_tag_buttons['MOD'].setChecked(True)
+            app.processEvents()
+            assert any(source == 'mod_a' and target == 'mod_b' for source, target, *_ in dialog.view._edges)
+            dialog.close()
+            QSettings('KANT', 'KANT Editor').remove(dialog._position_key)
 
     def test_xref_map_drill_down(self):
         with _temp_dir() as tmp:
@@ -1298,10 +1475,8 @@ class KantSmokeTest(unittest.TestCase):
             MainWindow._delete_tree_item(delete_window, delete_item, 'file')
             assert events == ['flush', ('close', False), 'move']
 
-    def test_git_button_hover_shows_dropdown(self):
-        # QToolButton has no built-in "show menu on hover" mode, so this is a manual eventFilter —
-        # QMenu.exec is monkeypatched (instance-level, a plain Python call site so this shadows it
-        # fine) to a non-blocking recorder, since the real exec() opens a blocking modal loop
+    def test_git_button_hover_does_not_show_dropdown(self):
+        # Hover opening was intentionally removed: only the full Git panel opens from the button.
         window = MainWindow()
         menu = window.title_bar.git_menu_btn.menu()
         calls = []
@@ -1311,7 +1486,7 @@ class KantSmokeTest(unittest.TestCase):
             window.title_bar.eventFilter(window.title_bar.git_menu_btn, QEvent(QEvent.Enter))
         finally:
             menu.exec = original_exec
-        assert len(calls) == 1
+        assert calls == []
 
         # "Altro..." (the dropdown's last item, after a separator) reaches the full Git panel —
         # same destination as clicking the button itself, for whoever opens it via the dropdown
@@ -1481,7 +1656,7 @@ class KantSmokeTest(unittest.TestCase):
         assert test_window._test_run_pending is False
         assert test_window.results_view.topLevelItemCount() == 1
         root_item = test_window.results_view.topLevelItem(0)
-        assert 'failed' in root_item.text(0)
+        assert 'failed' in root_item.text(0), root_item.text(0)
         fail_labels = [root_item.child(i).text(0) for i in range(root_item.childCount())]
         assert any('test_sample.py::test_should_fail' in label for label in fail_labels)
         fail_item = next(root_item.child(i) for i in range(root_item.childCount()) if 'test_should_fail' in root_item.child(i).text(0))
@@ -1504,21 +1679,24 @@ class KantSmokeTest(unittest.TestCase):
             fmt_window._ide_message = lambda title, msg: applied.append(('MESSAGE', msg))
 
             original_which = kant_mainwindow_module.shutil.which
+            original_has_module = kant_mainwindow_module.has_module
             original_run = kant_mainwindow_module.subprocess.run
 
             def fake_which(name):
                 return '/usr/bin/black' if name == 'black' else None
 
             def fake_run(args, input=None, capture_output=None, text=None, timeout=None):
-                assert args[0] == 'black'
+                assert args[:3] == [sys.executable, '-m', 'black']
                 return subprocess.CompletedProcess(args, 0, stdout=input.replace('x=1', 'x = 1'), stderr='')
 
             kant_mainwindow_module.shutil.which = fake_which
+            kant_mainwindow_module.has_module = lambda _python, module: module == 'black'
             kant_mainwindow_module.subprocess.run = fake_run
             try:
                 MainWindow._format_with_external_tool(fmt_window)
             finally:
                 kant_mainwindow_module.shutil.which = original_which
+                kant_mainwindow_module.has_module = original_has_module
                 kant_mainwindow_module.subprocess.run = original_run
             assert len(applied) == 1
             assert 'x = 1' in applied[0][0]
@@ -1604,18 +1782,18 @@ class KantSmokeTest(unittest.TestCase):
         window.deleteLater()
 
     def test_project_chrome_hidden_on_welcome_shown_after_open(self):
-        # File/Cerca/LSP/Git act on tabs/files/the project tree — on the welcome screen (no project
-        # open yet) they used to be active menus with nothing useful inside. isHidden(), not
+        # The title-bar menus belong to the project workspace, so none appear on the welcome screen.
+        # isHidden(), not
         # isVisible(): window is never shown in this test, so isVisible() would be False regardless
         # of these calls (it also accounts for the whole unshown ancestor chain).
         window = MainWindow()
         project_menus = (
             window.title_bar.file_menu_btn, window.title_bar.search_menu_btn,
-            window.title_bar.lsp_menu_btn, window.title_bar.git_menu_btn,
+            window.title_bar.appearance_menu_btn, window.title_bar.lsp_menu_btn,
+            window.title_bar.git_menu_btn,
         )
         assert all(btn.isHidden() for btn in project_menus)
         assert window.action_toolbar.isHidden()
-        assert not window.title_bar.appearance_menu_btn.isHidden()  # theme/palette stay useful regardless
 
         project_root = Path(tempfile.mkdtemp())
         window._ide_yes_no = lambda *_args, **_kwargs: False  # decline the KANT-tagging prompts
@@ -1966,7 +2144,7 @@ class KantSmokeTest(unittest.TestCase):
 
             assert window._test_run_pending is False
             root_item = window.results_view.topLevelItem(0)
-            assert 'failed' in root_item.text(0)
+            assert 'failed' in root_item.text(0), root_item.text(0)
             assert root_item.childCount() == 1  # only the targeted test ran, not test_ok
             assert 'test_should_fail' in root_item.child(0).text(0)
 # [TST CLOSED] KantSmokeTest

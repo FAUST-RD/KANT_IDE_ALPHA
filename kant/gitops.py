@@ -234,9 +234,8 @@ class GitPanelDialog(QDialog):
 # [CLS] GitOpsMixin — git status/diff/stage/commit/branch actions for MainWindow
 # [CLS OPEN] GitOpsMixin
 class GitOpsMixin:
-    # [FN CATEGORY] _open_git_panel — the Git title-bar button's primary click action (the
-    # dropdown's individual actions stay wired underneath, reachable on hover, for the command
-    # palette and tree context menu too). With no repository yet, routes into a `git init` flow
+    # [FN CATEGORY] _open_git_panel — the Git title-bar button's primary click action. With no
+    # repository yet, routes into a `git init` flow
     # instead of just refusing — the panel is useless with nothing to show, but "no repo" is a
     # starting state to walk the user out of, not a dead end. One dialog instance is reused across
     # opens, like map_dialog, so branch/file-list state doesn't have to be rebuilt from scratch.

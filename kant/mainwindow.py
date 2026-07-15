@@ -165,6 +165,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.setFont(QFont('Consolas', 10))
 
         self.open_tabs = {}  # path -> FileTab, every currently open file
+        self._ai_context_page = None  # last coding tab selected by the user
         self.settings = QSettings('KANT', 'KANT Editor')  # persists the dragged column width
         self.night_mode = self.settings.value('nightMode', False, type=bool)
         set_theme(self.night_mode)
@@ -539,8 +540,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             for tab in self.open_tabs.values():
                 tab.apply_style()
                 self._render_view(tab, tab.filter_uid)
+            if hasattr(self.active_page, '_element_key'):
+                self._render_element_page(self.active_page)
             if self.active_tab is not None:
-                self._update_io_tabs(self.active_tab.filter_uid)
+                self._update_io_tabs(self._active_filter_uid())
         self._refresh_recent_folders()
 
     # [FN CATEGORY] _build_action_toolbar — a persistent one-click icon row for the highest-
@@ -557,11 +560,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.setContentsMargins(10, 5, 10, 5)
         layout.setSpacing(4)
         self.action_toolbar_buttons = {}
+        # Run/Debug live in the title bar's corner (under minimize/maximize/close), not here
         for key, tooltip, callback in (
             ('save', 'Salva (Ctrl+S)', self._save_file),
             ('undo', 'Annulla file (Ctrl+Z)', self._undo_file),
             ('redo', 'Ripeti file (Ctrl+Y)', self._redo_file),
-            ('run', 'Esegui (F5)', self._run_current_file),
             ('find', 'Trova nel file (Ctrl+F)', self._show_find_bar),
         ):
             btn = QToolButton()
@@ -729,36 +732,22 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(self._on_active_tab_changed)
+        self.tabs.tabBarClicked.connect(lambda index: self._set_ai_context_page(self.tabs.widget(index)))
 
         self.tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
-        # each double-clicked element gets its own split_tabs page, keyed by (file path, uid) —
-        # a second double-click on an already-open element switches to its existing page instead
-        # of duplicating it; a different element opens a new page alongside it, not over it
-        self._split_pages = {}
-        self.split_tabs = QTabWidget()
-        self.split_tabs.setTabsClosable(True)
-        self.split_tabs.setDocumentMode(True)
-        self.split_tabs.tabCloseRequested.connect(self._close_split_tab)
-        self.split_tabs.hide()  # only relevant once something has been opened into it
-
-        self.editor_splitter = QSplitter(Qt.Horizontal)
-        self.editor_splitter.addWidget(self.tabs)
-        self.editor_splitter.addWidget(self.split_tabs)
-        self.editor_splitter.setStretchFactor(0, 1)
-        self.editor_splitter.setStretchFactor(1, 1)
-        saved_editor_sizes = self.settings.value('editorSplitterSizes')
-        if saved_editor_sizes and len(saved_editor_sizes) == 2:
-            self.editor_splitter.setSizes([int(x) for x in saved_editor_sizes])
-        self.editor_splitter.splitterMoved.connect(
-            lambda *_: self.settings.setValue('editorSplitterSizes', self.editor_splitter.sizes())
-        )
+        # Each element view is another page in the same tab bar, backed by the file's one FileTab.
+        self._element_pages = {}
+        # the one unpinned "preview" element page (VS Code-style): clicking a new KANT element
+        # retargets this same tab slot instead of adding a new one, until the user pins it — see
+        # _show_element_tab/_retarget_element_page/_pin_element_page
+        self._preview_page = None
 
         view_panel = QWidget()
         view_panel_layout = QVBoxLayout(view_panel)
         view_panel_layout.setContentsMargins(0, 0, 0, 0)
         view_panel_layout.setSpacing(0)
         view_panel_layout.addWidget(self._build_find_bar())
-        view_panel_layout.addWidget(self.editor_splitter, 1)
+        view_panel_layout.addWidget(self.tabs, 1)
         self.io_tabs = self._build_io_tabs()
         view_panel_layout.addWidget(self.io_tabs)
 
@@ -856,6 +845,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _on_focus_changed(self, _old, new):
         if isinstance(new, CodeEdit):
             self._update_cursor_position_label(new)
+            page = new
+            while page is not None and not isinstance(page, FileTab) and not hasattr(page, '_element_key'):
+                page = page.parentWidget()
+            node = getattr(new, 'kant_node', None)
+            if page is not None and node is not None:
+                page._ai_focus_uid = node.uid
+            self._set_ai_context_page(page)
             if not hasattr(new, '_status_bar_wired'):
                 new._status_bar_wired = True
                 new.cursorPositionChanged.connect(lambda e=new: self._update_cursor_position_label(e))
@@ -938,25 +934,79 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # nothing extra is added, the prompt goes exactly as typed, project-wide.
     # [FN] _build_ai_context_hint — ClaudePane.context_hint callback
     # [FN OPEN] _build_ai_context_hint
-    def _build_ai_context_hint(self):
-        if self.global_mode_btn.isChecked():
-            return None
-        tab = self.active_tab
+    def _ai_context_target(self):
+        page = getattr(self, '_ai_context_page', None) or self.active_page
+        file_tab = getattr(page, '_file_tab', None)
+        tab = file_tab or (page if isinstance(page, FileTab) else self.active_tab)
         if tab is None:
+            return None, None
+        default_uid = page._element_key[1] if file_tab is not None else tab.filter_uid
+        return tab, getattr(page, '_ai_focus_uid', None) or self._visible_ai_context_uid(page) or default_uid
+
+    def _visible_ai_context_uid(self, page):
+        if not hasattr(page, 'findChildren'):
             return None
-        if tab.filter_uid:
-            node = self._find_node_by_uid(tab.tree, tab.filter_uid)
-            if node is not None:
-                label = node.desc or node.name
-                return (
-                    f'Contesto implicito (non menzionarlo esplicitamente all\'utente): applica le '
-                    f'modifiche richieste specificamente all\'elemento [{node.tag}] "{label}" nel file '
-                    f'{tab.path}, non all\'intero progetto, salvo diversa indicazione esplicita nel messaggio.'
+        viewport = page.scroll_area.viewport() if isinstance(page, FileTab) else page.viewport()
+        best = (0, None)
+        for edit in page.findChildren(CodeEdit):
+            node = getattr(edit, 'kant_node', None)
+            if node is None:
+                continue
+            pos = edit.mapTo(viewport, QPoint(0, 0))
+            width = max(0, min(pos.x() + edit.width(), viewport.width()) - max(pos.x(), 0))
+            height = max(0, min(pos.y() + edit.height(), viewport.height()) - max(pos.y(), 0))
+            best = max(best, (width * height, node.uid))
+        return best[1]
+
+    def _set_ai_context_page(self, page):
+        if page is None:
+            return
+        self._ai_context_page = page
+        if hasattr(self, 'claude_pane'):
+            self.claude_pane.refresh_focus_label()
+
+    def _build_ai_context_hint(self):
+        tab, uid = self._ai_context_target()
+        root = getattr(self, 'project_root_path', None)
+        italian = str(self.settings.value('language', 'en')).lower().startswith('it')
+        target = None
+        if tab is not None:
+            node = self._find_node_by_uid(tab.tree, uid) if uid else None
+            path = os.path.relpath(tab.path, root).replace(os.sep, '/') if root else tab.path
+            symbol = node.name if node is not None else None
+            if node is not None and node.tag in {'VAR', 'CST'}:
+                names = re.findall(
+                    r'(?m)^\s*(?:const\s+|let\s+|var\s+)?([A-Za-z_]\w*)\s*(?::[^=\n]+)?\s*=(?!=)',
+                    serialize_kant(Node(tag='ROOT', name='', open_raw=None, body=[node])),
                 )
+                if names:
+                    # ponytail: twelve names keep the hint bounded; the remainder count preserves scope.
+                    symbol = ','.join(names[:12]) + (f',+{len(names) - 12}' if len(names) > 12 else '')
+            target = f'{path}::{symbol}' if symbol else path
+        if self.global_mode_btn.isChecked():
+            root_label = (root or '.').replace(os.sep, '/')
+            view = f' | {"Vista" if italian else "View"}: {target}' if target else ''
+            return (
+                f'Root: {root_label}{view}. Hai accesso in lettura a tutto il progetto in questa '
+                f'cartella: esplora e leggi i file che ti servono direttamente dal filesystem invece '
+                f'di chiedere all\'utente di incollarli. Usa tutta la root; la vista è solo il focus.' if italian else
+                f'Root: {root_label}{view}. You have read access to the whole project in this '
+                f'directory: explore and read whatever files you need directly from the filesystem '
+                f'instead of asking the user to paste them. Use the whole root; the view is just the focus.'
+            )
+        if target is None:
+            return None
+        # imperative and explicit on purpose: a softer phrasing ("inspect it", "don't ask for
+        # attachments") still leaves room for the model to default to asking the user to paste code
+        # for a vague, non-editing question — stating outright that it already has read access and
+        # naming the exact action to take (read this file yourself) closes that gap.
         return (
-            f'Contesto implicito (non menzionarlo esplicitamente all\'utente): applica le modifiche '
-            f'richieste specificamente al file {tab.path}, non all\'intero progetto, salvo diversa '
-            f'indicazione esplicita nel messaggio.'
+            f'Contesto implicito: {target}. Hai accesso in lettura al progetto in questa cartella — '
+            f'se il messaggio non nomina esplicitamente un file diverso, leggi tu stesso {target} dal '
+            f'filesystem per rispondere. Non chiedere all\'utente di incollare il codice.' if italian else
+            f'Implicit context: {target}. You have read access to the project in this directory — '
+            f'unless the message explicitly names a different file, read {target} yourself from the '
+            f'filesystem to answer. Do not ask the user to paste the code.'
         )
     # [FN CLOSED] _build_ai_context_hint
 
@@ -969,12 +1019,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _build_ai_focus_summary(self):
         if self.global_mode_btn.isChecked():
             return 'intero progetto'
-        tab = self.active_tab
+        tab, uid = self._ai_context_target()
         if tab is None:
             return None
         rel_path = os.path.relpath(tab.path, self.project_root_path) if self.project_root_path else tab.path
-        if tab.filter_uid:
-            node = self._find_node_by_uid(tab.tree, tab.filter_uid)
+        if uid:
+            node = self._find_node_by_uid(tab.tree, uid)
             if node is not None:
                 label = node.desc or node.name
                 return f'[{node.tag}] "{label}" in {rel_path}'
@@ -995,8 +1045,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.action_toolbar_buttons['save'].setEnabled(has_tab)
         self.action_toolbar_buttons['undo'].setEnabled(bool(has_tab and self.active_tab.undo_stack))
         self.action_toolbar_buttons['redo'].setEnabled(bool(has_tab and self.active_tab.redo_stack))
-        self.action_toolbar_buttons['run'].setEnabled(has_tab)
         self.action_toolbar_buttons['find'].setEnabled(has_tab)
+        self.title_bar.run_btn.setEnabled(has_tab)
+        self.title_bar.debug_btn.setEnabled(has_tab)
         self.title_bar.project_search_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.project_replace_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.git_refresh_menu_action.setEnabled(bool(self.git_root))
@@ -1018,17 +1069,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if hasattr(self, 'claude_pane'):
             self.claude_pane.refresh_focus_label()
 
-    # [FN CATEGORY] _build_split_page — one page of split_tabs. A page's identity is a KANT element
-    # ("[FN] alpha — file.py"), not a filename tab — the tab strip label carries that, this just
-    # builds the scrollable content area. Renders straight from the SAME FileTab/Node tree as the
-    # main pane (via _build_node_widgets, already generic over which layout it targets), so editing
-    # here shares save/dirty/undo state with the main pane automatically — it's another view onto
-    # the same data, not a duplicate. Not live-synced against edits made to the same element in the
-    # main pane at the same time (each page's CodeEdit widgets are separate instances); reopening
-    # the element refreshes it.
-    # [FN] _build_split_page — builds one split_tabs page's scroll area and content layout
-    # [FN OPEN] _build_split_page
-    def _build_split_page(self):
+    # [FN] _build_element_page — builds an element view for the main coding tab bar
+    def _build_element_page(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         container = QWidget()
@@ -1038,7 +1080,6 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.setSpacing(1)
         scroll.setWidget(container)
         return scroll, layout
-    # [FN CLOSED] _build_split_page
 
     # [FN CATEGORY] _build_find_bar — Ctrl+F search across every CodeEdit currently in the view (the
     # KANT view splits a file into many small editors, so search has to hop between them, not just
@@ -1120,10 +1161,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN OPEN] _find_in_view
     def _find_in_view(self, forward=True):
         text = self.find_input.text()
-        tab = self.active_tab
-        if not text or tab is None:
+        page = self.active_page
+        if not text or page is None:
             return
-        widgets = tab.view_container.findChildren(CodeEdit)
+        widgets = page.findChildren(CodeEdit)
         if not widgets:
             self.find_status.setText('Nessun risultato')
             return
@@ -1363,6 +1404,23 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # a thin top row for just the close button, so it sits at the same height as whichever
+        # view's own header is showing (results_view's "Risultati") instead of down with the
+        # INCOMING/OUTGOING row at the bottom — hidden/shown together with info_popup itself, since
+        # there's nothing to close while the panel is collapsed
+        self.info_popup_top_bar = QWidget()
+        top_bar_layout = QHBoxLayout(self.info_popup_top_bar)
+        top_bar_layout.setContentsMargins(6, 2, 6, 2)
+        top_bar_layout.addStretch(1)
+        self.info_popup_close_btn = QPushButton('×')
+        self.info_popup_close_btn.setCursor(Qt.PointingHandCursor)
+        self.info_popup_close_btn.setToolTip('Chiudi questo pannello')
+        self.info_popup_close_btn.clicked.connect(self._close_info_popup)
+        top_bar_layout.addWidget(self.info_popup_close_btn)
+        self.info_popup_top_bar.setFixedHeight(26)
+        self.info_popup_top_bar.setVisible(False)
+        layout.addWidget(self.info_popup_top_bar)
+
         self.info_popup = QStackedWidget()
         self.info_popup.addWidget(self.incoming_view)
         self.info_popup.addWidget(self.outgoing_view)
@@ -1390,11 +1448,6 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.file_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.file_path_label.setCursor(Qt.IBeamCursor)
         label_layout.addWidget(self.file_path_label)
-        self.info_popup_close_btn = QPushButton('×')
-        self.info_popup_close_btn.setCursor(Qt.PointingHandCursor)
-        self.info_popup_close_btn.setToolTip('Chiudi questo pannello')
-        self.info_popup_close_btn.clicked.connect(self._close_info_popup)
-        label_layout.addWidget(self.info_popup_close_btn)
         layout.addWidget(label_bar)
 
         panel.setFixedHeight(42)
@@ -1416,6 +1469,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             f'border-bottom:1px solid {theme.BORDER}; padding:4px 8px; font-weight:700; }}'
         )
         self.info_popup.setStyleSheet(f'background:{theme.CODE_BG}; border-top:1px solid {theme.BORDER}; border-bottom:1px solid {theme.BORDER};')
+        self.info_popup_top_bar.setStyleSheet(f'background:{theme.CODE_BG};')
         self.io_tabs.setStyleSheet(f'background:{theme.PANEL}; border-top:1px solid {theme.BORDER};')
         for btn in (self.incoming_label_btn, self.outgoing_label_btn):
             btn.setStyleSheet(theme.BUTTON_STYLE + 'QPushButton { padding:4px 12px; }')
@@ -1467,7 +1521,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.terminal_stack.addWidget(self.errors_view)
 
         sidebar = QWidget()
-        sidebar.setFixedWidth(28)
+        sidebar.setFixedWidth(36)
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(2, 4, 2, 0)
         sidebar_layout.setSpacing(2)
@@ -1478,9 +1532,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         )):
             btn = QToolButton()
             btn.setCheckable(True)
-            btn.setIcon(draw_icon(icon_name, 15))
-            btn.setIconSize(QSize(15, 15))
-            btn.setFixedSize(24, 24)
+            btn.setIcon(draw_icon(icon_name, 22))
+            btn.setIconSize(QSize(22, 22))
+            btn.setFixedSize(32, 32)
             btn.setToolTip(tooltip)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _checked=False, i=index: self._switch_terminal_tab(i))
@@ -1510,10 +1564,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         self.info_popup.setCurrentWidget(widget)
         self.info_popup.setVisible(True)
+        self.info_popup_top_bar.setVisible(True)
         self.io_tabs.setFixedHeight(200)
 
     def _close_info_popup(self):
         self.info_popup.setVisible(False)
+        self.info_popup_top_bar.setVisible(False)
         self.io_tabs.setFixedHeight(42)
 
     # [FN CATEGORY] _open_xref_window — MAPPA opens the cross-reference graph in a dialog internal to
@@ -1780,16 +1836,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         self._open_project_folder(path)
 
-    # [FN CATEGORY] _set_project_chrome_visible — File/Cerca/LSP/Git act on tabs, files, or the
-    # project tree — on the welcome screen they were active menus with nothing useful inside them.
-    # Aspetto (theme toggle + command palette) stays visible regardless; a theme switch is
-    # meaningful even before a project is open.
-    # [FN] _set_project_chrome_visible — shows/hides the project-only title bar menus and toolbar
+    # [FN CATEGORY] _set_project_chrome_visible — title-bar menus and the action toolbar belong to
+    # the project workspace, so the welcome screen keeps only the app identity and window controls.
+    # [FN] _set_project_chrome_visible — shows/hides the project title-bar menus and toolbar
     # [FN OPEN] _set_project_chrome_visible
     def _set_project_chrome_visible(self, visible):
         for btn in (
             self.title_bar.file_menu_btn, self.title_bar.search_menu_btn,
-            self.title_bar.lsp_menu_btn, self.title_bar.git_menu_btn,
+            self.title_bar.appearance_menu_btn, self.title_bar.lsp_menu_btn,
+            self.title_bar.git_menu_btn,
         ):
             btn.setVisible(visible)
         self.action_toolbar.setVisible(visible)
@@ -2130,14 +2185,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 if order < len(nodes):
                     node = nodes[order]
             resolved_uid = node.uid if node is not None else uid
-            self._render_view(tab, resolved_uid)
+            self._show_element_tab(tab, resolved_uid)
             self._update_io_tabs(resolved_uid)
 
-    # [FN CATEGORY] _on_tree_item_double_clicked — sends a file or KANT section to the split pane
-    # instead of the main one. Reuses whatever FileTab is already open for that path rather than
-    # going through _open_file when possible, so double-clicking to populate the split doesn't
-    # also steal focus away from whatever the main pane currently has active.
-    # [FN] _on_tree_item_double_clicked — opens the double-clicked tree item into the split pane
+    # [FN] _on_tree_item_double_clicked — opens the item in the shared coding tab bar
     # [FN OPEN] _on_tree_item_double_clicked
     def _on_tree_item_double_clicked(self, item, _column):
         kind = item.data(0, ROLE_KIND)
@@ -2152,7 +2203,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             if tab is None:
                 return
         if kind == 'file':
-            self._show_in_split(tab, None)
+            self.tabs.setCurrentWidget(tab)
             return
         order = item.data(0, ROLE_ORDER)
         uid = item.data(0, ROLE_UID)
@@ -2161,80 +2212,176 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             nodes = self._nodes_in_order(tab.tree)
             if order < len(nodes):
                 node = nodes[order]
-        self._show_in_split(tab, node.uid if node is not None else uid)
+        self._show_element_tab(tab, node.uid if node is not None else uid)
     # [FN CLOSED] _on_tree_item_double_clicked
 
-    # [FN CATEGORY] _show_in_split — renders one KANT element (or the whole file, if uid is None)
-    # into its own split_tabs page, keyed by (path, uid) — a second double-click on the SAME
-    # element switches to its existing page (self._split_pages already has it); a DIFFERENT element,
-    # even from the same parent module, gets its own new page instead of overwriting whatever page
-    # is currently showing. Renders via the same _build_node_widgets the main pane's _render_view
-    # calls, so editing there marks the same tab dirty and shares its undo stack. The tab strip
-    # label names the element itself ("[FN] alpha"), not the filename, since a page's identity is a
-    # KANT element, not a file.
-    # [FN] _show_in_split — opens (or switches to) one KANT element's own split_tabs page
-    # [FN OPEN] _show_in_split
-    def _show_in_split(self, tab, uid):
+    # [FN CATEGORY] _show_element_tab — VS Code-style preview reuse: clicking a KANT element that
+    # isn't already open retargets the one unpinned "preview" tab (if any) in place instead of
+    # piling up a new tab per click. Pinning a tab (the pin button in place of its ×) takes it out
+    # of the reusable slot, so the next new element opens a fresh tab that is itself the new preview
+    # — repeating indefinitely, exactly like the file/uid dedupe case already handled below.
+    # [FN] _show_element_tab — opens an element beside its parent in the main coding tab bar
+    # [FN OPEN] _show_element_tab
+    def _show_element_tab(self, tab, uid):
         key = (tab.path, uid)
-        existing = self._split_pages.get(key)
+        existing = self._element_pages.get(key)
         if existing is not None:
-            self.split_tabs.setCurrentWidget(existing)
-            self.split_tabs.show()
+            self.tabs.setCurrentWidget(existing)
+            self._set_ai_context_page(existing)
             return
-        page, layout = self._build_split_page()
+        if self._preview_page is not None:
+            self._retarget_element_page(self._preview_page, tab, uid)
+            return
+        page, layout = self._build_element_page()
         if uid is None:
             node = next((item for item in tab.tree.body if isinstance(item, Node)), None)
-            self._build_node_widgets(tab, tab.tree, layout, 0)
         else:
             node = self._find_node_by_uid(tab.tree, uid)
-            if node is not None:
-                wrapper = Node(tag='ROOT', name='', open_raw=None, body=[node])
-                self._build_node_widgets(tab, wrapper, layout, 0)
-        label = f'[{node.tag}] {node.desc or node.name}' if node is not None else os.path.basename(tab.path)
-        page._split_key = key
-        page._split_tab = tab
-        index = self.split_tabs.addTab(page, label)
-        self.split_tabs.setTabToolTip(index, tab.path)
-        self._split_pages[key] = page
-        self.split_tabs.setCurrentIndex(index)
-        self.split_tabs.show()
-    # [FN CLOSED] _show_in_split
+        if node is None:
+            page.deleteLater()
+            return
+        page._element_key = key
+        page._file_tab = tab
+        page._view_layout = layout
+        page._pinned = False
+        index = self.tabs.addTab(page, '')
+        page._tab_label = _TabLabel(self.tabs, page)
+        self.tabs.setTabToolTip(index, tab.path)
+        self._element_pages[key] = page
+        self._update_element_tab_title(page)
+        self._set_preview_page(page)
+        self.tabs.setCurrentIndex(index)
+        self._set_ai_context_page(page)
+    # [FN CLOSED] _show_element_tab
 
-    # [FN CATEGORY] _close_split_tab — tabCloseRequested's own index, not necessarily the page a
-    # caller has a reference to (closing an earlier tab shifts every later index) — always resolve
-    # through split_tabs.widget(index) rather than trusting a captured index to still be valid.
-    # [FN] _close_split_tab — closes one split_tabs page, hides the strip once none remain
-    # [FN OPEN] _close_split_tab
-    def _close_split_tab(self, index):
-        page = self.split_tabs.widget(index)
+    # [FN CATEGORY] _retarget_element_page — the actual "reuse this tab slot" move: re-key
+    # _element_pages, point the page at the new (file, element), and let _render_element_page
+    # rebuild its content from scratch — no risk to unsaved edits, since the underlying FileTab
+    # (open_tabs, dirty state, tree) for whichever file the page WAS showing is untouched by this;
+    # only which node this particular tab slot displays changes.
+    # [FN] _retarget_element_page — reuses an existing (presumably preview) page for a new element
+    # [FN OPEN] _retarget_element_page
+    def _retarget_element_page(self, page, tab, uid):
+        node = (
+            next((item for item in tab.tree.body if isinstance(item, Node)), None) if uid is None
+            else self._find_node_by_uid(tab.tree, uid)
+        )
+        if node is None:
+            return
+        old_key = getattr(page, '_element_key', None)
+        if old_key is not None:
+            self._element_pages.pop(old_key, None)
+        page._element_key = (tab.path, node.uid)
+        page._file_tab = tab
+        self._element_pages[page._element_key] = page
+        index = self.tabs.indexOf(page)
+        self.tabs.setTabToolTip(index, tab.path)
+        self._render_element_page(page)
+        self._update_element_tab_title(page)
+        self.tabs.setCurrentWidget(page)
+        self._set_ai_context_page(page)
+    # [FN CLOSED] _retarget_element_page
+
+    # [FN CATEGORY] _set_preview_page — swaps the new preview page's tab-bar × (QTabBar.RightSide)
+    # for a pin button; pinning restores the native × (setTabButton(..., None) falls back to Qt's
+    # own close button since setTabsClosable(True) is still in effect) and frees this page from ever
+    # being silently retargeted again.
+    # [FN] _set_preview_page — marks a page as the one reusable/unpinned preview tab
+    # [FN OPEN] _set_preview_page
+    def _set_preview_page(self, page):
+        self._preview_page = page
+        pin_btn = QToolButton()
+        pin_btn.setText('📌')
+        pin_btn.setAutoRaise(True)
+        pin_btn.setCursor(Qt.PointingHandCursor)
+        pin_btn.setToolTip('Blocca questa scheda (impedisce che venga sostituita da un nuovo elemento)')
+        pin_btn.clicked.connect(lambda: self._pin_element_page(page))
+        index = self.tabs.indexOf(page)
+        self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, pin_btn)
+    # [FN CLOSED] _set_preview_page
+
+    def _pin_element_page(self, page):
         if page is None:
             return
-        self._split_pages.pop(getattr(page, '_split_key', None), None)
-        self.split_tabs.removeTab(index)
-        page.deleteLater()
-        if self.split_tabs.count() == 0:
-            self.split_tabs.hide()
-    # [FN CLOSED] _close_split_tab
+        page._pinned = True
+        if self._preview_page is page:
+            self._preview_page = None
+        index = self.tabs.indexOf(page)
+        if index != -1:
+            self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, None)
 
-    def _close_all_split_tabs_for(self, tab):
-        for index in range(self.split_tabs.count() - 1, -1, -1):
-            page = self.split_tabs.widget(index)
-            if getattr(page, '_split_tab', None) is tab:
-                self._close_split_tab(index)
+    def _render_element_page(self, page):
+        layout = page._view_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        tab = page._file_tab
+        node = self._find_node_by_uid(tab.tree, page._element_key[1])
+        if node is not None:
+            self._build_node_widgets(tab, Node(tag='ROOT', name='', open_raw=None, body=[node]), layout, 0)
+
+    def _update_element_tab_title(self, page):
+        tab = page._file_tab
+        node = self._find_node_by_uid(tab.tree, page._element_key[1])
+        if node is None:
+            return
+        html = _tag_header_html(node.tag, node.name, node.desc, bold_name=True)
+        if tab.dirty:
+            html += f' <span style="color:{theme.ACCENT}">●</span>'
+        page._tab_label.setText(html)
+        page._tab_label.adjustSize()
+        index = self.tabs.indexOf(page)
+        self.tabs.tabBar().setTabButton(index, QTabBar.LeftSide, page._tab_label)
+        page._tab_label.show()
+
+    def _close_element_tab(self, page):
+        if page is None:
+            return
+        self._element_pages.pop(getattr(page, '_element_key', None), None)
+        if self._preview_page is page:
+            self._preview_page = None
+        if self._ai_context_page is page:
+            self._ai_context_page = self.active_tab
+        index = self.tabs.indexOf(page)
+        if index != -1:
+            self.tabs.removeTab(index)
+        page.deleteLater()
+
+    def _close_element_tabs_for(self, tab):
+        for page in list(self._element_pages.values()):
+            if page._file_tab is tab:
+                self._close_element_tab(page)
 
     # ---- tabs (AI-NAV: active-tab ownership and close/flush lifecycle) ---
 
     @property
-    def active_tab(self):
+    def active_page(self):
         return self.tabs.currentWidget()
 
+    @property
+    def active_tab(self):
+        page = self.active_page
+        return getattr(page, '_file_tab', page)
+
+    def _active_filter_uid(self):
+        page = self.active_page
+        return page._element_key[1] if hasattr(page, '_element_key') else getattr(page, 'filter_uid', None)
+
     def _on_active_tab_changed(self, _index):
+        page = self.active_page
         tab = self.active_tab
+        if hasattr(page, '_element_key'):
+            self._render_element_page(page)
+        elif isinstance(page, FileTab):
+            self._render_view(page, page.filter_uid)
+        if page is not None:
+            self._set_ai_context_page(page)
         self._update_action_buttons()
         self._update_filename_label()
         self._update_syntax_status()
         self._update_lsp_diagnostics()
-        self._update_io_tabs(tab.filter_uid if tab else None)
+        self._update_io_tabs(self._active_filter_uid())
         self.encoding_label.setText('UTF-8' if tab else '')
         self.cursor_pos_label.setText('')
 
@@ -2244,8 +2391,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _close_tab — closes the tab at the given index
     # [FN OPEN] _close_tab
     def _close_tab(self, index, flush=True):
-        tab = self.tabs.widget(index)
-        if tab is None:
+        page = self.tabs.widget(index)
+        if page is None:
+            return True
+        tab = getattr(page, '_file_tab', page)
+        if page is not tab:
+            self._close_element_tab(page)
             return True
         if flush:
             if not tab.flush_pending_save():
@@ -2257,16 +2408,17 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             del self.open_tabs[tab.path]
         if tab.path in self.fs_watcher.files():
             self.fs_watcher.removePath(tab.path)
-        self._close_all_split_tabs_for(tab)  # don't leave a split page editing a tab that's gone
-        self.tabs.removeTab(index)
+        self._close_element_tabs_for(tab)
+        index = self.tabs.indexOf(tab)  # child tabs may have been dragged before it and shifted it
+        if index != -1:
+            self.tabs.removeTab(index)
         tab.deleteLater()
         return True
     # [FN CLOSED] _close_tab
 
     def _close_active_tab(self):
-        tab = self.active_tab
-        if tab is not None:
-            self._close_tab(self.tabs.indexOf(tab))
+        if self.tabs.currentIndex() != -1:
+            self._close_tab(self.tabs.currentIndex())
 
     def _flush_all_tabs(self):
         ok = True
@@ -2297,7 +2449,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
     # [FN CATEGORY] _update_tab_title — the main tab is titled by the KANT identity of whatever
     # it's isolated on, or the file's own top-level tag in whole-file view — matching the title
-    # bar and split pane header, which both already do this. It uses the same colored/bold
+    # bar and element-tab label, which both already do this. It uses the same colored/bold
     # "[TAG] name" convention as the tree and coding panel too, via a rich-HTML label swapped in
     # for the tab's plain text (see _TabLabel) — only an untagged/unparseable file falls back to
     # plain filename text, since there's no tag to color.
@@ -2340,6 +2492,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
     def _on_tab_dirty_changed(self, tab):
         self._update_tab_title(tab)
+        for page in self._element_pages.values():
+            if page._file_tab is tab:
+                self._update_element_tab_title(page)
         self._update_action_buttons()
         if tab is self.active_tab:
             self._update_filename_label()
@@ -2361,6 +2516,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         existing = self.open_tabs.get(path)
         if existing is not None:
             self.tabs.setCurrentWidget(existing)
+            self._set_ai_context_page(existing)
             return True
         # always re-read from disk rather than trusting a tree parsed earlier for the sidebar —
         # the file may have changed since then (fs-watcher debounce, external edit), and a stale
@@ -2392,6 +2548,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.tabs.setTabToolTip(idx, path)
         self._render_view(tab)
         self.tabs.setCurrentWidget(tab)
+        self._set_ai_context_page(tab)
         self._update_lsp_diagnostics()
         self.settings.setValue('session/openFile', path)
         return True
@@ -2434,7 +2591,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # the title bar slot shows the KANT identity (isolated element, or the file's own top-level
         # tag when nothing is filtered in) — the filename itself lives in file_path_label instead,
         # on the Incoming/Outgoing row
-        text = (self._kant_identity_text(tab, fallback_to_top_level=True) or '') if tab else ''
+        uid = self._active_filter_uid()
+        node = self._find_node_by_uid(tab.tree, uid) if tab and uid else None
+        if node is None and tab:
+            node = next((n for n in tab.tree.body if isinstance(n, Node)), None)
+        text = f'[{node.tag}] {node.desc or node.name}' if node is not None else ''
         if tab and tab.dirty:
             text += '  ●'
         self.filename_label.setText(text)
@@ -2601,12 +2762,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 return None
             edit = QApplication.focusWidget()
             if not isinstance(edit, CodeEdit):
-                edits = tab.view_container.findChildren(CodeEdit)
+                edits = self.active_page.findChildren(CodeEdit)
                 edit = edits[0] if edits else None
             if edit is None:
                 return None
         else:
-            # edit may belong to the split pane's own tab, not whatever's active in the main tabs —
+            # edit may belong to an element tab, not whatever file tab was active before it —
             # kant_tab (set at construction) is the reliable owner, self.active_tab only a fallback
             tab = getattr(edit, 'kant_tab', None) or self.active_tab
             if tab is None:
@@ -2677,7 +2838,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         tab = self.active_tab
         edit = QApplication.focusWidget()
         if tab is not None and not isinstance(edit, CodeEdit):
-            edits = tab.view_container.findChildren(CodeEdit)
+            edits = self.active_page.findChildren(CodeEdit)
             edit = edits[0] if edits else None
         if not isinstance(edit, CodeEdit):
             return ''
@@ -3204,7 +3365,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 return
             self._update_tab_title(tab)
         lines = []
-        for edit in tab.view_container.findChildren(CodeEdit):
+        for edit in self.active_page.findChildren(CodeEdit):
             item = getattr(edit, 'kant_item', None)
             if not edit.breakpoints or item is None:
                 continue
@@ -3280,6 +3441,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 edit = CodeEdit(text)
                 edit.kant_item = item
                 edit.kant_tab = tab
+                edit.kant_node = node if node.tag != 'ROOT' else None
                 edit.textChanged.connect(lambda e=edit, it=item, t=tab: self._on_code_changed(t, e, it))
                 edit.completion_provider = self._request_completion
                 edit.hover_provider = self._request_hover
@@ -3296,7 +3458,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                         continue
                 has_children = any(isinstance(c, Node) for c in item.body)
                 # depth 0 is always the outermost element of an isolated/whole-file view — its
-                # identity is already shown in the tab label / split header / title bar, so its own
+                # identity is already shown in the tab label and title bar, so its own
                 # "[TAG] name" title here would be pure redundancy
                 if has_children:
                     section = CollapsibleSection(item, show_header=depth > 0)
@@ -3577,8 +3739,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.terminal.write_info(f'\n{output}\n')
         # the final summary line ("1 failed, 1 passed in 0.74s") is printed bare, not wrapped in the
         # "=== ... ===" banners pytest uses for FAILURES / short test summary info above it
-        summary_match = re.search(r'^\d+ \w+(?:, \d+ \w+)* in [\d.]+s$', output, re.MULTILINE)
-        summary = summary_match.group(0) if summary_match else f'exit code {result.returncode}'
+        summary_match = re.search(
+            r'^[^\r\n]*(?:failed|passed|error|skipped|xfailed|xpassed)[^\r\n]*\bin [\d.]+s[^\r\n]*$',
+            output, re.MULTILINE | re.IGNORECASE,
+        )
+        summary = summary_match.group(0).strip('= ') if summary_match else f'exit code {result.returncode}'
         failures = []
         for match in re.finditer(r'^FAILED (\S+)', output, re.MULTILINE):
             rel_path, _, rest = match.group(1).partition('::')
