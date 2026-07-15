@@ -4,7 +4,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QProxyStyle, QStyle
 
 from kant.model import parse_kant, serialize_kant, read_top_level_label_result, Node, KantParseError
 from kant.fileio import is_safe_child_name
@@ -16,6 +16,26 @@ from kant.mainwindow import MainWindow
 
 
 CRASH_LOG_DIR = Path.home() / '.kant_ide' / 'crash_logs'
+
+# [CST] TOOLTIP_DELAY_MS — deliberately longer than Qt's own default wake-up delay (~700ms) so
+# every hover-help tooltip across the app (every command has one, see the docstrings/setToolTip
+# calls throughout kant/*.py) only appears once the pointer clearly lingers, not on every
+# incidental pass-over while moving the mouse across the toolbar
+TOOLTIP_DELAY_MS = 1100
+
+
+# [FN CATEGORY] _HoverDelayStyle — the one shared choke point for every tooltip in the app: Qt has
+# no per-widget "wake-up delay" setting, only this global style hint, so a single QProxyStyle
+# applied once at startup covers every QWidget.setToolTip and QAction.setToolTip already used
+# throughout the codebase, without editing each widget individually.
+# [FN] _HoverDelayStyle — QProxyStyle overriding only the tooltip wake-up delay
+# [FN OPEN] _HoverDelayStyle
+class _HoverDelayStyle(QProxyStyle):
+    def styleHint(self, hint, option=None, widget=None, returnData=None):
+        if hint == QStyle.SH_ToolTip_WakeUpDelay:
+            return TOOLTIP_DELAY_MS
+        return super().styleHint(hint, option, widget, returnData)
+# [FN CLOSED] _HoverDelayStyle
 
 
 # [FN CATEGORY] _install_crash_handler — PySide6 routes an exception raised inside a Qt slot/event
@@ -216,6 +236,7 @@ def main():
     _install_crash_handler()
     _self_check()
     app = QApplication(sys.argv)
+    app.setStyle(_HoverDelayStyle(app.style()))
     app.setWindowIcon(make_star_icon())
     window = MainWindow()
     window.show()

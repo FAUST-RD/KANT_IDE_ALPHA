@@ -288,7 +288,11 @@ class WorkspaceMixin:
             choice = self._ide_choice(
                 'Conflitto sul file',
                 f'{os.path.basename(tab.path)} e cambiato fuori da KANT IDE.',
-                [('Annulla', None), ('Ricarica dal disco', 'reload'), ('Sovrascrivi il disco', 'overwrite')],
+                [
+                    ('Annulla', None, "Non fare nulla, decidi la prossima volta che salvi o chiudi il file"),
+                    ('Ricarica dal disco', 'reload', "Scarta le modifiche non salvate nell'editor e ricarica la versione su disco"),
+                    ('Sovrascrivi il disco', 'overwrite', "Salva la versione dell'editor, sovrascrivendo il cambiamento esterno su disco"),
+                ],
             )
             if choice == 'reload':
                 self._reload_tab_from_disk(tab)

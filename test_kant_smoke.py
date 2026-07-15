@@ -24,15 +24,20 @@ from PySide6.QtWidgets import (
 import kant_editor
 from kant import theme
 from kant import mainwindow as kant_mainwindow_module
+from kant import widgets as kant_widgets_module
 from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT, ROLE_LINE
 from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
+from kant.pyenv import (
+    dependency_file, detect_venvs, has_module, interpreter_label, interpreter_version,
+    is_python_majority_project, load_interpreter, save_interpreter,
+)
 from kant.xref import build_xref, XrefElement
 from kant.widgets import (
-    CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard, _AiReviewCard,
-    _agent_command, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
+    ClaudePane, CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard,
+    _AiReviewCard, _agent_command, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
 )
-from kant.mappa import XrefMapDialog, XrefMapView, _force_layout_positions
+from kant.mappa import XrefMapDialog, XrefMapView, _force_layout_positions, _element_degree, _element_size
 from kant import gitops as kant_gitops_module
 from kant.gitops import GitPanelDialog
 from kant.workspace import (
@@ -50,6 +55,29 @@ class LabelStub:
         pass
 
     def write_info(self, *_args):
+        pass
+
+
+class _StatusButtonStub:
+    """Stands in for the real QPushButton status-bar label in tests that don't need a live window."""
+
+    def __init__(self):
+        self._text = ''
+        self._visible = False
+
+    def setText(self, text):
+        self._text = text
+
+    def text(self):
+        return self._text
+
+    def setVisible(self, visible):
+        self._visible = visible
+
+    def isVisible(self):
+        return self._visible
+
+    def setToolTip(self, *_args):
         pass
 
 
@@ -273,6 +301,121 @@ class KantSmokeTest(unittest.TestCase):
         codex_effort_args = _agent_command('codex', 'ciao', effort='medium')[1]
         assert codex_effort_args == ['exec', '-c', 'model_reasoning_effort="medium"', 'ciao']
         assert _agent_command('claude', 'ciao')[1] == ['-p', 'ciao']  # no --effort when unset
+        # session_args (conversation-continuity marker) splices in before --model/effort for both
+        # providers, still ahead of the trailing prompt positional
+        assert _agent_command('claude', 'ciao', session_args=('--session-id', 'abc'))[1] == ['--session-id', 'abc', '-p', 'ciao']
+        assert _agent_command('claude', 'ciao', session_args=('--resume', 'abc'))[1] == ['--resume', 'abc', '-p', 'ciao']
+        codex_resume_args = _agent_command('codex', 'ciao', session_args=('resume', '--last'))[1]
+        assert codex_resume_args == ['exec', 'resume', '--last', 'ciao']
+
+    def test_claude_pane_resumes_conversation_across_messages(self):
+        # each run_prompt call is otherwise a brand-new, memory-less claude/codex process — this
+        # checks the fix: the pane mints a session id on the first Claude message and resumes that
+        # same id on the next one (instead of starting fresh every time), Codex gets `exec resume
+        # --last` from its second message onward, and switching project (set_cwd) resets both so a
+        # new project doesn't inherit the old one's conversation.
+        class _ProcessStub:
+            captured = []
+
+            def __init__(self, _parent=None):
+                self.readyReadStandardOutput = self.readyReadStandardError = self
+                self.errorOccurred = self.finished = self
+
+            def connect(self, *_args):
+                pass
+
+            def setWorkingDirectory(self, _cwd):
+                pass
+
+            def start(self, executable, args):
+                _ProcessStub.captured.append((executable, args))
+
+            def closeWriteChannel(self):
+                pass
+
+        original_process_cls = kant_widgets_module.QProcess
+        kant_widgets_module.QProcess = _ProcessStub
+        pane = ClaudePane(os.getcwd())
+        try:
+            pane.set_agent('claude')
+            assert pane.run_prompt('primo messaggio')
+            pane.process = None  # simulates _finished having already run
+            assert pane.run_prompt('secondo messaggio')
+            claude_calls = [args for _exe, args in _ProcessStub.captured]
+            first_session_flag, first_session_id = claude_calls[0][0], claude_calls[0][1]
+            assert first_session_flag == '--session-id'
+            assert claude_calls[1][0] == '--resume' and claude_calls[1][1] == first_session_id
+
+            _ProcessStub.captured.clear()
+            pane.process = None
+            pane.set_agent('codex')
+            assert pane.run_prompt('primo messaggio codex')
+            pane.process = None
+            assert pane.run_prompt('secondo messaggio codex')
+            codex_calls = [args for _exe, args in _ProcessStub.captured]
+            assert codex_calls[0][:1] == ['exec'] and 'resume' not in codex_calls[0]
+            assert codex_calls[1][:3] == ['exec', 'resume', '--last']
+
+            # switching project resets both providers' tracked session
+            pane.process = None
+            pane.set_cwd(os.getcwd())
+            assert pane._claude_session_id is None and pane._codex_resumable is False
+        finally:
+            kant_widgets_module.QProcess = original_process_cls
+            pane.deleteLater()
+
+    def test_codex_context_hint_not_reframed_as_kant_code_map(self):
+        # bug: every codex message (not just genuine /kant-code-map runs) was being rewritten into
+        # "this is an explicit request to run /kant-code-map... create or update KANT_<project>.md",
+        # burying both the real request and the hidden context_hint (the coding panel's currently
+        # isolated file/element) under an unrelated project-wide tagging task — which is why the AI
+        # seemed to ignore the focused element and "forget" what was actually asked.
+        class _ProcessStub:
+            captured = []
+
+            def __init__(self, _parent=None):
+                self.readyReadStandardOutput = self.readyReadStandardError = self
+                self.errorOccurred = self.finished = self
+
+            def connect(self, *_args):
+                pass
+
+            def setWorkingDirectory(self, _cwd):
+                pass
+
+            def start(self, _executable, args):
+                _ProcessStub.captured.append(args)
+
+            def closeWriteChannel(self):
+                pass
+
+        original_process_cls = kant_widgets_module.QProcess
+        kant_widgets_module.QProcess = _ProcessStub
+        pane = ClaudePane(os.getcwd())
+        try:
+            pane.set_agent('codex')
+            assert pane.run_prompt(
+                'modifica solo questa funzione',
+                context_hint='Contesto implicito: applica le modifiche solo a [FN] alpha.',
+            )
+            sent_prompt = _ProcessStub.captured[-1][-1]
+            assert '/kant-code-map' not in sent_prompt
+            assert 'KANT_<nome-progetto>.md' not in sent_prompt
+            assert 'Prima leggi il file temporaneo' in sent_prompt
+            assert 'modifica solo questa funzione' in sent_prompt
+            with open(pane.system_prompt_file, encoding='utf-8') as f:
+                saved_instructions = f.read()
+            assert 'applica le modifiche solo a [FN] alpha' in saved_instructions
+
+            pane.process = None
+            assert pane.run_prompt(
+                'Applica la convenzione KANT a tutto il progetto', extra_skills=('kant-code-map',),
+            )
+            kant_map_prompt = _ProcessStub.captured[-1][-1]
+            assert '/kant-code-map' in kant_map_prompt
+        finally:
+            kant_widgets_module.QProcess = original_process_cls
+            pane.deleteLater()
 
     def test_ai_context_hint(self):
         hint_tree = parse_kant('\n'.join([
@@ -992,6 +1135,38 @@ class KantSmokeTest(unittest.TestCase):
             restored_dialog.close()
             QSettings('KANT', 'KANT Editor').remove(map_dialog._position_key)
 
+    def test_force_layout_positions_no_overlap(self):
+        # the median-Y edge-crossing-reduction pass (added alongside the higher iteration floor)
+        # nudges nodes toward their neighbours' median y — on a moderately connected graph that can
+        # crowd unrelated, x-overlapping nodes into the same y band; resolve_overlaps() must always
+        # clean that up afterward so the "boxes never actually overlap" guarantee still holds
+        import random
+        rng = random.Random(7)
+        count = 60
+        graph = {
+            f'e{i}': XrefElement(f'e{i}', f'e{i}', 'FN', f'e{i}', f'E{i}', f'file{i % 8}.py', 0)
+            for i in range(count)
+        }
+        for i in range(count):
+            source = graph[f'e{i}']
+            for _ in range(rng.randint(0, 3)):
+                target_key = f'e{rng.randint(0, count - 1)}'
+                if target_key != f'e{i}':
+                    source.outgoing.append(target_key)
+                    graph[target_key].incoming.append(f'e{i}')
+        positions = _force_layout_positions(graph)
+        max_degree = max(_element_degree(e, graph, None) for e in graph.values())
+        sizes = {key: _element_size(el, max_degree, graph, None) for key, el in graph.items()}
+        keys = list(positions)
+        for i, left in enumerate(keys):
+            for right in keys[i + 1:]:
+                lx, ly = positions[left]
+                lw, lh = sizes[left]
+                rx, ry = positions[right]
+                rw, rh = sizes[right]
+                overlapping = lx < rx + rw and lx + lw > rx and ly < ry + rh and ly + lh > ry
+                assert not overlapping, f'{left} and {right} overlap: {positions[left]} vs {positions[right]}'
+
     def test_xref_map_dialog_expand_collapse(self):
         with _temp_dir() as tmp:
             root = Path(tmp)
@@ -1323,6 +1498,7 @@ class KantSmokeTest(unittest.TestCase):
             fmt_tab = FileTab(str(fmt_source), parse_kant(fmt_source.read_text(encoding='utf-8')))
             fmt_window = MainWindow.__new__(MainWindow)
             fmt_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: fmt_tab})()
+            fmt_window.project_root_path = None
             applied = []
             fmt_window._apply_local_text = lambda tab, text, message: applied.append((text, message))
             fmt_window._ide_message = lambda title, msg: applied.append(('MESSAGE', msg))
@@ -1350,6 +1526,7 @@ class KantSmokeTest(unittest.TestCase):
             # neither tool actually installed in this real environment -> the fallback message path
             none_window = MainWindow.__new__(MainWindow)
             none_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: fmt_tab})()
+            none_window.project_root_path = None
             none_messages = []
             none_window._ide_message = lambda title, msg: none_messages.append(msg)
             MainWindow._format_with_external_tool(none_window)
@@ -1623,6 +1800,175 @@ class KantSmokeTest(unittest.TestCase):
             w._update_io_tabs = lambda uid: calls.append(('io', uid))
             MainWindow._on_tree_item_clicked(w, item, 0)
             assert ('render', None) in calls and ('io', None) in calls
+
+    def test_pyenv_venv_detection_config_roundtrip_and_majority_heuristic(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            scripts_dir = project / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')
+            scripts_dir.mkdir(parents=True)
+            venv_python = scripts_dir / ('python.exe' if os.name == 'nt' else 'python')
+            venv_python.write_text('', encoding='utf-8')
+
+            assert detect_venvs(str(project)) == [str(venv_python)]
+            assert load_interpreter(str(project)) is None  # nothing configured yet
+
+            save_interpreter(str(project), str(venv_python))
+            config = json.loads((project / '.kant' / 'python.json').read_text(encoding='utf-8'))
+            assert config['python'] == venv_python.relative_to(project).as_posix()  # portable/relative
+            assert load_interpreter(str(project)) == str(venv_python)
+
+            assert interpreter_label(str(venv_python)) == '.venv'
+            assert interpreter_version(sys.executable) is not None
+            assert has_module(sys.executable, 'this_module_does_not_exist_xyz') is False
+
+            assert dependency_file(str(project)) is None
+            (project / 'requirements.txt').write_text('pytest\n', encoding='utf-8')
+            assert dependency_file(str(project)) == 'requirements.txt'
+
+            (project / 'a.py').write_text('x = 1\n', encoding='utf-8')
+            (project / 'b.py').write_text('y = 2\n', encoding='utf-8')
+            (project / 'c.txt').write_text('text\n', encoding='utf-8')
+            assert is_python_majority_project(str(project)) is True
+
+    def test_active_python_auto_select_interpreter_and_status_label(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            scripts_dir = project / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')
+            scripts_dir.mkdir(parents=True)
+            venv_python = scripts_dir / ('python.exe' if os.name == 'nt' else 'python')
+            venv_python.write_text('', encoding='utf-8')
+
+            window = MainWindow.__new__(MainWindow)
+            window.project_root_path = str(project)
+            window.python_env_label = _StatusButtonStub()
+            assert MainWindow._active_python(window) == sys.executable  # unconfigured -> fallback
+
+            MainWindow._auto_select_interpreter(window)
+            assert MainWindow._active_python(window) == str(venv_python)
+            assert window.python_env_label.isVisible()
+            assert '.venv' in window.python_env_label.text()
+
+            window.project_root_path = None
+            MainWindow._refresh_python_env_label(window)
+            assert not window.python_env_label.isVisible()
+
+    def test_select_python_interpreter_and_install_dependencies(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            (project / 'requirements.txt').write_text('pytest\n', encoding='utf-8')
+            chosen_python = sys.executable
+
+            class _TerminalStub:
+                def __init__(self):
+                    self.commands = []
+                    self.messages = []
+
+                def run_command(self, command, cwd=None):
+                    self.commands.append((command, cwd))
+                    return True
+
+                def write_info(self, text):
+                    self.messages.append(text)
+
+            window = MainWindow.__new__(MainWindow)
+            window.project_root_path = str(project)
+            window.python_env_label = _StatusButtonStub()
+            window.terminal = _TerminalStub()
+            window._ide_python_interpreter_form = lambda candidates, current: chosen_python
+
+            MainWindow._select_python_interpreter(window)
+            assert MainWindow._active_python(window) == chosen_python
+            assert any('Interprete Python' in m for m in window.terminal.messages)
+
+            MainWindow._install_dependencies(window)
+            assert window.terminal.commands
+            command, cwd = window.terminal.commands[-1]
+            assert 'pip' in command and 'install' in command and 'requirements.txt' in command
+            assert cwd == str(project)
+
+    def test_run_lint_check_ruff_integration(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            window = MainWindow.__new__(MainWindow)
+            window.project_root_path = str(project)
+            window.terminal = LabelStub()
+            window.results_view = QTreeWidget()
+            window._toggle_info_popup = lambda *_args, **_kwargs: None
+            window._run_background = lambda work, done: done(work(), None)
+
+            original_has_module = kant_mainwindow_module.has_module
+            original_run = kant_mainwindow_module.subprocess.run
+
+            def fake_has_module(_python_path, module):
+                return module == 'ruff'
+
+            def fake_run(args, cwd=None, capture_output=None, text=None, timeout=None):
+                assert args[:3] == [sys.executable, '-m', 'ruff']
+                return subprocess.CompletedProcess(args, 1, stdout='sample.py:3:1: F401 unused import\n', stderr='')
+
+            kant_mainwindow_module.has_module = fake_has_module
+            kant_mainwindow_module.subprocess.run = fake_run
+            try:
+                MainWindow._run_lint_check(window)
+            finally:
+                kant_mainwindow_module.has_module = original_has_module
+                kant_mainwindow_module.subprocess.run = original_run
+
+            assert window.results_view.topLevelItemCount() == 1
+            root_item = window.results_view.topLevelItem(0)
+            assert '1 problema' in root_item.text(0)
+            finding = root_item.child(0)
+            assert 'F401' in finding.text(0)
+            assert finding.data(0, ROLE_KIND) == 'diagnostic-result'
+            assert finding.data(0, ROLE_LINE) == 3
+
+    def test_run_single_test_from_tree_context_menu(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            test_file = project / 'test_single.py'
+            test_file.write_text('\n'.join([
+                '# [MOD CATEGORY] sample module with one passing, one failing test',
+                '# [MOD OPEN #mod1] test_single.py',
+                '# [FN CATEGORY] trivially passes',
+                '# [FN OPEN #fn1] test_ok',
+                'def test_ok():',
+                '    assert True',
+                '# [FN CLOSED #fn1] test_ok',
+                '# [FN CATEGORY] trivially fails',
+                '# [FN OPEN #fn2] test_should_fail',
+                'def test_should_fail():',
+                '    assert False',
+                '# [FN CLOSED #fn2] test_should_fail',
+                '# [MOD CLOSED #mod1] test_single.py',
+            ]), encoding='utf-8')
+
+            tree = parse_kant(test_file.read_text(encoding='utf-8'))
+            mod_node = next(n for n in tree.body if isinstance(n, Node))
+            fail_node = next(c for c in mod_node.body if isinstance(c, Node) and c.name == 'test_should_fail')
+
+            item = QTreeWidgetItem()
+            item.setData(0, ROLE_KIND, 'section')
+            item.setData(0, ROLE_PATH, str(test_file))
+            item.setData(0, ROLE_UID, fail_node.uid)
+
+            window = MainWindow.__new__(MainWindow)
+            window.open_tabs = {}
+            window.project_root_path = str(project)
+            assert MainWindow._section_test_name(window, item) == 'test_should_fail'
+
+            window.git_root = None
+            window._test_run_pending = False
+            window._run_background = lambda work, done: done(work(), None)
+            window.terminal = LabelStub()
+            window.results_view = QTreeWidget()
+            window._toggle_info_popup = lambda *_args, **_kwargs: None
+            MainWindow._run_single_test(window, str(test_file), 'test_should_fail')
+
+            assert window._test_run_pending is False
+            root_item = window.results_view.topLevelItem(0)
+            assert 'failed' in root_item.text(0)
+            assert root_item.childCount() == 1  # only the targeted test ran, not test_ok
+            assert 'test_should_fail' in root_item.child(0).text(0)
 # [TST CLOSED] KantSmokeTest
 
 

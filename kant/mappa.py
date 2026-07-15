@@ -263,7 +263,12 @@ def _force_layout_positions(elements, fixed=None, seed=None, active_edge_tags=No
         # cue, not a replacement for the hierarchy-rank seeding or call-direction flow that already
         # dominate node placement.
         origin_weight = 0.35
-        iterations = max(2, min(60, 1200 // count))
+        # a floor high enough that the common case (dozens to a couple hundred elements) always
+        # gets to settle fully, not just whatever `1200 // count` happened to leave it — a map
+        # that stops refining early reads as visibly less organized than one that's converged.
+        # Very large graphs (hundreds+) still get fewer passes since O(n^2) repulsion cost grows
+        # quadratically (see the ponytail note below), but never fewer than 20.
+        iterations = max(20, min(80, 4000 // count))
         temperature = radius * 0.22
         cooling = 0.94  # geometric decay — smoother settling than a linear ramp to zero
         # each node's own half-diagonal, in the same squashed metric used for `distance` below, so
@@ -321,45 +326,81 @@ def _force_layout_positions(elements, fixed=None, seed=None, active_edge_tags=No
                 pull_x, pull_y = (0.35, 0.22) if key in isolated else (0.12, 0.05)
                 positions[key][0] += (seeds[key][0] - positions[key][0]) * pull_x
                 positions[key][1] += (seeds[key][1] - positions[key][1]) * pull_y
+
         # the repulsion above is a soft, elliptical approximation (via y_squash) — it makes overlap
         # rare but can't guarantee zero in every configuration, particularly when two boxes end up
         # nearly aligned on one axis. Directly resolve any real axis-aligned overlap left over,
         # using each box's true (unsquashed) width/height — a hard constraint layered on top of the
-        # soft aesthetic preference above, so two boxes never actually overlap on screen.
+        # soft aesthetic preference above, so two boxes never actually overlap on screen. Defined as
+        # a closure (not inlined once) because the median-Y pass below moves nodes again afterward
+        # and can reintroduce overlaps — it needs re-running, not just running once.
         margin = 10.0
-        for _ in range(12):
-            moved = False
-            for index, left in enumerate(keys):
-                for right in keys[index + 1:]:
-                    move_left, move_right = left not in fixed, right not in fixed
-                    if not move_left and not move_right:
-                        continue
-                    lw, lh = sizes[left]
-                    rw, rh = sizes[right]
-                    dx = positions[left][0] - positions[right][0]
-                    dy = positions[left][1] - positions[right][1]
-                    overlap_x = (lw + rw) / 2 + margin - abs(dx)
-                    overlap_y = (lh + rh) / 2 + margin - abs(dy)
-                    if overlap_x <= 0 or overlap_y <= 0:
-                        continue
-                    moved = True
-                    share = 0.5 if (move_left and move_right) else 1.0
-                    if overlap_x < overlap_y:
-                        sign = 1.0 if dx >= 0 else -1.0
-                        push = overlap_x * share
-                        if move_left:
-                            positions[left][0] += sign * push
-                        if move_right:
-                            positions[right][0] -= sign * push
-                    else:
-                        sign = 1.0 if dy >= 0 else -1.0
-                        push = overlap_y * share
-                        if move_left:
-                            positions[left][1] += sign * push
-                        if move_right:
-                            positions[right][1] -= sign * push
-            if not moved:
-                break
+
+        def resolve_overlaps():
+            for _ in range(40):
+                moved = False
+                for index, left in enumerate(keys):
+                    for right in keys[index + 1:]:
+                        move_left, move_right = left not in fixed, right not in fixed
+                        if not move_left and not move_right:
+                            continue
+                        lw, lh = sizes[left]
+                        rw, rh = sizes[right]
+                        dx = positions[left][0] - positions[right][0]
+                        dy = positions[left][1] - positions[right][1]
+                        overlap_x = (lw + rw) / 2 + margin - abs(dx)
+                        overlap_y = (lh + rh) / 2 + margin - abs(dy)
+                        if overlap_x <= 0 or overlap_y <= 0:
+                            continue
+                        moved = True
+                        share = 0.5 if (move_left and move_right) else 1.0
+                        if overlap_x < overlap_y:
+                            sign = 1.0 if dx >= 0 else -1.0
+                            push = overlap_x * share
+                            if move_left:
+                                positions[left][0] += sign * push
+                            if move_right:
+                                positions[right][0] -= sign * push
+                        else:
+                            sign = 1.0 if dy >= 0 else -1.0
+                            push = overlap_y * share
+                            if move_left:
+                                positions[left][1] += sign * push
+                            if move_right:
+                                positions[right][1] -= sign * push
+                if not moved:
+                    break
+
+        resolve_overlaps()
+
+        # Sugiyama-style median-Y refinement: nudge each free node's y toward the median y of its
+        # directly connected neighbours (edge and parent-origin alike) — the spring attraction above
+        # already pulls toward neighbours in both x and y, but a few dedicated median passes at the
+        # very end straighten near-vertical runs and reduce edge crossings beyond what pairwise
+        # springs alone settle into, a standard technique from layered graph drawing adapted to this
+        # continuous (non-layered) layout. X is left untouched so the module-flow/call-depth rank
+        # established by seeding — and the source.x < target.x guarantee that gives a simple chain —
+        # can never be disturbed by this pass. Unlike a real layered Sugiyama layout (where X is
+        # fixed per rank and only sibling order within a layer changes), nodes here span a
+        # continuous X range, so pulling several toward a shared neighbour's Y can cram unrelated,
+        # X-overlapping nodes into the same Y band — resolve_overlaps() runs after EVERY sweep (not
+        # just once at the end) so that crowding gets separated in small doses before it compounds
+        # into a tangle too dense for one pass to untangle.
+        neighbors = {key: [] for key in keys}
+        for left, right in edges:
+            neighbors[left].append(right)
+            neighbors[right].append(left)
+        for child, parent in parent_pairs:
+            neighbors[child].append(parent)
+            neighbors[parent].append(child)
+        for _ in range(4):
+            for key in keys:
+                if key in fixed or not neighbors[key]:
+                    continue
+                ys = sorted(positions[other][1] for other in neighbors[key])
+                median_y = ys[len(ys) // 2]
+                positions[key][1] += (median_y - positions[key][1]) * 0.12
+            resolve_overlaps()
     if not fixed and not seed:
         min_x = min(point[0] for point in positions.values())
         min_y = min(point[1] for point in positions.values())
@@ -1228,12 +1269,14 @@ class XrefMapDialog(QDialog):
         self.drill_back_btn.setIcon(draw_icon('arrow-left', 14))
         self.drill_back_btn.setIconSize(QSize(14, 14))
         self.drill_back_btn.setFixedHeight(28)
+        self.drill_back_btn.setToolTip("Esce dalla vista concentrata su un elemento e torna alla mappa completa")
         self.drill_back_btn.clicked.connect(self._exit_drill_mode)
         self.drill_back_btn.hide()
         top.addWidget(self.drill_back_btn)
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText('Cerca per nome o descrizione…')
         self.search_box.setClearButtonEnabled(True)
+        self.search_box.setToolTip('Filtra i nodi mostrati per nome o descrizione')
         self.search_box.textChanged.connect(self._on_search)
         self.search_box.returnPressed.connect(self._on_search_enter)
         self.search_box.setMaximumWidth(300)
@@ -1242,15 +1285,18 @@ class XrefMapDialog(QDialog):
         top.addWidget(QLabel('File:'))
         self.file_combo = QComboBox()
         self.file_combo.setMinimumWidth(200)
+        self.file_combo.setToolTip('Mostra solo i nodi del file scelto (o tutti i file)')
         self.file_combo.currentIndexChanged.connect(self._on_file_filter)
         top.addWidget(self.file_combo)
 
         self.expand_all_btn = QPushButton(' Espandi tutti')
         self.expand_all_btn.setIcon(draw_icon('expand', 14))
         self.expand_all_btn.setIconSize(QSize(14, 14))
+        self.expand_all_btn.setToolTip('Espande tutti i moduli/classi raggruppati nella mappa')
         self.collapse_all_btn = QPushButton(' Comprimi tutti')
         self.collapse_all_btn.setIcon(draw_icon('collapse', 14))
         self.collapse_all_btn.setIconSize(QSize(14, 14))
+        self.collapse_all_btn.setToolTip('Comprime tutti i moduli/classi in un singolo nodo ciascuno')
         self.expand_all_btn.clicked.connect(self._expand_all)
         self.collapse_all_btn.clicked.connect(self._collapse_all)
         top.addWidget(self.expand_all_btn)
@@ -1258,6 +1304,7 @@ class XrefMapDialog(QDialog):
         self.relayout_btn = QPushButton(' Riorganizza')
         self.relayout_btn.setIcon(draw_icon('undo', 14))
         self.relayout_btn.setIconSize(QSize(14, 14))
+        self.relayout_btn.setToolTip('Ricalcola la disposizione dei nodi, scartando le posizioni trascinate a mano')
         self.relayout_btn.clicked.connect(self._reorganize)
         top.addWidget(self.relayout_btn)
 
@@ -1265,6 +1312,7 @@ class XrefMapDialog(QDialog):
         self.isolate_btn.setIcon(draw_icon('target', 14))
         self.isolate_btn.setIconSize(QSize(14, 14))
         self.isolate_btn.setCheckable(True)
+        self.isolate_btn.setToolTip('Mostra solo il nodo selezionato e i suoi collegamenti diretti')
         self.isolate_btn.toggled.connect(self._on_isolate)
         top.addWidget(self.isolate_btn)
 
@@ -1290,6 +1338,9 @@ class XrefMapDialog(QDialog):
         zoom_out = QPushButton('−')
         zoom_in = QPushButton('+')
         fit = QPushButton('Adatta')
+        zoom_out.setToolTip('Rimpicciolisci')
+        zoom_in.setToolTip('Ingrandisci')
+        fit.setToolTip('Adatta lo zoom per mostrare tutta la mappa')
         zoom_out.clicked.connect(lambda: self.view.zoom(1 / 1.2))
         zoom_in.clicked.connect(lambda: self.view.zoom(1.2))
         fit.clicked.connect(self.view.fit)
@@ -1307,6 +1358,7 @@ class XrefMapDialog(QDialog):
             btn.setCheckable(True)
             btn.setChecked(tag in self._active_tags)
             btn.setFixedHeight(26)
+            btn.setToolTip(f'Mostra/nascondi i nodi con tag {tag}')
             btn.toggled.connect(lambda checked, t=tag: self._on_tag_toggle(t, checked))
             self.tag_buttons[tag] = btn
             tag_row.addWidget(btn)
@@ -1327,6 +1379,7 @@ class XrefMapDialog(QDialog):
             btn.setCheckable(True)
             btn.setChecked(tag in self._active_edge_tags)
             btn.setFixedHeight(26)
+            btn.setToolTip(f'Mostra/nascondi le connessioni verso nodi con tag {tag}')
             btn.toggled.connect(lambda checked, t=tag: self._on_edge_tag_toggle(t, checked))
             self.edge_tag_buttons[tag] = btn
             edge_tag_row.addWidget(btn)
@@ -1505,9 +1558,11 @@ class XrefMapDialog(QDialog):
         viewport_point = self.view.mapFromScene(scene_point)
         point = self.view.viewport().mapTo(self, viewport_point)
         x = min(max(8, point.x() + 14), max(8, self.width() - self.edge_popup.width() - 8))
-        y = point.y() + 14
-        if y + self.edge_popup.height() > self.height() - 8:
-            y = max(8, point.y() - self.edge_popup.height() - 14)
+        # above the hover point by default (smaller y = higher on screen); only falls back below
+        # when there isn't room above, e.g. hovering near the view's own top edge
+        y = point.y() - self.edge_popup.height() - 14
+        if y < 8:
+            y = min(point.y() + 14, self.height() - self.edge_popup.height() - 8)
         self.edge_popup.move(x, y)
         self.edge_popup.raise_()
         self.edge_popup.show()

@@ -35,7 +35,7 @@ from kant.theme import set_theme
 from kant.icons import draw_icon
 from kant.model import Run, Node, parse_kant, serialize_kant, read_top_level_label, read_top_level_label_result, KantParseError
 from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending
-from kant.syntax import check_file_syntax, run_command_for_path
+from kant.syntax import check_file_syntax, run_command_for_path, _quote_arg
 from kant.xref import build_xref, _walk_nodes
 from kant.lsp import LSP_SERVERS_BY_EXT, file_uri, path_from_file_uri, lsp_server_for_path, LspClient
 from kant.dialogs import IdeDialogsMixin
@@ -43,6 +43,10 @@ from kant.gitops import GitOpsMixin
 from kant.projectops import (
     build_kant_map, definition_locations, has_any_kant_tags, iter_kant_tagged_files,
     reference_locations, scan_project_replace, search_project, validate_kant_project,
+)
+from kant.pyenv import (
+    dependency_file, detect_venvs, has_module, interpreter_label, interpreter_version,
+    is_python_majority_project, load_interpreter, save_interpreter,
 )
 from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback_snapshot
 from kant.widgets import (
@@ -365,7 +369,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             f'E rimasta una revisione AI non conclusa per:\n{project}\n'
             'Vuoi ripristinare i file come erano prima delle modifiche AI, o tenere i file attuali '
             'e scartare solo lo snapshot?',
-            [('Decidi più tardi', None), ('Ripristina originali', 'rollback'), ('Tieni i file attuali', 'discard')],
+            [
+                ('Decidi più tardi', None, 'Chiudi senza decidere; verra richiesto di nuovo al prossimo avvio'),
+                ('Ripristina originali', 'rollback', 'Riporta i file com\'erano prima delle modifiche AI, scartandole'),
+                ('Tieni i file attuali', 'discard', 'Mantiene le modifiche AI gia applicate, scarta solo lo snapshot di backup'),
+            ],
         )
         if choice is None:
             return
@@ -629,6 +637,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         open_btn = QPushButton('Apri cartella…')
         open_btn.setFont(QFont('Consolas', 15, QFont.DemiBold))
         open_btn.setCursor(Qt.PointingHandCursor)
+        open_btn.setToolTip('Scegli una cartella di progetto da aprire nell\'IDE')
         open_btn.setStyleSheet(
             f'QPushButton {{ background:{theme.ACCENT}; color:#ffffff; border:none; '
             f'border-radius:9px; padding:14px 30px; }} '
@@ -694,6 +703,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.map_tab_btn.setIconSize(QSize(12, 12))
         self.map_tab_btn.setFixedSize(96, 22)
         self.map_tab_btn.setCursor(Qt.PointingHandCursor)
+        self.map_tab_btn.setToolTip('Apri/chiudi la mappa grafica delle dipendenze (MAPPA) del progetto')
         self.map_tab_btn.clicked.connect(self._toggle_xref_window)
         self.map_tab_btn.hide()  # only relevant once a project is open
 
@@ -755,6 +765,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.claude_pane = ClaudePane(os.getcwd())
         self.claude_pane.before_run = self._prepare_ai_snapshot
         self.claude_pane.context_hint = self._build_ai_context_hint
+        self.claude_pane.focus_hint = self._build_ai_focus_summary
+        self.global_mode_btn.toggled.connect(lambda _checked: self.claude_pane.refresh_focus_label())
+        self.claude_pane.refresh_focus_label()
         self.claude_pane.finished.connect(self._finish_ai_review)
         self.claude_pane.finished.connect(self._refresh_and_validate_after_ai)
 
@@ -818,6 +831,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         bar.addWidget(self.kant_map_label)  # addWidget (not addPermanentWidget): left-aligned
         self.cursor_pos_label = QLabel('')
         self.encoding_label = QLabel('')
+        # a flat QPushButton, not a QLabel: it needs to be click-to-reopen-the-picker, and a
+        # QPushButton gets that natively instead of needing the tree row labels' click-forwarding
+        self.python_env_label = QPushButton('')
+        self.python_env_label.setCursor(Qt.PointingHandCursor)
+        self.python_env_label.setToolTip('Cambia interprete Python per questo progetto')
+        self.python_env_label.clicked.connect(self._select_python_interpreter)
+        self.python_env_label.setVisible(False)
+        bar.addPermanentWidget(self.python_env_label)
         bar.addPermanentWidget(self.cursor_pos_label)
         bar.addPermanentWidget(self.encoding_label)
         self._style_status_bar()
@@ -826,6 +847,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _style_status_bar(self):
         self.statusBar().setStyleSheet(
             f'QStatusBar {{ background:{theme.PANEL}; color:{theme.DIM}; border-top:1px solid {theme.BORDER}; }}'
+        )
+        self.python_env_label.setStyleSheet(
+            f'QPushButton {{ border:none; background:transparent; color:{theme.DIM}; padding:0 8px; }} '
+            f'QPushButton:hover {{ color:{theme.ACCENT}; }}'
         )
 
     def _on_focus_changed(self, _old, new):
@@ -864,10 +889,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.code_view_btn = QPushButton('Codice')
         self.code_view_btn.setCheckable(True)
         self.code_view_btn.setChecked(True)
+        self.code_view_btn.setToolTip('Mostra il file attivo come sezioni KANT modificabili (vista predefinita)')
         self.code_view_btn.clicked.connect(lambda: self._set_view_mode('code'))
 
         self.file_view_btn = QPushButton('File')
         self.file_view_btn.setCheckable(True)
+        self.file_view_btn.setToolTip('Mostra il file attivo come testo grezzo, senza la struttura a sezioni KANT')
         self.file_view_btn.clicked.connect(lambda: self._set_view_mode('file'))
 
         self.view_mode_group = QButtonGroup(self)
@@ -933,6 +960,27 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         )
     # [FN CLOSED] _build_ai_context_hint
 
+    # [FN CATEGORY] _build_ai_focus_summary — the short, user-visible counterpart to
+    # _build_ai_context_hint: same three cases (GLOBAL / isolated element / whole file), but a
+    # one-line label for ClaudePane.focus_label instead of a full hidden instruction — mirrors that
+    # function's logic on purpose so the two can never silently disagree about what's in scope.
+    # [FN] _build_ai_focus_summary — ClaudePane.focus_hint callback
+    # [FN OPEN] _build_ai_focus_summary
+    def _build_ai_focus_summary(self):
+        if self.global_mode_btn.isChecked():
+            return 'intero progetto'
+        tab = self.active_tab
+        if tab is None:
+            return None
+        rel_path = os.path.relpath(tab.path, self.project_root_path) if self.project_root_path else tab.path
+        if tab.filter_uid:
+            node = self._find_node_by_uid(tab.tree, tab.filter_uid)
+            if node is not None:
+                label = node.desc or node.name
+                return f'[{node.tag}] "{label}" in {rel_path}'
+        return rel_path
+    # [FN CLOSED] _build_ai_focus_summary
+
     def _update_action_buttons(self):
         if not hasattr(self, 'title_bar') or not hasattr(self, 'tabs'):
             return
@@ -967,6 +1015,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.title_bar.lsp_format_external_menu_action,
         ):
             action.setEnabled(has_tab)
+        if hasattr(self, 'claude_pane'):
+            self.claude_pane.refresh_focus_label()
 
     # [FN CATEGORY] _build_split_page — one page of split_tabs. A page's identity is a KANT element
     # ("[FN] alpha — file.py"), not a filename tab — the tab strip label carries that, this just
@@ -1014,6 +1064,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         prev_btn.setIcon(draw_icon('arrow-up', 14))
         prev_btn.setIconSize(QSize(14, 14))
         prev_btn.setFixedWidth(32)
+        prev_btn.setToolTip('Occorrenza precedente')
         prev_btn.clicked.connect(self._find_prev)
         layout.addWidget(prev_btn)
 
@@ -1021,6 +1072,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         next_btn.setIcon(draw_icon('arrow-down', 14))
         next_btn.setIconSize(QSize(14, 14))
         next_btn.setFixedWidth(32)
+        next_btn.setToolTip('Occorrenza successiva (Invio)')
         next_btn.clicked.connect(self._find_next)
         layout.addWidget(next_btn)
 
@@ -1030,6 +1082,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
         close_btn = QPushButton('×')
         close_btn.setFixedWidth(32)
+        close_btn.setToolTip('Chiudi la barra di ricerca (Esc)')
         close_btn.clicked.connect(self._hide_find_bar)
         layout.addWidget(close_btn)
 
@@ -1301,6 +1354,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
         self.results_view = QTreeWidget()
         self.results_view.setHeaderLabels(['Risultati'])
+        self.results_view.header().setStretchLastSection(True)
+        self.results_view.header().setMinimumSectionSize(80)
         self.results_view.itemDoubleClicked.connect(self._open_result_item)
 
         panel = QWidget()
@@ -1320,8 +1375,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         label_layout.setContentsMargins(10, 4, 10, 4)
         label_layout.setSpacing(16)
         self.incoming_label_btn = QPushButton('INCOMING')
+        self.incoming_label_btn.setToolTip("Elenca chi fa riferimento all'elemento selezionato, e da dove")
         self.incoming_label_btn.clicked.connect(lambda: self._toggle_info_popup(self.incoming_view))
         self.outgoing_label_btn = QPushButton('OUTGOING')
+        self.outgoing_label_btn.setToolTip("Elenca a cosa fa riferimento l'elemento selezionato, e dove")
         self.outgoing_label_btn.clicked.connect(lambda: self._toggle_info_popup(self.outgoing_view))
         for btn in (self.incoming_label_btn, self.outgoing_label_btn):
             label_layout.addWidget(btn)
@@ -1333,6 +1390,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.file_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.file_path_label.setCursor(Qt.IBeamCursor)
         label_layout.addWidget(self.file_path_label)
+        self.info_popup_close_btn = QPushButton('×')
+        self.info_popup_close_btn.setCursor(Qt.PointingHandCursor)
+        self.info_popup_close_btn.setToolTip('Chiudi questo pannello')
+        self.info_popup_close_btn.clicked.connect(self._close_info_popup)
+        label_layout.addWidget(self.info_popup_close_btn)
         layout.addWidget(label_bar)
 
         panel.setFixedHeight(42)
@@ -1348,11 +1410,20 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         )
         for view in (self.incoming_view, self.outgoing_view):
             view.setStyleSheet(list_style)
-        self.results_view.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:6px;')
+        self.results_view.setStyleSheet(
+            f'QTreeWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:6px; }} '
+            f'QHeaderView::section {{ background:{theme.PANEL}; color:{theme.TEXT}; border:none; '
+            f'border-bottom:1px solid {theme.BORDER}; padding:4px 8px; font-weight:700; }}'
+        )
         self.info_popup.setStyleSheet(f'background:{theme.CODE_BG}; border-top:1px solid {theme.BORDER}; border-bottom:1px solid {theme.BORDER};')
         self.io_tabs.setStyleSheet(f'background:{theme.PANEL}; border-top:1px solid {theme.BORDER};')
         for btn in (self.incoming_label_btn, self.outgoing_label_btn):
             btn.setStyleSheet(theme.BUTTON_STYLE + 'QPushButton { padding:4px 12px; }')
+        self.info_popup_close_btn.setStyleSheet(
+            f'QPushButton {{ border:none; background:transparent; color:{theme.DIM}; '
+            f'font-size:16px; font-weight:700; padding:0px 4px; }} '
+            f'QPushButton:hover {{ color:{theme.TAG_COLORS["TST"]}; }}'
+        )
         # map_tab_btn's own corner rounding flips with which edge it's on (bottom of the shell vs
         # top of the map dialog) — handled by _style_map_tab_button, called from _position_map_tab
         # since it already knows which edge, and runs whenever the tab is (re)shown or moved
@@ -1431,16 +1502,19 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _switch_terminal_tab(self, index):
         self.terminal_stack.setCurrentIndex(index)
         if index == 1 and self.python_terminal.process is None:
-            self.python_terminal.run_python_repl()
+            self.python_terminal.run_python_repl(self._active_python())
 
     def _toggle_info_popup(self, widget, force_open=False):
         if self.info_popup.currentWidget() is widget and self.info_popup.isVisible() and not force_open:
-            self.info_popup.setVisible(False)
-            self.io_tabs.setFixedHeight(42)
+            self._close_info_popup()
             return
         self.info_popup.setCurrentWidget(widget)
         self.info_popup.setVisible(True)
         self.io_tabs.setFixedHeight(200)
+
+    def _close_info_popup(self):
+        self.info_popup.setVisible(False)
+        self.io_tabs.setFixedHeight(42)
 
     # [FN CATEGORY] _open_xref_window — MAPPA opens the cross-reference graph in a dialog internal to
     # the IDE (parented to the main window, floating over the editor — not a strip in the coding pane
@@ -1758,6 +1832,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.settings.setValue('session/openFolder', path)
         self.terminal.set_cwd(path)
         self.claude_pane.set_cwd(path)
+        self._auto_select_interpreter()
+        if is_python_majority_project(path):
+            self._switch_terminal_tab(1)
         self._rebuild_tree()
         self._check_kant_map(path)
         if self.kant_map_path is None:
@@ -1954,7 +2031,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             f' <span style="color:{theme.WARN}; font-weight:700">[{html_escape(git_status)}]</span>'
             if git_status else ''
         )
-        detail_html = f'<br><span style="color:{theme.DIM}">{html_escape(detail)}</span>' if detail else ''
+        # rich-text spans ignore QLabel.setFont proportionally, so the size needs to be explicit
+        # here rather than inherited — one point larger than the label's own TREE_FONT_PT
+        detail_html = (
+            f'<br><span style="color:{theme.DIM}; font-size:{theme.TREE_FONT_PT + 1}pt">{html_escape(detail)}</span>'
+            if detail else ''
+        )
         lbl = _TreeItemLabel(
             self.tree, item,
             f'<span style="color:{color}; background-color:{bg}; font-weight:700; '
@@ -2369,8 +2451,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         path = tab.path
         text = serialize_kant(tab.tree)
         self.syntax_label.setText('Controllo sintassi...')
+        python_exe = self._active_python()
         self._run_background(
-            lambda: check_file_syntax(path, text),
+            lambda: check_file_syntax(path, text, python_exe),
             lambda result, error: self._apply_syntax_status(path, text, result, error),
         )
 
@@ -2430,6 +2513,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             item.setData(0, ROLE_PATH, path)
             item.setData(0, ROLE_LINE, line)
             item.setData(0, ROLE_TEXT, message)
+            # LSP severity: 1=Error, 2=Warning, 3=Info, 4=Hint (missing severity, e.g. the local
+            # syntax-check fallback above, means "the one thing that's wrong" -> treat as an error)
+            severity = diag.get('severity', 1)
+            color = {1: theme.TAG_COLORS['TST'], 2: theme.HOT}.get(severity, theme.DIM)
+            item.setForeground(0, QColor(color))
     # [FN CLOSED] _refresh_errors_view
 
     def _lsp_first_error(self, path):
@@ -2653,7 +2741,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._ide_message('Formatta', 'Formattazione black/ruff disponibile solo per file Python.')
             return
         text = serialize_kant(tab.tree)
-        if shutil.which('black'):
+        python_exe = self._active_python()
+        if has_module(python_exe, 'black'):
+            args = [python_exe, '-m', 'black', '-q', '-']
+        elif has_module(python_exe, 'ruff'):
+            args = [python_exe, '-m', 'ruff', 'format', '--stdin-filename', tab.path, '-']
+        elif shutil.which('black'):
             args = ['black', '-q', '-']
         elif shutil.which('ruff'):
             args = ['ruff', 'format', '--stdin-filename', tab.path, '-']
@@ -2687,6 +2780,142 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._update_tab_title(tab)
         self._update_filename_label()
         self._ide_message('LSP locale', message)
+
+    # ---- Python interpreter/venv (AI-NAV: kant/pyenv.py owns detection/config, this owns UI) ---
+
+    def _active_python(self):
+        """The configured interpreter for the open project, or sys.executable as a fallback —
+        the single call every run/debug/test/format/REPL site routes through."""
+        if self.project_root_path:
+            configured = load_interpreter(self.project_root_path)
+            if configured:
+                return configured
+        return sys.executable
+
+    def _refresh_python_env_label(self):
+        if not self.project_root_path:
+            self.python_env_label.setVisible(False)
+            return
+        python_path = self._active_python()
+        version = interpreter_version(python_path)
+        label = interpreter_label(python_path) if python_path != sys.executable else 'sistema'
+        text = f'Python: {label}' + (f' ({version})' if version else '')
+        self.python_env_label.setText(text)
+        self.python_env_label.setVisible(True)
+
+    # [FN CATEGORY] _auto_select_interpreter — called once per project open: silently picks the
+    # first detected venv when nothing is configured yet, no prompt — Python-mode activating with
+    # no manual setup is the point. A user who wants a different interpreter still has the status
+    # bar button (_select_python_interpreter) to change it any time.
+    # [FN] _auto_select_interpreter — auto-picks a detected venv if the project has none configured
+    # [FN OPEN] _auto_select_interpreter
+    def _auto_select_interpreter(self):
+        if not self.project_root_path:
+            return
+        if not load_interpreter(self.project_root_path):
+            candidates = detect_venvs(self.project_root_path)
+            if candidates:
+                save_interpreter(self.project_root_path, candidates[0])
+        self._refresh_python_env_label()
+    # [FN CLOSED] _auto_select_interpreter
+
+    def _select_python_interpreter(self):
+        if not self.project_root_path:
+            self._ide_message('Python', 'Apri prima una cartella di progetto.')
+            return
+        candidates = detect_venvs(self.project_root_path)
+        current = load_interpreter(self.project_root_path)
+        chosen = self._ide_python_interpreter_form(candidates, current)
+        if not chosen:
+            return
+        save_interpreter(self.project_root_path, chosen)
+        self._refresh_python_env_label()
+        self.terminal.write_info(f'\n# Interprete Python: {chosen}\n')
+
+    # [FN CATEGORY] _install_dependencies — requirements.txt gets `pip install -r`; pyproject.toml
+    # gets `pip install -e .` (an editable install resolves the project's own declared deps without
+    # this needing to parse the TOML itself) — both run through the terminal pane (not
+    # _run_background) so the install's own output streams live instead of appearing only once
+    # finished.
+    # [FN] _install_dependencies — installs requirements.txt/pyproject.toml deps on the active interpreter
+    # [FN OPEN] _install_dependencies
+    def _install_dependencies(self):
+        if not self.project_root_path:
+            return
+        dep_file = dependency_file(self.project_root_path)
+        if not dep_file:
+            self._ide_message('Dipendenze', 'Nessun requirements.txt o pyproject.toml trovato in questo progetto.')
+            return
+        python_path = self._active_python()
+        args = (
+            [python_path, '-m', 'pip', 'install', '-r', dep_file] if dep_file == 'requirements.txt'
+            else [python_path, '-m', 'pip', 'install', '-e', '.']
+        )
+        command = ' '.join(_quote_arg(a) for a in args)
+        self.terminal.run_command(command, self.project_root_path)
+    # [FN CLOSED] _install_dependencies
+
+    # [FN CATEGORY] _run_lint_check — ruff first, flake8 as a fallback (same shape as
+    # _format_with_external_tool's black/ruff choice), both checked via has_module against the
+    # SELECTED interpreter rather than a bare PATH lookup, so this lints with whatever the
+    # project's own venv actually has installed, not whatever happens to be on the system PATH.
+    # [FN] _run_lint_check — runs ruff check (or flake8) and surfaces results as a clickable list
+    # [FN OPEN] _run_lint_check
+    def _run_lint_check(self):
+        project_root = self.project_root_path
+        if not project_root:
+            return
+        python_path = self._active_python()
+
+        def run():
+            if has_module(python_path, 'ruff'):
+                return subprocess.run(
+                    [python_path, '-m', 'ruff', 'check', '--output-format=concise', '.'],
+                    cwd=project_root, capture_output=True, text=True, timeout=60,
+                )
+            if has_module(python_path, 'flake8'):
+                return subprocess.run(
+                    [python_path, '-m', 'flake8', '.'],
+                    cwd=project_root, capture_output=True, text=True, timeout=60,
+                )
+            return None
+
+        self.terminal.write_info('\n# Lint: ruff check (o flake8)\n')
+        self._run_background(run, lambda result, error: self._finish_lint_check(project_root, result, error))
+    # [FN CLOSED] _run_lint_check
+
+    def _finish_lint_check(self, project_root, result, error):
+        if error or result is None:
+            self.terminal.write_info(
+                '\n# Lint: ne ruff ne flake8 sono installati per questo interprete '
+                '(pip install ruff, oppure pip install flake8)\n'
+            )
+            return
+        output = (result.stdout or '') + (result.stderr or '')
+        self.terminal.write_info(f'\n{output}\n')
+        self._show_lint_results(project_root, output)
+
+    # [FN CATEGORY] _show_lint_results — parses ruff's --output-format=concise and flake8's default
+    # output, both "path:line:col: message" (flake8) or "path:line:col: CODE message" (ruff) —
+    # the trailing column is optional in the regex since it's not needed for navigation, just line.
+    # [FN] _show_lint_results — populates results_view with clickable ruff/flake8 findings
+    # [FN OPEN] _show_lint_results
+    def _show_lint_results(self, project_root, output):
+        entries = []
+        for match in re.finditer(r'^(?P<path>[^\s:][^:]*):(?P<line>\d+):(?:\d+:)?\s*(?P<message>.+)$', output, re.MULTILINE):
+            entries.append((match.group('path'), int(match.group('line')), match.group('message')))
+        self.results_view.clear()
+        summary = f'Lint: {len(entries)} problema/i' if entries else 'Lint: nessun problema'
+        root_item = QTreeWidgetItem(self.results_view, [summary])
+        for rel_path, line, message in entries[:200]:
+            abs_path = rel_path if os.path.isabs(rel_path) else os.path.join(project_root, rel_path)
+            item = QTreeWidgetItem(root_item, [f'{rel_path}:{line}: {message}'])
+            item.setData(0, ROLE_KIND, 'diagnostic-result')
+            item.setData(0, ROLE_PATH, abs_path)
+            item.setData(0, ROLE_LINE, line)
+        root_item.setExpanded(True)
+        self._toggle_info_popup(self.results_view, force_open=True)
+    # [FN CLOSED] _show_lint_results
 
     def _on_lsp_response(self, request_id, method, result):
         if method == 'textDocument/completion':
@@ -2950,7 +3179,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             if not tab.save():
                 return
             self._update_tab_title(tab)
-        command = run_command_for_path(tab.path)
+        command = run_command_for_path(tab.path, self._active_python())
         if command is None:
             self._ide_message('Run', 'Nessun comando run configurato per questo tipo di file.')
             return
@@ -2981,7 +3210,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 continue
             offset = self._line_count_before_run(tab.tree, item) or 0
             lines.extend(offset + number + 1 for number in edit.breakpoints)
-        self.terminal.run_debug_python(tab.path, lines, os.path.dirname(tab.path) or None)
+        self.terminal.run_debug_python(tab.path, lines, os.path.dirname(tab.path) or None, self._active_python())
     # [FN CLOSED] _debug_current_file
 
     # ---- section view (AI-NAV: Node/Run tree -> editable Qt widgets) -----
@@ -2990,6 +3219,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         tab.filter_uid = only_uid
         self._update_tab_title(tab)
         self._update_filename_label()
+        if hasattr(self, 'claude_pane'):
+            self.claude_pane.refresh_focus_label()
         while tab.view_layout.count():
             item = tab.view_layout.takeAt(0)
             w = item.widget()
@@ -3204,19 +3435,37 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         target_dir = self._dir_for_context(item, kind)
 
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         new_file_action = menu.addAction('Nuovo file…')
+        new_file_action.setToolTip('Crea un nuovo file vuoto nella cartella scelta')
         new_folder_action = menu.addAction('Nuova cartella…')
+        new_folder_action.setToolTip('Crea una nuova sottocartella vuota')
         restore_action = menu.addAction('Ripristina dal cestino...') if self._restore_candidates() else None
+        if restore_action is not None:
+            restore_action.setToolTip("Ripristina un file/cartella eliminato di recente dal cestino dell'IDE")
         rename_action = delete_action = git_diff_action = git_stage_action = git_unstage_action = None
+        run_test_action = None
+        test_name = None
         if item is not None and kind in ('file', 'plainfile', 'invalidfile', 'dir'):
             menu.addSeparator()
             rename_action = menu.addAction('Rinomina…')
+            rename_action.setToolTip('Rinomina questo file o cartella')
             delete_action = menu.addAction('Elimina')
+            delete_action.setToolTip('Sposta questo file o cartella nel cestino')
         if item is not None and kind in ('file', 'plainfile') and self.git_root:
             menu.addSeparator()
             git_diff_action = menu.addAction('Git diff')
+            git_diff_action.setToolTip('Mostra le differenze non salvate di questo file rispetto a Git')
             git_stage_action = menu.addAction('Git stage')
+            git_stage_action.setToolTip('Aggiunge questo file alla staging area (git add)')
             git_unstage_action = menu.addAction('Git unstage')
+            git_unstage_action.setToolTip('Rimuove questo file dalla staging area (git reset)')
+        if item is not None and kind == 'section' and Path(item.data(0, ROLE_PATH)).suffix.lower() == '.py':
+            test_name = self._section_test_name(item)
+            if test_name:
+                menu.addSeparator()
+                run_test_action = menu.addAction(f'Esegui questo test ({test_name})')
+                run_test_action.setToolTip(f'Esegue solo pytest {test_name}, non l\'intera suite')
 
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if chosen is new_file_action:
@@ -3235,7 +3484,63 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._git_stage_file(item.data(0, ROLE_PATH), staged=True)
         elif git_unstage_action is not None and chosen is git_unstage_action:
             self._git_stage_file(item.data(0, ROLE_PATH), staged=False)
+        elif run_test_action is not None and chosen is run_test_action:
+            self._run_single_test(item.data(0, ROLE_PATH), test_name)
     # [FN CLOSED] _show_tree_context_menu
+
+    # [FN CATEGORY] _section_test_name — resolves a tree item's KANT node the same way
+    # _on_tree_item_clicked does (uid first, document-order fallback for legacy no-#id files) and
+    # returns its name only when it looks like a pytest test (name starts with 'test_') — this is
+    # the one check that decides whether "Esegui questo test" shows up in the context menu at all.
+    # [FN] _section_test_name — the pytest test name for a 'section' tree item, or None
+    # [FN OPEN] _section_test_name
+    def _section_test_name(self, item):
+        path = item.data(0, ROLE_PATH)
+        tab = self.open_tabs.get(path)
+        tree = tab.tree if tab is not None else None
+        if tree is None:
+            try:
+                with open(path, encoding='utf-8') as f:
+                    tree = parse_kant(f.read())
+            except (OSError, KantParseError):
+                return None
+        uid = item.data(0, ROLE_UID)
+        node = self._find_node_by_uid(tree, uid)
+        if node is None:
+            order = item.data(0, ROLE_ORDER)
+            if order is None:
+                return None
+            nodes = self._nodes_in_order(tree)
+            if order >= len(nodes):
+                return None
+            node = nodes[order]
+        return node.name if node.name.startswith('test_') else None
+    # [FN CLOSED] _section_test_name
+
+    # [FN CATEGORY] _run_single_test — targets one test with pytest's `path::name` node-id syntax
+    # instead of the whole-project run _run_tests does; reuses _finish_test_run's own output/summary
+    # parsing since a one-test run produces the exact same FAILED-line / summary-line shape.
+    # [FN] _run_single_test — runs one pytest test by name and surfaces pass/fail
+    # [FN OPEN] _run_single_test
+    def _run_single_test(self, path, test_name):
+        project_root = self.project_root_path or self.git_root
+        if not project_root or self._test_run_pending:
+            return
+        if not self._flush_all_tabs():
+            return
+        self._test_run_pending = True
+        python_exe = self._active_python()
+        node_id = f'{path}::{test_name}'
+
+        def run():
+            return subprocess.run(
+                [python_exe, '-m', 'pytest', '--tb=short', '-q', '--color=no', node_id],
+                cwd=project_root, capture_output=True, text=True, timeout=120,
+            )
+
+        self.terminal.write_info(f'\n# Esegui test: python -m pytest {test_name}\n')
+        self._run_background(run, lambda result, error: self._finish_test_run(project_root, result, error))
+    # [FN CLOSED] _run_single_test
 
     # [FN CATEGORY] _run_tests — runs the whole project through `python -m pytest` (auto-discovers
     # test_*.py, matching this project's own test_kant_smoke.py convention) via _run_background so
@@ -3250,10 +3555,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if not self._flush_all_tabs():
             return
         self._test_run_pending = True
+        python_exe = self._active_python()
 
         def run():
             return subprocess.run(
-                [sys.executable, '-m', 'pytest', '--tb=short', '-q', '--color=no'],
+                [python_exe, '-m', 'pytest', '--tb=short', '-q', '--color=no'],
                 cwd=project_root, capture_output=True, text=True, timeout=300,
             )
 

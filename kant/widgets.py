@@ -21,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 from html import escape as html_escape
 from pathlib import Path
 
@@ -555,22 +556,23 @@ class TerminalPane(QPlainTextEdit):
     # via the same stdin-forwarding keyPressEvent uses for any running process.
     # [FN] run_debug_python — starts a pdb session for path with breakpoints pre-set
     # [FN OPEN] run_debug_python
-    def run_debug_python(self, path, breakpoint_lines, cwd=None):
+    def run_debug_python(self, path, breakpoint_lines, cwd=None, python_exe=None):
         if self.process is not None:
             self._append('\n# terminal busy: stop the running command first\n')
             return False
         if cwd:
             self.cwd = cwd
+        python_exe = python_exe or sys.executable
         if len(self.toPlainText()) > self.prompt_start:
             self._append('\n')
-        self._append(f'{sys.executable} -m pdb {path}\n')
+        self._append(f'{python_exe} -m pdb {path}\n')
         self.process = QProcess(self)
         self.process.setWorkingDirectory(self.cwd)
         self.process.readyReadStandardOutput.connect(self._read_stdout)
         self.process.readyReadStandardError.connect(self._read_stderr)
         self.process.errorOccurred.connect(self._error)
         self.process.finished.connect(self._finished)
-        self.process.start(sys.executable, ['-m', 'pdb', path])
+        self.process.start(python_exe, ['-m', 'pdb', path])
         self.prompt_start = len(self.toPlainText())
         for line_no in sorted(breakpoint_lines):
             self.process.write(f'break {path}:{line_no}\n'.encode(self.encoding))
@@ -584,17 +586,18 @@ class TerminalPane(QPlainTextEdit):
     # uses for pdb makes this pane a working REPL with no extra input handling of its own.
     # [FN] run_python_repl — starts an interactive `python -i` session in this pane
     # [FN OPEN] run_python_repl
-    def run_python_repl(self):
+    def run_python_repl(self, python_exe=None):
         if self.process is not None:
             return False
-        self._append(f'{sys.executable} -i\n')
+        python_exe = python_exe or sys.executable
+        self._append(f'{python_exe} -i\n')
         self.process = QProcess(self)
         self.process.setWorkingDirectory(self.cwd)
         self.process.readyReadStandardOutput.connect(self._read_stdout)
         self.process.readyReadStandardError.connect(self._read_stderr)
         self.process.errorOccurred.connect(self._error)
         self.process.finished.connect(self._finished)
-        self.process.start(sys.executable, ['-i', '-u'])
+        self.process.start(python_exe, ['-i', '-u'])
         self.prompt_start = len(self.toPlainText())
         return True
     # [FN CLOSED] run_python_repl
@@ -671,14 +674,19 @@ def _agent_executable(agent):
 # [FN] _agent_command — builds the argv for launching one prompt, per-provider. Effort is a real
 # parameter for both CLIs, just under different mechanisms: claude has a direct `--effort` flag
 # (low/medium/high/xhigh/max, per `claude --help`); codex has no dedicated flag but honors the
-# `model_reasoning_effort` config key via its generic `-c key=value` override.
-def _agent_command(agent, prompt, auto_permissions=False, model=None, effort=None):
+# `model_reasoning_effort` config key via its generic `-c key=value` override. session_args (see
+# run_prompt) thread through a fresh-session or resume-session marker, per-provider shape decided
+# by the caller — this function just splices it into the right spot in the argv.
+def _agent_command(agent, prompt, auto_permissions=False, model=None, effort=None, session_args=()):
     model_args = ('--model', model) if model else ()
     if agent == 'codex':
         effort_args = ('-c', f'model_reasoning_effort="{effort}"') if effort else ()
-        return 'codex', ['exec', *(('--full-auto',) if auto_permissions else ()), *model_args, *effort_args, prompt]
+        return 'codex', [
+            'exec', *session_args, *(('--full-auto',) if auto_permissions else ()),
+            *model_args, *effort_args, prompt,
+        ]
     effort_args = ('--effort', effort) if effort else ()
-    return 'claude', [*model_args, *effort_args, '-p', prompt]
+    return 'claude', [*session_args, *model_args, *effort_args, '-p', prompt]
 
 
 def _agent_label(agent):
@@ -771,6 +779,14 @@ class ClaudePane(QWidget):
         self.validate_after_finish = False
         self.before_run = None
         self.context_hint = None  # callable returning a hidden scoping instruction, or None; see _send
+        self.focus_hint = None  # callable returning a short human-readable focus summary, or None
+        # each run_prompt call is otherwise a brand-new, stateless claude/codex subprocess with no
+        # memory of earlier turns — these track this pane's ongoing conversation per provider so a
+        # later message can ask the CLI to resume it instead of starting fresh every time. Reset in
+        # set_cwd (a different project is a different conversation), not on Stop (interrupting the
+        # current turn doesn't erase what was already said).
+        self._claude_session_id = None
+        self._codex_resumable = False
         self._messages = []
         self._stream_label = None
         self._stream_text = ''
@@ -807,16 +823,24 @@ class ClaudePane(QWidget):
         self.agent_select = QComboBox()
         self.agent_select.addItem('Claude Code', 'claude')
         self.agent_select.addItem('Codex', 'codex')
+        self.agent_select.setToolTip('Quale CLI AI usare per i messaggi inviati da questa plancia')
         header.addWidget(self.agent_select)
         self.model_select = QComboBox()
         self.model_select.setEditable(True)
         self.model_select.setToolTip("Modello per l'agente selezionato (modificabile: puoi scrivere un ID non in elenco)")
         self.model_select.addItems(CLAUDE_MODELS)
+        # editable QComboBox: the internal line edit shows an I-beam text cursor by default, which
+        # reads as "select/copy this text" — it's a dropdown picker, not a text field, so both the
+        # combo box and its line edit need the pointer cursor explicitly
+        self.model_select.setCursor(Qt.PointingHandCursor)
+        self.model_select.lineEdit().setCursor(Qt.PointingHandCursor)
         header.addWidget(self.model_select)
         self.effort_select = QComboBox()
         self.effort_select.setEditable(True)
         self.effort_select.setToolTip("Reasoning effort per l'agente selezionato")
         self.effort_select.addItems(EFFORT_LEVELS['claude'])
+        self.effort_select.setCursor(Qt.PointingHandCursor)
+        self.effort_select.lineEdit().setCursor(Qt.PointingHandCursor)
         header.addWidget(self.effort_select)
         header.addStretch(1)
         self.auto_permissions = QCheckBox('Automatico')
@@ -824,6 +848,14 @@ class ClaudePane(QWidget):
         self.auto_permissions.toggled.connect(self._automatic_permissions_changed)
         header.addWidget(self.auto_permissions)
         layout.addWidget(self.controls_bar)
+
+        # a quiet line under the selector row surfacing what focus_hint() currently resolves to —
+        # the implicit scoping (isolated element / whole file / whole project) is otherwise silent,
+        # riding the hidden system-prompt channel with nothing to show for it in the chat UI itself
+        self.focus_label = QLabel('')
+        self.focus_label.setFont(QFont('Consolas', theme.CODE_FONT_PT - 1))
+        self.focus_label.setContentsMargins(10, 0, 10, 0)
+        layout.addWidget(self.focus_label)
 
         self.output = QScrollArea()
         self.output.setWidgetResizable(True)
@@ -851,6 +883,7 @@ class ClaudePane(QWidget):
         self.send_btn.setIcon(draw_icon('arrow-right', 14))
         self.send_btn.setIconSize(QSize(14, 14))
         self.send_btn.setCursor(Qt.PointingHandCursor)
+        self.send_btn.setToolTip('Invia il messaggio (Ctrl+Return); se un comando e in corso, lo interrompe')
         self.send_btn.clicked.connect(self._send)
         self.send_btn.setFixedHeight(42)
         composer.addWidget(self.send_btn, 0, Qt.AlignBottom)
@@ -884,6 +917,7 @@ class ClaudePane(QWidget):
         self.model_select.setStyleSheet(combo_style)
         self.effort_select.setStyleSheet(combo_style)
         self.auto_permissions.setStyleSheet(f'color:{theme.WARN}; font-weight:600; spacing:6px;')
+        self.focus_label.setStyleSheet(f'color:{theme.DIM};')
         self.send_btn.setStyleSheet(
             f'QPushButton {{ background:{theme.WARN}; color:#ffffff; border:none; border-radius:9px; '
             f'padding:7px 15px; font-weight:700; }} '
@@ -960,11 +994,17 @@ class ClaudePane(QWidget):
         content.addWidget(status)
         actions = QHBoxLayout()
         buttons = [QPushButton(label) for label in ('Rifiuta', 'Consenti una volta', 'Consenti per la sessione')]
+        button_tooltips = (
+            'Nega questa singola richiesta di permesso',
+            'Consenti solo questa singola richiesta, ne verra richiesto di nuovo la prossima volta',
+            "Consenti questo tipo di richiesta per il resto della sessione, senza chiedere ogni volta",
+        )
         # color-coded (deny=danger, allow=accept) instead of three identical plain buttons — a
         # permission decision is exactly the kind of choice a misclick shouldn't be easy to make
         deny_color = theme.TAG_COLORS['TST']
-        for button, accent in zip(buttons, (deny_color, theme.OK, theme.OK)):
+        for button, accent, tooltip in zip(buttons, (deny_color, theme.OK, theme.OK), button_tooltips):
             button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(tooltip)
             button.setStyleSheet(
                 f'QPushButton {{ background:{theme.PANEL}; color:{accent}; border:1px solid {accent}; '
                 f'border-radius:8px; padding:6px 12px; font-weight:700; }} '
@@ -1005,7 +1045,13 @@ class ClaudePane(QWidget):
 
     def set_cwd(self, cwd):
         self.cwd = cwd
+        self._claude_session_id = None
+        self._codex_resumable = False
         self._append(f'Cartella di lavoro: {cwd}')
+
+    def refresh_focus_label(self):
+        text = self.focus_hint() if self.focus_hint else None
+        self.focus_label.setText(f'Focus: {text}' if text else '')
 
     def _write_log(self, text):
         try:
@@ -1038,6 +1084,10 @@ class ClaudePane(QWidget):
         label = QLabel(text.strip())
         label.setTextFormat(Qt.PlainText)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # TextSelectableByMouse alone doesn't change the hover cursor — without this the bubble
+        # (user messages included) looks like static text even though drag-select already works,
+        # same IBeam pairing used for file_path_label wherever TextSelectableByMouse is set
+        label.setCursor(Qt.IBeamCursor)
         label.setWordWrap(True)
         label.setFont(QFont('Consolas', theme.CODE_FONT_PT))
         bubble.addWidget(name_label)
@@ -1130,20 +1180,53 @@ class ClaudePane(QWidget):
             try:
                 self.system_prompt_file = _write_system_prompt_file(system_prompt)
             except OSError as e:
-                self._append(f'Impossibile preparare le istruzioni KANT per Codex: {e}\n')
+                self._append(f'Impossibile preparare le istruzioni per Codex: {e}\n')
                 return False
             name = self.system_prompt_file
-            prompt = (
-                f'/kant-code-map\n'
-                f'Questa e una richiesta esplicita di eseguire /kant-code-map sul progetto corrente. '
-                f'Prima leggi e segui il file temporaneo {name} come istruzioni KANT. '
-                f'Non modificare, non taggare e non includere il file temporaneo {name}; applica invece la convenzione KANT ai file sorgente '
-                f'e crea o aggiorna KANT_<nome-progetto>.md. Richiesta originale: {prompt}'
-            )
+            if 'kant-code-map' in extra_skills:
+                prompt = (
+                    f'/kant-code-map\n'
+                    f'Questa e una richiesta esplicita di eseguire /kant-code-map sul progetto corrente. '
+                    f'Prima leggi e segui il file temporaneo {name} come istruzioni KANT. '
+                    f'Non modificare, non taggare e non includere il file temporaneo {name}; applica invece la convenzione KANT ai file sorgente '
+                    f'e crea o aggiorna KANT_<nome-progetto>.md. Richiesta originale: {prompt}'
+                )
+            else:
+                # codex has no --append-system-prompt equivalent (no such flag in `codex exec
+                # --help`) — a temp file plus a "read this first" instruction is the only way to
+                # deliver the KANT comment standard and the hidden context_hint (the coding panel's
+                # currently isolated file/element) without either showing up in the visible chat
+                # bubble. This branch must stay separate from the kant-code-map one above: framing
+                # every ordinary message as "run /kant-code-map... create or update
+                # KANT_<project>.md" (the old, unconditional wording) reframed every single chat
+                # message as a project-wide tagging task regardless of what was actually asked,
+                # burying both the real request and context_hint's scoping underneath it — which is
+                # why the AI seemed to ignore the isolated element/file and "forget" what was asked.
+                prompt = (
+                    f'Prima leggi il file temporaneo {name}: contiene istruzioni di contesto da '
+                    f'seguire per questa risposta (non modificarlo, non menzionarlo esplicitamente '
+                    f'all\'utente). Poi rispondi a questa richiesta: {prompt}'
+                )
         model = self.model_select.currentText().strip()
         if model == MODEL_DEFAULT:
             model = ''
-        _, args = _agent_command(agent, prompt, auto_permissions_once, model or None, effort)
+        # each CLI call is otherwise a fresh, memory-less process — resume this pane's own ongoing
+        # conversation (per provider) instead of starting over on every message. Claude: mint a
+        # session id on the first turn, --resume it on every later turn. Codex has no equivalent
+        # "assign my own id" flag, only `exec resume --last` to continue whatever it last recorded
+        # for this cwd — good enough since only one conversation per provider runs from this pane.
+        if agent == 'claude':
+            if self._claude_session_id is None:
+                self._claude_session_id = str(uuid.uuid4())
+                session_args = ('--session-id', self._claude_session_id)
+            else:
+                session_args = ('--resume', self._claude_session_id)
+        elif agent == 'codex':
+            session_args = ('resume', '--last') if self._codex_resumable else ()
+            self._codex_resumable = True
+        else:
+            session_args = ()
+        _, args = _agent_command(agent, prompt, auto_permissions_once, model or None, effort, session_args)
         if agent == 'claude':
             try:
                 self.permission_config_file = write_permission_config(self.permission_bridge)
@@ -1265,6 +1348,7 @@ class ClaudePane(QWidget):
         header_row.addStretch(1)
         close_btn = QPushButton('×')
         close_btn.setFixedSize(26, 24)
+        close_btn.setToolTip('Chiudi (annulla le modifiche proposte, come Annulla ↶)')
         close_btn.setStyleSheet(theme.BUTTON_STYLE)
         header_row.addWidget(close_btn)
         outer.addWidget(header)
@@ -1361,8 +1445,12 @@ class _AiReviewCard(QWidget):
         if not self.in_dialog:
             # redundant in a dialog: the window's own close button cancels, and details are
             # already shown immediately instead of waiting for a "Controllo" click
-            header.addWidget(self._button('Annulla ↶', lambda: self.resolved.emit('cancel'), action=True))
-            header.addWidget(self._button('Controllo', self._show_details))
+            cancel_btn = self._button('Annulla ↶', lambda: self.resolved.emit('cancel'), action=True)
+            cancel_btn.setToolTip('Annulla tutte le modifiche proposte dall\'AI, ripristinando i file com\'erano')
+            header.addWidget(cancel_btn)
+            review_btn = self._button('Controllo', self._show_details)
+            review_btn.setToolTip('Apri la revisione dettagliata riga per riga delle modifiche proposte')
+            header.addWidget(review_btn)
         layout.addLayout(header)
 
         self.summary_rows = []
@@ -1375,6 +1463,7 @@ class _AiReviewCard(QWidget):
                 f'QPushButton {{ text-align:left; padding:5px 0; border:none; color:{theme.TEXT}; background:transparent; }} '
                 f'QPushButton:hover {{ color:{theme.ACCENT}; }}'
             )
+            path_button.setToolTip('Apri la revisione dettagliata di questo file')
             path_button.clicked.connect(lambda _checked=False, path=item['path']: self._show_details(path))
             row_layout.addWidget(path_button, 1)
             added_label = QLabel(f"+{item['additions']}")
@@ -1388,6 +1477,7 @@ class _AiReviewCard(QWidget):
             self.summary_rows.append(row)
         hidden = max(0, len(self.review) - 3)
         self.more_btn = self._button(f'Mostra altri {hidden} file ⌄', self._toggle_summary)
+        self.more_btn.setToolTip('Mostra o nascondi il resto dei file modificati')
         self.more_btn.setVisible(bool(hidden))
         layout.addWidget(self.more_btn)
         return panel
@@ -1445,12 +1535,22 @@ class _AiReviewCard(QWidget):
         note.setStyleSheet(f'color:{theme.DIM};')
         layout.addWidget(note)
         actions = QHBoxLayout()
-        actions.addWidget(self._button('Rifiuta selezionati', lambda: self._set_selected(False)))
-        actions.addWidget(self._button('Accetta selezionati', lambda: self._set_selected(True)))
+        reject_selected_btn = self._button('Rifiuta selezionati', lambda: self._set_selected(False))
+        reject_selected_btn.setToolTip("Deseleziona i blocchi correntemente evidenziati nell'albero (non li applica)")
+        actions.addWidget(reject_selected_btn)
+        accept_selected_btn = self._button('Accetta selezionati', lambda: self._set_selected(True))
+        accept_selected_btn.setToolTip("Seleziona i blocchi correntemente evidenziati nell'albero (li applica)")
+        actions.addWidget(accept_selected_btn)
         actions.addStretch(1)
-        actions.addWidget(self._button('Annulla tutto', lambda: self.resolved.emit('cancel'), action=True))
-        actions.addWidget(self._button('Accetta tutto', self._accept_all, action=True))
-        actions.addWidget(self._button('Applica scelte', lambda: self.resolved.emit('apply'), action=True))
+        cancel_all_btn = self._button('Annulla tutto', lambda: self.resolved.emit('cancel'), action=True)
+        cancel_all_btn.setToolTip("Scarta tutte le modifiche proposte, i file restano com'erano")
+        actions.addWidget(cancel_all_btn)
+        accept_all_btn = self._button('Accetta tutto', self._accept_all, action=True)
+        accept_all_btn.setToolTip('Seleziona ogni blocco di ogni file (non applica ancora)')
+        actions.addWidget(accept_all_btn)
+        apply_btn = self._button('Applica scelte', lambda: self.resolved.emit('apply'), action=True)
+        apply_btn.setToolTip('Scrive su disco solo i blocchi attualmente selezionati')
+        actions.addWidget(apply_btn)
         layout.addLayout(actions)
         return panel
 
@@ -1601,6 +1701,7 @@ class CollapsibleSection(QWidget):
             self.toggle_btn.setArrowType(Qt.DownArrow)
             self.toggle_btn.setCheckable(True)
             self.toggle_btn.setChecked(True)
+            self.toggle_btn.setToolTip('Comprimi/espandi questa sezione')
             self.toggle_btn.setStyleSheet(f'border:none; color:{theme.TEXT}; background:transparent; padding:0; margin:0;')
             self.toggle_btn.setMaximumWidth(16)
             self.toggle_btn.clicked.connect(self._on_toggle)
@@ -1619,7 +1720,7 @@ class CollapsibleSection(QWidget):
             cat = QLabel(html_escape(node.category_desc))
             cat.setWordWrap(True)
             cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 12px;')
-            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT - 1))
+            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT))
             outer.addWidget(cat)
 
         self.content = QWidget()
@@ -1679,7 +1780,7 @@ class LeafSection(QWidget):
             cat = QLabel(html_escape(node.category_desc))
             cat.setWordWrap(True)
             cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 4px;')
-            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT - 1))
+            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT))
             outer.addWidget(cat)
 
         self.content = QWidget()
@@ -1757,6 +1858,7 @@ class RecentFolderCard(QFrame):
         self._path = path
         self.setObjectName('recentFolderCard')
         self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip('Apri questo progetto recente')
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 9, 16, 9)
         layout.setSpacing(1)
@@ -1820,72 +1922,112 @@ class TitleBar(QWidget):
         title_box.addWidget(subtitle)
         layout.addLayout(title_box)
 
-        self.file_menu_btn = self._menu_button('File')
+        self.file_menu_btn = self._menu_button('File', 'Comandi sul file attivo: salva, annulla/ripeti, verifica KANT, esegui, esegui test')
         file_menu = self.file_menu_btn.menu()
+        file_menu.setToolTipsVisible(True)
         self.save_menu_action = file_menu.addAction('Salva')
+        self.save_menu_action.setToolTip('Salva il file attivo su disco (Ctrl+S)')
         self.save_menu_action.triggered.connect(window._save_file)
         self.undo_menu_action = file_menu.addAction('Annulla file')
+        self.undo_menu_action.setToolTip("Annulla l'ultima modifica al file attivo (Ctrl+Z)")
         self.undo_menu_action.triggered.connect(window._undo_file)
         self.redo_menu_action = file_menu.addAction('Ripeti file')
+        self.redo_menu_action.setToolTip("Ripristina la modifica appena annullata (Ctrl+Y)")
         self.redo_menu_action.triggered.connect(window._redo_file)
         self.validate_kant_menu_action = file_menu.addAction('Verifica KANT')
+        self.validate_kant_menu_action.setToolTip(
+            'Controlla che i marcatori KANT (tag/#id, apertura/chiusura) di tutto il progetto siano validi'
+        )
         self.validate_kant_menu_action.triggered.connect(window._run_kant_validation)
         self.run_menu_action = file_menu.addAction('Esegui')
+        self.run_menu_action.setToolTip("Esegue il file attivo con l'interprete/comando adatto al suo tipo (F5)")
         self.run_menu_action.triggered.connect(window._run_current_file)
         self.run_tests_menu_action = file_menu.addAction('Esegui test (Ctrl+Shift+T)')
+        self.run_tests_menu_action.setToolTip('Esegue l\'intera suite pytest del progetto e mostra i risultati')
         self.run_tests_menu_action.triggered.connect(window._run_tests)
         layout.addWidget(self.file_menu_btn)
 
-        self.search_menu_btn = self._menu_button('Cerca')
+        self.search_menu_btn = self._menu_button('Cerca', 'Trova e sostituisci testo nel file attivo o in tutto il progetto')
         search_menu = self.search_menu_btn.menu()
+        search_menu.setToolTipsVisible(True)
         self.find_menu_action = search_menu.addAction('Trova nel file')
+        self.find_menu_action.setToolTip('Cerca (ed eventualmente sostituisce) del testo nel file attualmente aperto')
         self.find_menu_action.triggered.connect(window._show_find_bar)
         self.project_search_menu_action = search_menu.addAction('Cerca nel progetto')
+        self.project_search_menu_action.setToolTip('Cerca del testo in tutti i file del progetto aperto')
         self.project_search_menu_action.triggered.connect(window._search_project)
         self.project_replace_menu_action = search_menu.addAction('Sostituisci nel progetto')
+        self.project_replace_menu_action.setToolTip('Cerca e sostituisce del testo in tutti i file del progetto aperto')
         self.project_replace_menu_action.triggered.connect(window._replace_project)
         layout.addWidget(self.search_menu_btn)
 
         # menu order mirrors the PyCharm-style convention: File, then editing/view-level menus
         # (Cerca ~ Edit's find/replace, Aspetto ~ View), with Git (~ VCS) last — version control is
         # its own concern, not part of the editing flow, so it sits at the end of the row
-        self.appearance_menu_btn = self._menu_button('Aspetto')
+        self.appearance_menu_btn = self._menu_button('Aspetto', "Tema chiaro/scuro e la palette comandi")
         appearance_menu = self.appearance_menu_btn.menu()
+        appearance_menu.setToolTipsVisible(True)
         self.theme_menu_action = appearance_menu.addAction('Notte')
+        self.theme_menu_action.setToolTip('Passa dal tema chiaro a quello scuro (o viceversa)')
         self.theme_menu_action.triggered.connect(window._toggle_theme)
         self.command_palette_menu_action = appearance_menu.addAction('Palette comandi (Ctrl+Shift+P)')
+        self.command_palette_menu_action.setToolTip('Apre un elenco cercabile di tutti i comandi disponibili')
         self.command_palette_menu_action.triggered.connect(window._show_command_palette)
         layout.addWidget(self.appearance_menu_btn)
 
-        self.lsp_menu_btn = self._menu_button('LSP')
+        self.lsp_menu_btn = self._menu_button('LSP', 'Funzioni del language server: hover, definizione, rename, formattazione, lint, dipendenze')
         lsp_menu = self.lsp_menu_btn.menu()
+        lsp_menu.setToolTipsVisible(True)
         self.lsp_hover_menu_action = lsp_menu.addAction('Hover (o passa il mouse su un simbolo)')
+        self.lsp_hover_menu_action.setToolTip('Mostra le informazioni del language server per il simbolo sotto il cursore')
         self.lsp_hover_menu_action.triggered.connect(lambda: window._lsp_command('hover'))
         self.lsp_definition_menu_action = lsp_menu.addAction('Vai alla definizione (Ctrl+Click)')
+        self.lsp_definition_menu_action.setToolTip('Salta alla definizione del simbolo sotto il cursore')
         self.lsp_definition_menu_action.triggered.connect(lambda: window._lsp_command('definition'))
         self.lsp_references_menu_action = lsp_menu.addAction('References')
+        self.lsp_references_menu_action.setToolTip('Elenca tutti i punti del progetto che usano il simbolo sotto il cursore')
         self.lsp_references_menu_action.triggered.connect(lambda: window._lsp_command('references'))
         self.lsp_rename_menu_action = lsp_menu.addAction('Rename symbol (F2)')
+        self.lsp_rename_menu_action.setToolTip('Rinomina il simbolo sotto il cursore in tutto il progetto')
         self.lsp_rename_menu_action.triggered.connect(lambda: window._lsp_command('rename'))
         self.lsp_format_menu_action = lsp_menu.addAction('Formatta documento')
+        self.lsp_format_menu_action.setToolTip('Formatta il file attivo tramite il language server configurato')
         self.lsp_format_menu_action.triggered.connect(lambda: window._lsp_command('format'))
         self.lsp_format_external_menu_action = lsp_menu.addAction('Formatta con black/ruff')
+        self.lsp_format_external_menu_action.setToolTip(
+            "Formatta il file Python attivo con black o ruff (dell'interprete del progetto, o del PATH di sistema)"
+        )
         self.lsp_format_external_menu_action.triggered.connect(window._format_with_external_tool)
+        self.lsp_install_deps_menu_action = lsp_menu.addAction('Installa dipendenze')
+        self.lsp_install_deps_menu_action.setToolTip(
+            'Installa le dipendenze da requirements.txt o pyproject.toml nell\'interprete del progetto'
+        )
+        self.lsp_install_deps_menu_action.triggered.connect(window._install_dependencies)
+        self.lsp_lint_menu_action = lsp_menu.addAction('Esegui lint (ruff/flake8)')
+        self.lsp_lint_menu_action.setToolTip('Analizza il progetto con ruff o flake8 e mostra i problemi trovati')
+        self.lsp_lint_menu_action.triggered.connect(window._run_lint_check)
         layout.addWidget(self.lsp_menu_btn)
 
-        self.git_menu_btn = self._menu_button('Git')
+        self.git_menu_btn = self._menu_button('Git', 'Clic: apri il pannello Git completo. Passaggio del mouse: azioni rapide (stage, commit, branch...)')
         git_menu = self.git_menu_btn.menu()
+        git_menu.setToolTipsVisible(True)
         self.git_refresh_menu_action = git_menu.addAction('Refresh')
+        self.git_refresh_menu_action.setToolTip('Aggiorna lo stato Git mostrato nella barra e nella struttura del progetto')
         self.git_refresh_menu_action.triggered.connect(window._git_refresh)
         self.git_diff_menu_action = git_menu.addAction('Diff file')
+        self.git_diff_menu_action.setToolTip('Mostra le differenze non salvate del file attivo rispetto a Git')
         self.git_diff_menu_action.triggered.connect(window._git_diff_active_file)
         self.git_stage_menu_action = git_menu.addAction('Stage file')
+        self.git_stage_menu_action.setToolTip('Aggiunge il file attivo alla staging area (git add)')
         self.git_stage_menu_action.triggered.connect(window._git_stage_active_file)
         self.git_unstage_menu_action = git_menu.addAction('Unstage file')
+        self.git_unstage_menu_action.setToolTip('Rimuove il file attivo dalla staging area (git reset)')
         self.git_unstage_menu_action.triggered.connect(window._git_unstage_active_file)
         self.git_commit_menu_action = git_menu.addAction('Commit...')
+        self.git_commit_menu_action.setToolTip('Crea un commit con i file attualmente in staging')
         self.git_commit_menu_action.triggered.connect(window._git_commit)
         self.git_branch_menu_action = git_menu.addAction('Cambia branch...')
+        self.git_branch_menu_action.setToolTip('Cambia il branch Git attivo per questo progetto')
         self.git_branch_menu_action.triggered.connect(window._git_switch_branch)
         git_menu.addSeparator()
         self.git_more_menu_action = git_menu.addAction('Altro...')
@@ -1912,20 +2054,24 @@ class TitleBar(QWidget):
             self.appearance_menu_btn, self.lsp_menu_btn, self.git_menu_btn,
         ]
 
+        chrome_tooltips = {'−': 'Riduci a icona', '□': 'Massimizza/ripristina la finestra', '×': "Chiudi l'IDE"}
         for text, callback in (('−', window.showMinimized), ('□', self._toggle_maximized), ('×', window.close)):
             btn = QPushButton(text)
             btn.setFixedSize(36, 28)
+            btn.setToolTip(chrome_tooltips[text])
             btn.clicked.connect(callback)
             self.buttons.append(btn)
             btn.setStyleSheet(theme.BUTTON_STYLE)
             layout.addWidget(btn)
         self.apply_style()
 
-    def _menu_button(self, text):
+    def _menu_button(self, text, tooltip=None):
         btn = QToolButton()
         btn.setText(text)
         btn.setPopupMode(QToolButton.DelayedPopup)
         btn.setMenu(QMenu(btn))
+        if tooltip:
+            btn.setToolTip(tooltip)
         btn.clicked.connect(lambda _checked=False, b=btn: self._show_button_menu(b))
         btn.setFixedHeight(28)
         return btn

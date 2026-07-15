@@ -132,7 +132,7 @@ def check_kant_markers(text):
 
 # ponytail: broad syntax support is delegated to compilers already on PATH; unknown or missing tools
 # fall back to the cheap bracket check above instead of bundling parsers for every language.
-def check_file_syntax(path, text):
+def check_file_syntax(path, text, python_exe=None):
     marker_result = check_kant_markers(text)
     if not marker_result['ok']:
         return marker_result
@@ -151,7 +151,7 @@ def check_file_syntax(path, text):
             return {'ok': False, 'line': e.position[0], 'message': str(e)}
 
     checkers = {
-        '.py': (sys.executable, ['-m', 'py_compile']),
+        '.py': (python_exe or sys.executable, ['-m', 'py_compile']),
         '.js': ('node', ['--check']),
         '.mjs': ('node', ['--check']),
         '.cjs': ('node', ['--check']),
@@ -200,11 +200,11 @@ def check_file_syntax(path, text):
     return result
 
 
-def run_command_for_path(path):
+def run_command_for_path(path, python_exe=None):
     ext = Path(path).suffix.lower()
     quoted = _quote_arg(path)
     commands = {
-        '.py': f'{_quote_arg(sys.executable)} {quoted}',
+        '.py': f'{_quote_arg(python_exe or sys.executable)} {quoted}',
         '.js': f'node {quoted}',
         '.mjs': f'node {quoted}',
         '.cjs': f'node {quoted}',

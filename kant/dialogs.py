@@ -1,8 +1,10 @@
 """Small themed modal dialogs shared by the main window."""
+import os
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -55,7 +57,9 @@ class IdeDialogsMixin:
         row = QHBoxLayout()
         row.addStretch(1)
         cancel = QPushButton('Annulla')
+        cancel.setToolTip('Chiudi senza applicare')
         ok = QPushButton('OK')
+        ok.setToolTip('Conferma e applica')
         for button in (cancel, ok):
             button.setStyleSheet(theme.BUTTON_STYLE)
             row.addWidget(button)
@@ -64,6 +68,8 @@ class IdeDialogsMixin:
         layout.addLayout(row)
 
     def _ide_choice(self, title, message, choices):
+        """choices: (label, value) pairs, or (label, value, tooltip) triples for a consequential
+        choice where the label alone doesn't make what happens obvious."""
         dialog, layout = self._dialog(title, message)
         layout.setSpacing(14)
         result = {'value': None}
@@ -74,8 +80,11 @@ class IdeDialogsMixin:
             result['value'] = value
             dialog.accept()
 
-        for label, value in choices:
+        for choice in choices:
+            label, value, *tooltip = choice
             button = QPushButton(label)
+            if tooltip:
+                button.setToolTip(tooltip[0])
             button.setStyleSheet(theme.BUTTON_STYLE)
             button.clicked.connect(lambda _checked=False, selected=value: choose(selected))
             row.addWidget(button)
@@ -129,6 +138,7 @@ class IdeDialogsMixin:
         header_row.addStretch(1)
         close_btn = QPushButton('×')
         close_btn.setFixedSize(26, 24)
+        close_btn.setToolTip('Chiudi senza salvare')
         close_btn.setStyleSheet(theme.BUTTON_STYLE)
         close_btn.clicked.connect(dialog.reject)
         header_row.addWidget(close_btn)
@@ -157,7 +167,9 @@ class IdeDialogsMixin:
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = QPushButton('Annulla')
+        cancel.setToolTip('Chiudi senza salvare le modifiche ai metadati')
         ok = QPushButton('OK')
+        ok.setToolTip('Salva tag, nome e descrizione')
         for button in (cancel, ok):
             button.setStyleSheet(theme.BUTTON_STYLE)
             buttons.addWidget(button)
@@ -203,6 +215,7 @@ class IdeDialogsMixin:
         header_row.addStretch(1)
         close_btn = QPushButton('×')
         close_btn.setFixedSize(26, 24)
+        close_btn.setToolTip('Annulla senza avviare')
         close_btn.setStyleSheet(theme.BUTTON_STYLE)
         close_btn.clicked.connect(dialog.reject)
         header_row.addWidget(close_btn)
@@ -260,7 +273,9 @@ class IdeDialogsMixin:
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = QPushButton('Annulla')
+        cancel.setToolTip('Annulla senza avviare')
         ok = QPushButton('Avvia')
+        ok.setToolTip('Avvia /kant-code-map con il provider, modello ed effort scelti')
         for button in (cancel, ok):
             button.setStyleSheet(theme.BUTTON_STYLE)
             buttons.addWidget(button)
@@ -309,6 +324,7 @@ class IdeDialogsMixin:
         header_row.addStretch(1)
         close_btn = QPushButton('×')
         close_btn.setFixedSize(26, 24)
+        close_btn.setToolTip('Annulla senza fare commit')
         close_btn.setStyleSheet(theme.BUTTON_STYLE)
         close_btn.clicked.connect(dialog.reject)
         header_row.addWidget(close_btn)
@@ -329,6 +345,7 @@ class IdeDialogsMixin:
         render_staged(staged_files)
 
         stage_all_btn = QPushButton('Stage tutto')
+        stage_all_btn.setToolTip('Aggiunge tutti i file modificati alla staging area (git add -A)')
         stage_all_btn.setStyleSheet(theme.BUTTON_STYLE)
 
         def stage_all():
@@ -355,7 +372,9 @@ class IdeDialogsMixin:
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = QPushButton('Annulla')
+        cancel.setToolTip('Annulla senza fare commit')
         commit_btn = QPushButton('Commit')
+        commit_btn.setToolTip('Crea un commit con i file in stage e questo messaggio')
         for button in (cancel, commit_btn):
             button.setStyleSheet(theme.BUTTON_STYLE)
             buttons.addWidget(button)
@@ -400,6 +419,7 @@ class IdeDialogsMixin:
         header_row.addStretch(1)
         close_btn = QPushButton('×')
         close_btn.setFixedSize(26, 24)
+        close_btn.setToolTip('Chiudi la palette comandi (Esc)')
         close_btn.setStyleSheet(theme.BUTTON_STYLE)
         close_btn.clicked.connect(dialog.reject)
         header_row.addWidget(close_btn)
@@ -469,3 +489,55 @@ class IdeDialogsMixin:
         layout.addWidget(combo)
         self._dialog_buttons(layout, dialog)
         return (combo.currentText(), True) if dialog.exec() == QDialog.Accepted else ('', False)
+
+    # [FN CATEGORY] _ide_python_interpreter_form — detected venvs (kant.pyenv.detect_venvs) listed
+    # first with the currently-configured one pre-selected, plus "Sfoglia..." for anything not
+    # auto-detected (a venv outside the project, a pyenv/conda install, etc.) — the browse dialog
+    # itself is a QFileDialog, an OS-native file picker rather than a themed one, so it isn't
+    # counted as one of the "entering credentials into a form" cases needing extra care here.
+    # [FN] _ide_python_interpreter_form — pick a detected venv or browse for any interpreter
+    # [FN OPEN] _ide_python_interpreter_form
+    def _ide_python_interpreter_form(self, candidates, current):
+        dialog, layout = self._dialog(
+            'Interprete Python', 'Scegli l\'interprete/venv per questo progetto:', width=520,
+        )
+        listbox = QListWidget()
+        listbox.setStyleSheet(
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:6px;'
+        )
+        for path in candidates:
+            item = QListWidgetItem(path)
+            listbox.addItem(item)
+            if current and os.path.abspath(path) == os.path.abspath(current):
+                listbox.setCurrentItem(item)
+        if current and all(os.path.abspath(current) != os.path.abspath(p) for p in candidates):
+            item = QListWidgetItem(current)
+            listbox.addItem(item)
+            listbox.setCurrentItem(item)
+        if listbox.currentRow() < 0 and listbox.count():
+            listbox.setCurrentRow(0)
+        layout.addWidget(listbox)
+
+        browse_row = QHBoxLayout()
+        browse_row.addStretch(1)
+        browse_btn = QPushButton('Sfoglia...')
+        browse_btn.setToolTip("Scegli un eseguibile Python non rilevato automaticamente (venv esterno, pyenv, conda...)")
+        browse_btn.setStyleSheet(theme.BUTTON_STYLE)
+
+        def browse():
+            path, _filter = QFileDialog.getOpenFileName(dialog, 'Scegli l\'eseguibile Python')
+            if path:
+                item = QListWidgetItem(path)
+                listbox.addItem(item)
+                listbox.setCurrentItem(item)
+
+        browse_btn.clicked.connect(browse)
+        browse_row.addWidget(browse_btn)
+        layout.addLayout(browse_row)
+
+        self._dialog_buttons(layout, dialog)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        chosen = listbox.currentItem()
+        return chosen.text() if chosen is not None else None
+    # [FN CLOSED] _ide_python_interpreter_form
