@@ -11,7 +11,6 @@ The MAPPA subsystem (layout helpers, ``XrefMapView``, ``XrefMapDialog``) lives i
 Application-wide coordination stays in ``mainwindow.py``. Filesystem transactions and rollback
 stay in ``workspace.py``; widgets expose signals/callbacks instead of importing ``MainWindow``.
 """
-import json
 import hashlib
 import locale
 import math
@@ -1165,6 +1164,43 @@ def _markdown_to_html(text):
 # [FN CLOSED] _markdown_to_html
 
 
+# [CST] _CODE_PERMISSION_FIELDS — tool-call argument keys, across Claude Code's built-in Edit/
+# Write/Bash/NotebookEdit tools, whose value is source code or a shell command rather than a short
+# scalar — these get the same <pre> code-block treatment as a fenced markdown block, everything
+# else in the payload (file_path, replace_all, description, ...) stays a plain "key: value" line.
+_CODE_PERMISSION_FIELDS = {'old_string', 'new_string', 'content', 'command', 'new_source', 'old_str', 'new_str'}
+_PERMISSION_FIELD_MAX_CHARS = 2000
+
+
+# [FN CATEGORY] _format_permission_input_html — the raw tool_input dict was previously shown via
+# json.dumps(..., indent=2), which escapes every real newline in an Edit's old_string/new_string as
+# a literal two-character "\n" — unreadable for anything but a one-liner. This renders known
+# code-bearing fields as an actual multi-line, monospaced block (reusing _markdown_to_html's own
+# <pre> styling) and leaves short scalar fields as plain text, so a permission card reads like a
+# diff/command instead of a JSON dump.
+# [FN] _format_permission_input_html — tool_input dict -> Qt rich text for the permission card
+# [FN OPEN] _format_permission_input_html
+def _format_permission_input_html(tool_input):
+    if not isinstance(tool_input, dict):
+        return html_escape(str(tool_input))
+    parts = []
+    for key, value in tool_input.items():
+        if isinstance(value, str) and (key in _CODE_PERMISSION_FIELDS or '\n' in value):
+            truncated = value[:_PERMISSION_FIELD_MAX_CHARS]
+            suffix = '\n…' if len(value) > _PERMISSION_FIELD_MAX_CHARS else ''
+            code_html = html_escape(truncated + suffix).replace('\n', '<br>')
+            parts.append(
+                f'<div><b>{html_escape(key)}:</b></div>'
+                f'<pre style="background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; '
+                f'border-radius:6px; padding:8px; margin:2px 0 8px 0; '
+                f'font-family:Consolas;">{code_html}</pre>'
+            )
+        else:
+            parts.append(f'<div><b>{html_escape(str(key))}:</b> {html_escape(str(value))}</div>')
+    return ''.join(parts)
+# [FN CLOSED] _format_permission_input_html
+
+
 # [CST] _TYPING_FRAMES — cycled in the placeholder assistant bubble while a prompt is running and
 # no output has streamed back yet, so the chat shows the AI is working instead of sitting blank
 _TYPING_FRAMES = ('·', '· ·', '· · ·')
@@ -1424,8 +1460,8 @@ class ClaudePane(QWidget):
         content.setContentsMargins(12, 9, 12, 10)
         title = QLabel(f'Permesso richiesto: {tool_name}')
         title.setStyleSheet(f'color:{theme.WARN}; font-weight:600; border:none;')
-        details = QLabel(json.dumps(request['input'], ensure_ascii=False, indent=2)[:3000])
-        details.setTextFormat(Qt.PlainText)
+        details = QLabel(_format_permission_input_html(request['input']))
+        details.setTextFormat(Qt.RichText)
         details.setTextInteractionFlags(Qt.TextSelectableByMouse)
         details.setWordWrap(True)
         details.setStyleSheet(f'color:{theme.TEXT}; border:none;')

@@ -636,7 +636,11 @@ class KantSmokeTest(unittest.TestCase):
             tree_window.project_root_path = str(root)
             tree_window.git_root = None
             tree_window.git_status = {}
-            assert tree_window._open_file(str(source))  # a second open tab, so switching to index 0 below is a real tab change
+            assert tree_window._open_file(str(source))
+            # pin it: otherwise it's just the unpinned preview slot, and opening legacy.py below
+            # would reuse (close) this tab instead of leaving two real, independent open tabs —
+            # this test wants a genuine second tab so switching to index 0 later is a real tab change
+            tree_window._pin_file_tab(tree_window.open_tabs[str(source)])
 
             # legacy (no #id) file: parse_kant mints a fresh random uid every reparse, and _open_file
             # always reparses from disk — so a tree item's uid (captured at the last tree rebuild) can
@@ -671,6 +675,10 @@ class KantSmokeTest(unittest.TestCase):
             stale_uid = beta_item.data(0, ROLE_UID)
             tree_window._on_tree_item_clicked(beta_item, 0)
             legacy_tab = tree_window.open_tabs[str(legacy)]
+            # pin it too: the rest of this test keeps using this exact FileTab instance across
+            # several more files being opened, which would otherwise reuse (close) its still-unpinned
+            # preview slot the moment a later file opens, re-opening legacy.py as a distinct new object
+            tree_window._pin_file_tab(legacy_tab)
             assert legacy_tab.filter_uid is None  # the module remains open in the main page
             beta_page = tree_window.tabs.currentWidget()
             resolved_uid = beta_page._element_key[1]
@@ -730,10 +738,17 @@ class KantSmokeTest(unittest.TestCase):
                 '# [CLS CLOSED] Widget',
             ]), encoding='utf-8')
             assert tree_window._open_file(str(nested_source))
+            self.app.processEvents()  # let legacy.py's reused-preview-slot deleteLater() settle first
             nested_tab = tree_window.open_tabs[str(nested_source)]
             cls_node = next(n for n in nested_tab.tree.body if hasattr(n, 'body'))
             fn_node = next(c for c in cls_node.body if getattr(c, 'tag', None) == 'FN')
             tree_window._render_view(nested_tab, cls_node.uid)
+            # _open_file above already rendered the full-file view once; this isolates to just the
+            # class right after, with no event-loop turn in between — draining it here lets the
+            # first render's deleteLater()-pending CodeEdits actually go away before geometry is
+            # queried below, instead of leaving orphaned zero/stale-geometry duplicates that can
+            # tie (same 0,0 position) with the real ones and make the uid comparison a coin flip.
+            self.app.processEvents()
             # _visible_ai_context_uid below picks the CodeEdit with the largest on-screen overlap
             # with the viewport — needs a real layout pass (show + processEvents), not just widget
             # construction, or every edit's mapTo()/width()/height() reports stale/zero geometry
@@ -900,6 +915,9 @@ class KantSmokeTest(unittest.TestCase):
             tag_a.write_text('# [MOD OPEN] taga.py\nx=1\n# [MOD CLOSED] taga.py\n', encoding='utf-8')
             tag_b.write_text('# [MOD OPEN] tagb.py\nx=1\n# [MOD CLOSED] tagb.py\n', encoding='utf-8')
             mappa_window._open_file(str(tag_a))
+            # pin it: otherwise it's just the unpinned preview slot, and opening tag_b below would
+            # reuse (close) this tab instead of leaving two real, independently draggable tabs
+            mappa_window._pin_file_tab(mappa_window.open_tabs[str(tag_a)])
             mappa_window._open_file(str(tag_b))
             app.processEvents()
             tab_a = mappa_window.open_tabs[str(tag_a)]
@@ -2232,6 +2250,105 @@ class KantSmokeTest(unittest.TestCase):
             QTest.keyClicks(edits[1], 'k')
             app.processEvents()
             assert QApplication.focusWidget() is edits[0]
+            window.close()
+
+    def test_file_and_element_preview_tabs_reuse_until_pinned_or_dirty(self):
+        # regression for the VS Code-style preview slot: a single unpinned tab is reused (closed +
+        # reopened for files, retargeted in place for elements) as long as its content is clean, but
+        # editing it must auto-pin instead of letting a later click silently swap the view away —
+        # see _open_file/_show_element_tab/_pin_file_tab/_pin_element_page in kant/mainwindow.py.
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            paths = {}
+            for name in ('f1', 'f2', 'f3', 'f4', 'f5', 'f6'):
+                path = project / f'{name}.py'
+                path.write_text('\n'.join([
+                    f'# [MOD OPEN] {name}.py',
+                    f'# [FN OPEN] {name}_alpha', f'def {name}_alpha(): pass', f'# [FN CLOSED] {name}_alpha',
+                    f'# [FN OPEN] {name}_beta', f'def {name}_beta(): pass', f'# [FN CLOSED] {name}_beta',
+                    f'# [MOD CLOSED] {name}.py',
+                ]), encoding='utf-8')
+                paths[name] = path
+
+            window = MainWindow()
+            window.project_root_path = str(project)
+            window.git_root = None
+            window.git_status = {}
+            window._build_project_tree(window.tree.invisibleRootItem(), str(project))
+
+            def find_section(name):
+                it = window.tree.invisibleRootItem()
+                stack = [it.child(i) for i in range(it.childCount())]
+                while stack:
+                    c = stack.pop()
+                    if c.data(0, ROLE_KIND) == 'section' and name in window.tree.itemWidget(c, 0).text():
+                        return c
+                    for i in range(c.childCount()):
+                        stack.append(c.child(i))
+                return None
+
+            # a clean file preview is reused (closed, then reopened) for the next file clicked
+            assert window._open_file(str(paths['f1']))
+            count_before = window.tabs.count()
+            assert window._open_file(str(paths['f2']))
+            assert window.tabs.count() == count_before
+            assert str(paths['f1']) not in window.open_tabs
+
+            # ...and again for a third file, since f2 was itself never pinned
+            count_before = window.tabs.count()
+            assert window._open_file(str(paths['f3']))
+            assert window.tabs.count() == count_before
+            assert str(paths['f2']) not in window.open_tabs
+
+            # pinning the current preview stops it from being reused
+            f3_tab = window.open_tabs[str(paths['f3'])]
+            window._pin_file_tab(f3_tab)
+            count_before = window.tabs.count()
+            assert window._open_file(str(paths['f1']))
+            assert window.tabs.count() == count_before + 1
+            assert str(paths['f3']) in window.open_tabs
+
+            # editing an element preview's content auto-pins it instead of letting the next
+            # element click silently swap it away
+            alpha_item = find_section('f1_alpha')
+            beta_item = find_section('f1_beta')
+            assert alpha_item is not None and beta_item is not None
+            window._on_tree_item_clicked(alpha_item, 0)
+            alpha_page = window.tabs.currentWidget()
+            alpha_page.findChildren(CodeEdit)[0].setPlainText('def f1_alpha(): return 1')
+            count_before = window.tabs.count()
+            window._on_tree_item_clicked(beta_item, 0)
+            assert window.tabs.count() == count_before + 1
+            assert window.tabs.indexOf(alpha_page) != -1  # still open, not silently discarded
+
+            # same rule for a dirty whole-file preview: pinned instead of closed on the next open
+            assert window._open_file(str(paths['f4']))
+            f4_tab = window.open_tabs[str(paths['f4'])]
+            f4_tab.findChildren(CodeEdit)[0].setPlainText('# edited')
+            count_before = window.tabs.count()
+            assert window._open_file(str(paths['f5']))
+            assert window.tabs.count() == count_before + 1
+            assert str(paths['f4']) in window.open_tabs
+
+            # a pinned CHILD element must survive its still-unpinned parent file being reused —
+            # pinning promotes the parent to pinned too, rather than losing the child along with it
+            f5_alpha_item = find_section('f5_alpha')
+            assert f5_alpha_item is not None
+            window._on_tree_item_clicked(f5_alpha_item, 0)
+            f5_alpha_page = window.tabs.currentWidget()
+            window._pin_element_page(f5_alpha_page)
+            assert str(paths['f5']) in window.open_tabs
+            window._open_file(str(paths['f6']))
+            assert str(paths['f5']) in window.open_tabs  # parent promoted to pinned, not closed
+            assert window.tabs.indexOf(f5_alpha_page) != -1  # pinned child untouched
+
+            # unpinning a pinned tab closes it outright — the pin-button slot becomes a close
+            # button instead of falling back to a plain "now reusable again" state
+            f3_index = window.tabs.indexOf(f3_tab)
+            close_btn = window.tabs.tabBar().tabButton(f3_index, QTabBar.RightSide)
+            assert close_btn is not None
+            close_btn.click()
+            assert str(paths['f3']) not in window.open_tabs
             window.close()
 # [TST CLOSED] KantSmokeTest
 

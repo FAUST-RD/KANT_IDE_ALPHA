@@ -561,25 +561,6 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.setContentsMargins(10, 5, 10, 5)
         layout.setSpacing(4)
         self.action_toolbar_buttons = {}
-        # Run/Debug first and visibly bigger than the rest — they used to share the title bar's
-        # own corner (under minimize/maximize/close) at a cramped 28x24/16px, easy to miss
-        for key, tooltip, callback in (
-            ('run', 'Esegui (Ctrl+R)', self._run_current_file),
-            ('debug', 'Debug (F5)', self._debug_current_file),
-        ):
-            btn = QToolButton()
-            btn.setIcon(draw_icon(key, 26))
-            btn.setIconSize(QSize(26, 26))
-            btn.setToolTip(tooltip)
-            btn.setFixedSize(40, 36)
-            btn.clicked.connect(callback)
-            layout.addWidget(btn)
-            self.action_toolbar_buttons[key] = btn
-        separator = QFrame()
-        separator.setFrameShape(QFrame.VLine)
-        separator.setFixedHeight(22)
-        self._action_toolbar_separator = separator
-        layout.addWidget(separator)
         for key, tooltip, callback in (
             ('save', 'Salva (Ctrl+S)', self._save_file),
             ('undo', 'Annulla file (Ctrl+Z)', self._undo_file),
@@ -595,6 +576,25 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             layout.addWidget(btn)
             self.action_toolbar_buttons[key] = btn
         layout.addStretch(1)
+        separator = QFrame()
+        separator.setFrameShape(QFrame.VLine)
+        separator.setFixedHeight(22)
+        self._action_toolbar_separator = separator
+        layout.addWidget(separator)
+        # Run/Debug visibly bigger than the rest, at the trailing edge of this same row (moved from
+        # the leading edge on request — same toolbar, opposite side)
+        for key, tooltip, callback in (
+            ('run', 'Esegui (Ctrl+R)', self._run_current_file),
+            ('debug', 'Debug (F5)', self._debug_current_file),
+        ):
+            btn = QToolButton()
+            btn.setIcon(draw_icon(key, 26))
+            btn.setIconSize(QSize(26, 26))
+            btn.setToolTip(tooltip)
+            btn.setFixedSize(40, 36)
+            btn.clicked.connect(callback)
+            layout.addWidget(btn)
+            self.action_toolbar_buttons[key] = btn
         self.action_toolbar = bar
         self._style_action_toolbar()
         return bar
@@ -761,6 +761,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # retargets this same tab slot instead of adding a new one, until the user pins it — see
         # _show_element_tab/_retarget_element_page/_pin_element_page
         self._preview_page = None
+        # same VS Code-style preview slot, one level up: the one unpinned whole-FILE tab. A FileTab
+        # can't be retargeted in place the way an element page can (its tree/undo stack/dirty state/
+        # disk_fingerprint are all tied to one path from construction on), so "reuse" here means
+        # close the old preview tab and open the new file in its place, rather than an in-place
+        # content swap — see _open_file/_set_preview_file_tab/_pin_file_tab
+        self._preview_file_tab = None
 
         view_panel = QWidget()
         view_panel_layout = QVBoxLayout(view_panel)
@@ -992,7 +998,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if not hasattr(page, 'findChildren'):
             return None
         viewport = page.scroll_area.viewport() if isinstance(page, FileTab) else page.viewport()
-        best = (0, None)
+        best_area, best_uid = -1, None
         for edit in page.findChildren(CodeEdit):
             node = getattr(edit, 'kant_node', None)
             if node is None:
@@ -1000,8 +1006,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             pos = edit.mapTo(viewport, QPoint(0, 0))
             width = max(0, min(pos.x() + edit.width(), viewport.width()) - max(pos.x(), 0))
             height = max(0, min(pos.y() + edit.height(), viewport.height()) - max(pos.y(), 0))
-            best = max(best, (width * height, node.uid))
-        return best[1]
+            area = width * height
+            # >= (not >): findChildren() visits an outer element (e.g. a class) before the nested
+            # ones inside it, so on an exact-area tie this keeps the LAST (most nested/specific)
+            # widget — deterministic, and the deepest element is the more meaningful focus target
+            # anyway. The old tiebreak on node.uid compared random hex strings, i.e. a coin flip.
+            if area >= best_area:
+                best_area, best_uid = area, node.uid
+        return best_uid
 
     def _set_ai_context_page(self, page):
         if page is None:
@@ -1297,7 +1309,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             if widget.find(text, flags):
                 self._find_widget_index = idx
                 widget.setFocus()
-                tab.scroll_area.ensureWidgetVisible(widget, 50, 80)
+                scroll_area = page.scroll_area if isinstance(page, FileTab) else page
+                scroll_area.ensureWidgetVisible(widget, 50, 80)
                 self.find_status.setText('')
                 return
         self.find_status.setText('Nessun risultato')
@@ -2333,7 +2346,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # isn't already open retargets the one unpinned "preview" tab (if any) in place instead of
     # piling up a new tab per click. Pinning a tab (the pin button in place of its ×) takes it out
     # of the reusable slot, so the next new element opens a fresh tab that is itself the new preview
-    # — repeating indefinitely, exactly like the file/uid dedupe case already handled below.
+    # — repeating indefinitely, exactly like the file/uid dedupe case already handled below. Editing
+    # the preview tab's content pins it too (see the dirty check below) — otherwise clicking a
+    # different element while mid-edit silently swaps the view out from under the user with no
+    # warning, same failure VS Code's own "promote preview to permanent on edit" rule prevents.
     # [FN] _show_element_tab — opens an element beside its parent in the main coding tab bar
     # [FN OPEN] _show_element_tab
     def _show_element_tab(self, tab, uid):
@@ -2344,8 +2360,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._set_ai_context_page(existing)
             return
         if self._preview_page is not None:
-            self._retarget_element_page(self._preview_page, tab, uid)
-            return
+            if self._preview_page._file_tab.dirty:
+                self._pin_element_page(self._preview_page)
+            else:
+                self._retarget_element_page(self._preview_page, tab, uid)
+                return
         page, layout = self._build_element_page()
         if uid is None:
             node = next((item for item in tab.tree.body if isinstance(item, Node)), None)
@@ -2397,9 +2416,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN CLOSED] _retarget_element_page
 
     # [FN CATEGORY] _set_preview_page — swaps the new preview page's tab-bar × (QTabBar.RightSide)
-    # for a pin button; pinning restores the native × (setTabButton(..., None) falls back to Qt's
-    # own close button since setTabsClosable(True) is still in effect) and frees this page from ever
-    # being silently retargeted again.
+    # for a pin button; pinning swaps it again for a plain close button (not Qt's native fallback —
+    # a pinned tab has nothing left to "unpin" back to, since it's no longer anyone's preview slot,
+    # so the only remaining action for that corner is closing it outright) and frees this page from
+    # ever being silently retargeted again.
     # [FN] _set_preview_page — marks a page as the one reusable/unpinned preview tab
     # [FN OPEN] _set_preview_page
     def _set_preview_page(self, page):
@@ -2421,8 +2441,46 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if self._preview_page is page:
             self._preview_page = None
         index = self.tabs.indexOf(page)
-        if index != -1:
-            self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, None)
+        if index == -1:
+            return
+        close_btn = QToolButton()
+        close_btn.setText('×')
+        close_btn.setAutoRaise(True)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setToolTip('Chiudi questa scheda')
+        close_btn.clicked.connect(lambda: self._close_element_tab(page))
+        self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, close_btn)
+
+    # [FN] _set_preview_file_tab — same pin-button swap as _set_preview_page, one level up for
+    # whole-file tabs (see _open_file for why files are closed-and-reopened rather than retargeted)
+    # [FN OPEN] _set_preview_file_tab
+    def _set_preview_file_tab(self, tab):
+        self._preview_file_tab = tab
+        pin_btn = QToolButton()
+        pin_btn.setText('📌')
+        pin_btn.setAutoRaise(True)
+        pin_btn.setCursor(Qt.PointingHandCursor)
+        pin_btn.setToolTip('Blocca questa scheda (impedisce che venga sostituita aprendo un altro file)')
+        pin_btn.clicked.connect(lambda: self._pin_file_tab(tab))
+        index = self.tabs.indexOf(tab)
+        self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, pin_btn)
+    # [FN CLOSED] _set_preview_file_tab
+
+    def _pin_file_tab(self, tab):
+        if tab is None:
+            return
+        if self._preview_file_tab is tab:
+            self._preview_file_tab = None
+        index = self.tabs.indexOf(tab)
+        if index == -1:
+            return
+        close_btn = QToolButton()
+        close_btn.setText('×')
+        close_btn.setAutoRaise(True)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setToolTip('Chiudi questa scheda')
+        close_btn.clicked.connect(lambda: self._close_tab(self.tabs.indexOf(tab)))
+        self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, close_btn)
 
     def _render_element_page(self, page):
         layout = page._view_layout
@@ -2523,6 +2581,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if tab.path in self.fs_watcher.files():
             self.fs_watcher.removePath(tab.path)
         self._close_element_tabs_for(tab)
+        if self._preview_file_tab is tab:
+            self._preview_file_tab = None
         index = self.tabs.indexOf(tab)  # child tabs may have been dragged before it and shifted it
         if index != -1:
             self.tabs.removeTab(index)
@@ -2648,6 +2708,28 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         except KantParseError as e:
             self._ide_message('Marcatori KANT non validi', f'{os.path.basename(path)}: {e}\nApro il file come testo grezzo.')
             tree = Node(tag='ROOT', name='', open_raw=None, body=[Run(lines=text.split('\n'))])
+
+        # reuse the preview file-tab slot in place (same tab index) instead of piling up a new
+        # permanent tab per file click — a dirty preview is pinned first, same rule _show_element_tab
+        # already applies to element tabs, so mid-edit content is never silently closed. A pinned
+        # CHILD element tab counts the same as dirty content: closing the file tab would force-close
+        # every element tab under it too (_close_tab -> _close_element_tabs_for has no pin exception,
+        # since an explicit "close this file" really should take its element views with it) — but here
+        # the file itself was never asked to close, the user just clicked a different file, so a
+        # pinned child must promote its still-unpinned parent to pinned rather than silently losing it.
+        insert_index = None
+        if self._preview_file_tab is not None:
+            has_pinned_child = any(
+                page._pinned and page._file_tab is self._preview_file_tab
+                for page in self._element_pages.values()
+            )
+            if self._preview_file_tab.dirty or has_pinned_child:
+                self._pin_file_tab(self._preview_file_tab)
+            else:
+                insert_index = self.tabs.indexOf(self._preview_file_tab)
+                if not self._close_tab(insert_index):
+                    insert_index = None
+
         tab = FileTab(path, tree, detect_line_ending(path))
         tab.dirtyChanged.connect(lambda t=tab: self._on_tab_dirty_changed(t))
         tab.saveFailed.connect(lambda msg, t=tab: self._on_tab_save_failed(t, msg))
@@ -2658,8 +2740,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # the tab's tree carries the authoritative in-memory #ids from here on (see _get_xref),
         # so any graph built from the disk parse alone is stale the moment a tab opens
         self._invalidate_xref()
-        idx = self.tabs.addTab(tab, os.path.basename(path))
+        if insert_index is not None and 0 <= insert_index <= self.tabs.count():
+            idx = self.tabs.insertTab(insert_index, tab, os.path.basename(path))
+        else:
+            idx = self.tabs.addTab(tab, os.path.basename(path))
         self.tabs.setTabToolTip(idx, path)
+        self._set_preview_file_tab(tab)
         # setCurrentWidget below fires currentChanged -> _on_active_tab_changed, which renders
         # this tab already (whether via addTab's implicit switch when it's the first tab, or via
         # this explicit switch otherwise) — a second _render_view() here used to double-build the
