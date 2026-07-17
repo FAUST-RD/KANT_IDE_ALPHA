@@ -163,7 +163,7 @@ class LineNumberArea(QWidget):
 # [CST] _VIM_MODE_ENABLED — module-level (not per-instance) so one Aspetto-menu toggle flips modal
 # editing for every CodeEdit at once, the same way theme.py's own day/night globals work. List-
 # wrapped so set_vim_mode can rebind the value from anywhere without a `global` statement.
-_VIM_MODE_ENABLED = [True]
+_VIM_MODE_ENABLED = [False]
 
 
 def set_vim_mode(enabled):

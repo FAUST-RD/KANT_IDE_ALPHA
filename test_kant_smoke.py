@@ -37,7 +37,7 @@ from kant.xref import build_xref, XrefElement
 from kant.widgets import (
     ClaudePane, CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard,
     _AiReviewCard, _agent_command, _markdown_to_html, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
-    _code_hover_popup_instance, make_app_icon, make_app_pixmap,
+    _code_hover_popup_instance, make_app_icon, make_app_pixmap, vim_mode_enabled,
 )
 from kant.mappa import MIN_NODE_GAP, XrefMapDialog, XrefMapView, _force_layout_positions, _element_degree, _element_size
 from kant import gitops as kant_gitops_module
@@ -610,6 +610,64 @@ class KantSmokeTest(unittest.TestCase):
         assert after == window._tree_stylesheet()
         assert 'padding:6px 4px' in after  # still tight after a real theme toggle, not just at boot
         window._toggle_theme()  # back to the original theme, tidy for anything after this test
+        window.close()
+
+    def test_vim_mode_disabled_by_default(self):
+        # regression: _VIM_MODE_ENABLED defaulted to True (left over from developing the vim
+        # keybindings feature) — a fresh install/launch had modal editing on unasked, on request
+        # it's now opt-in like every other non-default editing mode in the app
+        assert vim_mode_enabled() is False
+        window = MainWindow()
+        assert window.title_bar.vim_mode_menu_action.isChecked() is False
+        window.close()
+
+    def test_theme_toggle_restyles_python_terminal_and_add_row_buttons(self):
+        # regression: _apply_theme's terminal-restyle only ever touched self.terminal, never its
+        # sibling self.python_terminal in the same terminal_stack — invisible until
+        # is_python_majority_project auto-switches to it, the one case a real user actually sees
+        # the terminal dock in night mode with a still-day-colored REPL underneath. add_file_btn/
+        # add_grouping_btn had the same gap: styled once at construction, never refreshed on toggle.
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            (project / 'a.py').write_text('# [MOD OPEN] a.py\n# [MOD CLOSED] a.py\n', encoding='utf-8')
+            window = MainWindow()
+            window._ide_yes_no = lambda *a, **k: False
+            window._open_project_folder(str(project))
+
+            window._toggle_theme()
+            assert theme.CODE_BG in window.python_terminal.styleSheet()
+            assert theme.CODE_BG in window.terminal.styleSheet()
+            assert window._add_row_button_style() == window.add_file_btn.styleSheet()
+            assert window._add_row_button_style() == window.add_grouping_btn.styleSheet()
+
+            window._toggle_theme()  # back to the original theme, tidy for anything after this test
+            window.close()
+
+    def test_welcome_theme_toggle_button_flips_mode_and_stays_pinned_to_corner(self):
+        # regression for "metti un selettore notte e giorno in basso a destra nella home": the
+        # title bar's own Aspetto -> Notte/Giorno menu is hidden on the welcome screen
+        # (_set_project_chrome_visible(False)), so before this there was no way to switch themes
+        # before opening a project at all.
+        window = MainWindow()
+        window.resize(1000, 700)
+        window.show()
+        QApplication.processEvents()
+        QApplication.processEvents()  # let the deferred QTimer.singleShot(0, ...) reposition run
+
+        start_mode = window.night_mode
+        QTest.mouseClick(window.welcome_theme_btn, Qt.LeftButton)
+        assert window.night_mode != start_mode  # click actually toggled the theme, not just moved
+
+        QApplication.processEvents()
+        QApplication.processEvents()
+        margin = 18
+        expected_x = window.welcome_page.width() - window.welcome_theme_btn.width() - margin
+        expected_y = window.welcome_page.height() - window.welcome_theme_btn.height() - margin
+        actual_x, actual_y = window.welcome_theme_btn.pos().toTuple()
+        # small tolerance for an offscreen-platform layout-settling quirk (a few px), not a real
+        # position bug — same reasoning test_mappa_geometry_drag_reorder_and_tab_label_leak already
+        # tolerates for this class of geometry check
+        assert abs(actual_x - expected_x) <= 6 and abs(actual_y - expected_y) <= 6
         window.close()
 
     def test_project_tree_build_read_label_and_fs_reload(self):

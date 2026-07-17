@@ -240,6 +240,34 @@ def draw_icon(kind, size=16, color=None):
         door_w, door_h = size * 0.22, size * 0.32
         p.drawRect(QRectF(mid - door_w / 2, size - m * 0.5 - door_h, door_w, door_h))
 
+    elif kind == 'sun':
+        p.setBrush(QColor(color))
+        r = size * 0.2
+        p.drawEllipse(QRectF(mid - r, mid - r, r * 2, r * 2))
+        pen = QPen(QColor(color))
+        pen.setWidthF(max(1.2, size * 0.08))
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        inner, outer = r + size * 0.07, r + size * 0.07 + size * 0.13
+        for angle_deg in range(0, 360, 45):
+            angle = math.radians(angle_deg)
+            p.drawLine(
+                int(mid + inner * math.cos(angle)), int(mid + inner * math.sin(angle)),
+                int(mid + outer * math.cos(angle)), int(mid + outer * math.sin(angle)),
+            )
+
+    elif kind == 'moon':
+        # a crescent (full circle minus an offset smaller circle) rather than a filled disc — the
+        # one shape unambiguously read as "moon" instead of "sun" or "dot" at a glance
+        p.setBrush(QColor(color))
+        r = size * 0.3
+        full = QPainterPath()
+        full.addEllipse(QRectF(mid - r, mid - r, r * 2, r * 2))
+        cut_r = r * 0.82
+        cut = QPainterPath()
+        cut.addEllipse(QRectF(mid - cut_r + r * 0.5, mid - cut_r - r * 0.12, cut_r * 2, cut_r * 2))
+        p.drawPath(full.subtracted(cut))
+
     p.end()
     return QIcon(pm)
 # [FN CLOSED] draw_icon

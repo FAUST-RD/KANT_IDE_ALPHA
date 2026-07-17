@@ -410,6 +410,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._position_map_tab()
         self._position_claude_tab()
         self._position_map_dialog()
+        # deferred: welcome_page is nested inside self.stack (a QStackedWidget), whose own
+        # geometry isn't guaranteed updated yet at this exact point in a resize pass — reading its
+        # width/height synchronously here returned a stale, too-small size (reproduced live: the
+        # button landed mid-card instead of the page's actual bottom-right corner)
+        QTimer.singleShot(0, self._position_welcome_theme_btn)
 
     def _position_claude_tab(self):
         if not hasattr(self, 'claude_tab_btn'):
@@ -542,9 +547,17 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.tree.setStyleSheet(self._tree_stylesheet())
             self._rebuild_tree()
         if hasattr(self, 'tabs'):
-            self.terminal.setStyleSheet(
+            # python_terminal used to keep its construction-time (day) colors forever: this only
+            # ever restyled self.terminal, never its sibling in the same terminal_stack — invisible
+            # until is_python_majority_project auto-switches to it (_open_project_folder), the one
+            # case a real user actually sees the terminal dock in night mode with a still-light REPL
+            terminal_style = (
                 f'background:{theme.CODE_BG}; color:{theme.TEXT}; border-top:1px solid {theme.BORDER}; padding:12px;'
             )
+            self.terminal.setStyleSheet(terminal_style)
+            self.python_terminal.setStyleSheet(terminal_style)
+            self.add_file_btn.setStyleSheet(self._add_row_button_style())
+            self.add_grouping_btn.setStyleSheet(self._add_row_button_style())
             self.claude_pane.apply_style()
             self._style_io_tabs()
             self._style_view_mode_bar()
@@ -718,10 +731,40 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         center_row.addStretch(1)
         outer.addLayout(center_row)
         outer.addStretch(1)
+
+        # day/night toggle, bottom-right — the title bar's own Aspetto -> Notte/Giorno menu is
+        # hidden on this screen (_set_project_chrome_visible(False), project chrome only), so
+        # before opening a project there was previously no way to switch themes at all. Floats
+        # directly on the page (not part of `outer`'s own layout — a widget added there would
+        # repeat the exact bug the old top-right "+" button had, see this function's history
+        # above: it floated wherever the centered block landed, not the window's real corner),
+        # repositioned on resize the same way map_tab_btn/claude_tab_btn already are (see
+        # MainWindow.resizeEvent/_position_welcome_theme_btn).
+        self.welcome_theme_btn = QPushButton(page)
+        self.welcome_theme_btn.setFixedSize(40, 40)
+        self.welcome_theme_btn.setCursor(Qt.PointingHandCursor)
+        self.welcome_theme_btn.clicked.connect(self._toggle_theme)
+
         self._style_welcome_page()
+        QTimer.singleShot(0, self._position_welcome_theme_btn)  # page has no real layout yet here
         self._refresh_recent_folders()
         return page
     # [FN CLOSED] _build_welcome_page
+
+    # [FN] _position_welcome_theme_btn — keeps the welcome page's day/night toggle pinned to the
+    # page's actual bottom-right corner, called from resizeEvent the same way map_tab_btn/
+    # claude_tab_btn already are
+    # [FN OPEN] _position_welcome_theme_btn
+    def _position_welcome_theme_btn(self):
+        if not hasattr(self, 'welcome_theme_btn'):
+            return
+        margin = 18
+        self.welcome_theme_btn.move(
+            self.welcome_page.width() - self.welcome_theme_btn.width() - margin,
+            self.welcome_page.height() - self.welcome_theme_btn.height() - margin,
+        )
+        self.welcome_theme_btn.raise_()
+    # [FN CLOSED] _position_welcome_theme_btn
 
     # [FN CATEGORY] _welcome_page_stylesheet / _style_welcome_page — split out of
     # _build_welcome_page so _apply_theme can re-run the exact same styling after a day/night
@@ -753,11 +796,35 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             f'QPushButton:hover {{ background:{theme.ACCENT}; }}'
         )
         self.welcome_new_project_btn.setStyleSheet(
+            # theme.BORDER (a subtle divider color, not meant to stand alone) was nearly invisible
+            # as a dashed outline in day mode; theme.DIM reads clearly in both themes
             f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; '
-            f'border:2px dashed {theme.BORDER}; border-radius:9px; padding:12px 26px; }} '
+            f'border:2px dashed {theme.DIM}; border-radius:9px; padding:12px 26px; }} '
             f'QPushButton:hover {{ border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
         )
+        # icon shows the mode a click will SWITCH TO (a sun while it's night, a moon while it's
+        # day) — same "label is the destination, not the current state" convention theme_menu_action
+        # already uses for the Aspetto menu's own Notte/Giorno text
+        self.welcome_theme_btn.setIcon(draw_icon('sun' if self.night_mode else 'moon', 18, theme.ACCENT))
+        self.welcome_theme_btn.setIconSize(QSize(18, 18))
+        self.welcome_theme_btn.setToolTip('Passa al tema chiaro' if self.night_mode else 'Passa al tema scuro')
+        self.welcome_theme_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; '
+            f'border-radius:20px; }} '
+            f'QPushButton:hover {{ border-color:{theme.ACCENT}; background:{theme.CODE_BG}; }}'
+        )
     # [FN CLOSED] _style_welcome_page
+
+    # [FN] _add_row_button_style — shared "+ Nuovo ..." dashed-outline style for add_file_btn/
+    # add_grouping_btn, callable both at construction and from _apply_theme so a day/night toggle
+    # after a project is already open actually restyles these two buttons instead of leaving them
+    # stuck with whichever theme was active when _build_main_page first ran
+    def _add_row_button_style(self):
+        return (
+            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.DIM}; '
+            f'border-radius:8px; padding:8px; font-weight:600; }} '
+            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
+        )
 
     def _build_main_page(self):
         central = QWidget()
@@ -784,15 +851,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         tree_panel_layout.addWidget(self._build_view_mode_bar())
         tree_panel_layout.addWidget(self.tree, 1)
 
-        add_row_style = (
-            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.BORDER}; '
-            f'border-radius:8px; padding:8px; font-weight:600; }} '
-            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
-        )
         self.add_file_btn = QPushButton('+  Nuovo file')
         self.add_file_btn.setCursor(Qt.PointingHandCursor)
         self.add_file_btn.setToolTip('Crea un nuovo file nella cartella del progetto')
-        self.add_file_btn.setStyleSheet(add_row_style)
+        self.add_file_btn.setStyleSheet(self._add_row_button_style())
         self.add_file_btn.clicked.connect(self._prompt_add_file)
 
         # a grouping bundles elements from anywhere in the project (any tag, any file, any parent)
@@ -801,7 +863,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.add_grouping_btn = QPushButton('+  Nuovo gruppo')
         self.add_grouping_btn.setCursor(Qt.PointingHandCursor)
         self.add_grouping_btn.setToolTip('Raggruppa elementi da file diversi sotto un nome comune')
-        self.add_grouping_btn.setStyleSheet(add_row_style)
+        self.add_grouping_btn.setStyleSheet(self._add_row_button_style())
         self.add_grouping_btn.clicked.connect(self._prompt_add_grouping)
 
         add_row = QHBoxLayout()
@@ -3972,7 +4034,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         block.setToolTip('Crea un nuovo modulo, classe, funzione o altro elemento in questo file')
         block.setMinimumHeight(56)
         block.setStyleSheet(
-            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.BORDER}; '
+            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.DIM}; '
             f'border-radius:10px; font-size:{theme.CODE_FONT_PT + 2}pt; font-weight:600; margin-top:8px; }} '
             f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
         )

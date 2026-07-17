@@ -7,7 +7,11 @@ visible to widgets built afterward.
 
 BG = '#ffffff'; PANEL = '#fbfcff'; BORDER = '#d7dce5'; TEXT = '#111827'
 DIM = '#64748b'; ACCENT = '#f3bd27'; CODE_BG = '#f3f5f9'
-HOT = '#f2b705'; OK = '#15803d'; WARN = '#7c3aed'
+# HOT is deliberately NOT gold: mappa.py's EdgeFlowPopup picks it specifically so a "pinned" state
+# reads as a distinct color from ACCENT, not a tint of the same one (see its own apply_style
+# comment) — HOT was already close to the old blue ACCENT's warm-contrast pairing, and since ACCENT
+# is gold now too, an unchanged HOT would have collapsed both into near-identical golds
+HOT = '#ea580c'; OK = '#15803d'; WARN = '#7c3aed'
 HL_COMMENT = '#7a7f87'; HL_STRING = '#067d17'; HL_NUMBER = '#1750eb'; HL_KEYWORD = '#cf5b00'
 
 TAG_COLORS = {
@@ -57,7 +61,10 @@ def set_theme(night=False):
     if night:
         BG = '#0f172a'; PANEL = '#111827'; BORDER = '#334155'; TEXT = '#e5e7eb'
         DIM = '#94a3b8'; ACCENT = '#f3bd27'; CODE_BG = '#0b1120'
-        HOT = '#facc15'; OK = '#4ade80'; WARN = '#c084fc'
+        # a lighter, more saturated orange than the day value — needs to read clearly against the
+        # dark BG/CODE_BG while staying just as distinct from gold ACCENT (see the top-level HOT
+        # comment for why this can't just be a tint of ACCENT)
+        HOT = '#fb923c'; OK = '#4ade80'; WARN = '#c084fc'
         HL_COMMENT = '#94a3b8'; HL_STRING = '#86efac'; HL_NUMBER = '#93c5fd'; HL_KEYWORD = '#f59e0b'
         TAG_COLORS.clear(); TAG_COLORS.update(NIGHT_TAG_COLORS)
         TAG_BACKGROUNDS.clear(); TAG_BACKGROUNDS.update(NIGHT_TAG_BACKGROUNDS)
@@ -65,7 +72,7 @@ def set_theme(night=False):
     else:
         BG = '#ffffff'; PANEL = '#fbfcff'; BORDER = '#d7dce5'; TEXT = '#111827'
         DIM = '#64748b'; ACCENT = '#f3bd27'; CODE_BG = '#f3f5f9'
-        HOT = '#f2b705'; OK = '#15803d'; WARN = '#7c3aed'
+        HOT = '#ea580c'; OK = '#15803d'; WARN = '#7c3aed'
         HL_COMMENT = '#7a7f87'; HL_STRING = '#067d17'; HL_NUMBER = '#1750eb'; HL_KEYWORD = '#cf5b00'
         TAG_COLORS.clear(); TAG_COLORS.update(DAY_TAG_COLORS)
         TAG_BACKGROUNDS.clear(); TAG_BACKGROUNDS.update(DAY_TAG_BACKGROUNDS)
