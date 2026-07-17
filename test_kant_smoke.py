@@ -91,7 +91,15 @@ class _StatusButtonStub:
 # [FN OPEN] _temp_dir
 @contextlib.contextmanager
 def _temp_dir():
-    path = tempfile.mkdtemp()
+    try:
+        path = tempfile.mkdtemp()
+    except FileNotFoundError:
+        # observed on some macOS CI runners: tempfile.gettempdir()'s reported base directory can
+        # transiently not exist, failing mkdtemp() outright — fall back to a directory we just
+        # created ourselves (guaranteed to exist) instead of letting the whole test error out
+        fallback = os.path.join(os.getcwd(), '.pytest_tmp')
+        os.makedirs(fallback, exist_ok=True)
+        path = tempfile.mkdtemp(dir=fallback)
     try:
         yield path
     finally:
@@ -423,7 +431,12 @@ class KantSmokeTest(unittest.TestCase):
                 pass
 
         original_process_cls = kant_widgets_module.QProcess
+        original_which = kant_widgets_module.shutil.which
         kant_widgets_module.QProcess = _ProcessStub
+        # run_prompt refuses to start when shutil.which(executable) finds nothing — passes locally
+        # only by accident (the real claude/codex CLI happens to be on PATH on a dev machine), fails
+        # on a clean CI runner where neither is installed. Stub it like the sibling tests already do.
+        kant_widgets_module.shutil.which = lambda command: command
         pane = ClaudePane(os.getcwd())
         try:
             pane.set_agent('codex')
@@ -453,6 +466,7 @@ class KantSmokeTest(unittest.TestCase):
             assert '/kant-code-map' in kant_map_prompt
         finally:
             kant_widgets_module.QProcess = original_process_cls
+            kant_widgets_module.shutil.which = original_which
             pane.deleteLater()
 
     def test_claude_context_hint_precedes_skill_body(self):
@@ -481,7 +495,12 @@ class KantSmokeTest(unittest.TestCase):
                 pass
 
         original_process_cls = kant_widgets_module.QProcess
+        original_which = kant_widgets_module.shutil.which
         kant_widgets_module.QProcess = _ProcessStub
+        # run_prompt refuses to start when shutil.which(executable) finds nothing — passes locally
+        # only by accident (the real claude/codex CLI happens to be on PATH on a dev machine), fails
+        # on a clean CI runner where neither is installed. Stub it like the sibling tests already do.
+        kant_widgets_module.shutil.which = lambda command: command
         pane = ClaudePane(os.getcwd())
         try:
             pane.set_agent('claude')
@@ -494,6 +513,7 @@ class KantSmokeTest(unittest.TestCase):
             assert system_prompt.index('Implicit context') < system_prompt.index('KANT comment standard')
         finally:
             kant_widgets_module.QProcess = original_process_cls
+            kant_widgets_module.shutil.which = original_which
             pane.deleteLater()
 
     def test_ai_context_hint(self):
@@ -873,8 +893,11 @@ class KantSmokeTest(unittest.TestCase):
             toolbar_bottom = mappa_window.action_toolbar.mapToGlobal(mappa_window.action_toolbar.rect().bottomLeft()).y()
             status_top = mappa_window.statusBar().mapToGlobal(mappa_window.statusBar().rect().topLeft()).y()
             assert abs(dialog.geometry().top() - toolbar_bottom) <= 1
-            # Qt's offscreen Windows plugin can retain a 5px invisible top-level frame margin.
-            assert abs(dialog.geometry().bottom() - status_top) <= 6, (
+            # Qt's offscreen platform plugin can retain a few pixels of invisible top-level frame
+            # margin — up to ~5px observed on Windows, up to ~8px on Linux; not the same value
+            # across platforms, so the tolerance has to cover the largest observed rather than
+            # either one specifically.
+            assert abs(dialog.geometry().bottom() - status_top) <= 10, (
                 dialog.geometry().bottom(), status_top, dialog.geometry(), mappa_window.geometry()
             )
             assert dialog.width() == window_width_at_show
@@ -2072,8 +2095,13 @@ class KantSmokeTest(unittest.TestCase):
             (project / 'requirements.txt').write_text('pytest\n', encoding='utf-8')
             assert dependency_file(str(project)) == 'requirements.txt'
 
+            # 3 .py vs 2 .txt (requirements.txt from above + c.txt here) — a clear majority, not a
+            # 2-vs-2 tie: is_python_majority_project's max(counts, key=counts.get) breaks a tie by
+            # dict insertion order, which follows os.walk's directory-listing order — unspecified,
+            # and observed to differ between Windows and Linux, making a tied count flaky per-OS
             (project / 'a.py').write_text('x = 1\n', encoding='utf-8')
             (project / 'b.py').write_text('y = 2\n', encoding='utf-8')
+            (project / 'd.py').write_text('z = 3\n', encoding='utf-8')
             (project / 'c.txt').write_text('text\n', encoding='utf-8')
             assert is_python_majority_project(str(project)) is True
 
@@ -2352,6 +2380,33 @@ class KantSmokeTest(unittest.TestCase):
             assert close_btn is not None
             close_btn.click()
             assert str(paths['f3']) not in window.open_tabs
+            window.close()
+
+    def test_preview_and_pin_tab_buttons_are_not_left_hidden_by_setTabButton(self):
+        # regression: QTabBar.setTabButton() re-registering a corner widget can leave it internally
+        # hidden with no matching re-show — a real, already-reproduced-and-fixed Qt quirk in this
+        # exact codebase for the LeftSide _tab_label (_update_tab_title has the same .show() workaround
+        # with the same explanation). The RightSide pin/close buttons this mirrors were missing it:
+        # QTest.mouseClick(button, ...) calling the widget directly still "worked" in tests (it
+        # bypasses hit-testing), which is exactly why this went unnoticed until a real mouse click
+        # on the actual running app didn't register anything.
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            source = project / 'f1.py'
+            source.write_text('# [MOD OPEN] f1.py\nx=1\n# [MOD CLOSED] f1.py\n', encoding='utf-8')
+            window = MainWindow()
+            window.project_root_path = str(project)
+            assert window._open_file(str(source))
+            tab = window.open_tabs[str(source)]
+            index = window.tabs.indexOf(tab)
+            bar = window.tabs.tabBar()
+
+            pin_btn = bar.tabButton(index, QTabBar.RightSide)
+            assert pin_btn is not None and not pin_btn.isHidden()
+
+            window._pin_file_tab(tab)
+            close_btn = bar.tabButton(index, QTabBar.RightSide)
+            assert close_btn is not None and not close_btn.isHidden()
             window.close()
 
     def test_add_element_block_appends_language_correct_node(self):

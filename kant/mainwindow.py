@@ -2452,6 +2452,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         pin_btn.clicked.connect(lambda: self._pin_element_page(page))
         index = self.tabs.indexOf(page)
         self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, pin_btn)
+        # setTabButton alone can leave the widget internally hidden with no matching re-show — the
+        # exact same reproduced Qt bug _update_tab_title's _tab_label already works around (see its
+        # comment); missing here meant a real mouse click could land on nothing; QTest.mouseClick
+        # calling the widget directly bypassed hit-testing and never caught it.
+        pin_btn.show()
     # [FN CLOSED] _set_preview_page
 
     def _pin_element_page(self, page):
@@ -2469,7 +2474,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.setToolTip('Chiudi questa scheda')
         close_btn.clicked.connect(lambda: self._close_element_tab(page))
-        self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, close_btn)
+        bar = self.tabs.tabBar()
+        old_btn = bar.tabButton(index, QTabBar.RightSide)
+        bar.setTabButton(index, QTabBar.RightSide, close_btn)
+        close_btn.show()  # same setTabButton re-show workaround as _set_preview_page above
+        if old_btn is not None:
+            # setTabButton only detaches the old widget, it doesn't delete it — same leak
+            # _update_tab_title's _tab_label cleanup already guards against, just for this corner
+            old_btn.deleteLater()
 
     # [FN] _set_preview_file_tab — same pin-button swap as _set_preview_page, one level up for
     # whole-file tabs (see _open_file for why files are closed-and-reopened rather than retargeted)
@@ -2484,6 +2496,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         pin_btn.clicked.connect(lambda: self._pin_file_tab(tab))
         index = self.tabs.indexOf(tab)
         self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, pin_btn)
+        pin_btn.show()  # same setTabButton re-show workaround as _set_preview_page
     # [FN CLOSED] _set_preview_file_tab
 
     def _pin_file_tab(self, tab):
@@ -2500,7 +2513,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.setToolTip('Chiudi questa scheda')
         close_btn.clicked.connect(lambda: self._close_tab(self.tabs.indexOf(tab)))
-        self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, close_btn)
+        bar = self.tabs.tabBar()
+        old_btn = bar.tabButton(index, QTabBar.RightSide)
+        bar.setTabButton(index, QTabBar.RightSide, close_btn)
+        close_btn.show()  # same setTabButton re-show workaround as _set_preview_page
+        if old_btn is not None:
+            old_btn.deleteLater()  # same leak _update_tab_title's _tab_label cleanup already guards against
 
     def _render_element_page(self, page):
         layout = page._view_layout
