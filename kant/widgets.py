@@ -35,7 +35,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog, QFileDialog, QFrame,
-    QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
+    QGraphicsDropShadowEffect, QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
     QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMenuBar, QPlainTextEdit, QPushButton, QScrollArea,
     QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton,
@@ -46,7 +46,7 @@ from kant import theme
 from kant.aipermissions import PermissionBridge, write_permission_config
 from kant.icons import draw_icon
 from kant.model import Node, parse_kant, serialize_kant, KantParseError
-from kant.fileio import file_fingerprint, write_file_atomic
+from kant.fileio import file_fingerprint, write_file_atomic, safe_mkstemp
 from kant.syntax import KEYWORDS, TOKEN_RE
 from kant.xref import XrefElement
 
@@ -1044,7 +1044,7 @@ def _load_skill_prompt(skill_name):
 
 
 def _write_system_prompt_file(text, directory=None):
-    fd, path = tempfile.mkstemp(prefix='.kant-ai-system-', suffix='.md', dir=directory)
+    fd, path = safe_mkstemp(prefix='.kant-ai-system-', suffix='.md', dir=directory)
     with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
         f.write(text)
     return path
@@ -1264,19 +1264,39 @@ class _CodeHoverPopup(QFrame):
         # already gets "for free" from the OS, which a custom top-level widget doesn't by default
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setWindowFlag(Qt.WindowDoesNotAcceptFocus, True)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 9, 12, 10)
+        # a soft drop shadow lifts this off the code underneath instead of reading as pasted flat
+        # onto it — the one cue a native OS tooltip gets for free that this custom widget doesn't
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(32)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 100))
+        self.setGraphicsEffect(shadow)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        # a thin accent-colored top strip gives this an "info card" identity of its own at a
+        # glance, instead of being visually indistinguishable from every other bordered panel
+        self.accent_bar = QFrame()
+        self.accent_bar.setFixedHeight(3)
+        outer.addWidget(self.accent_bar)
+        body = QVBoxLayout()
+        body.setContentsMargins(14, 10, 14, 12)
         self.label = QLabel()
         self.label.setTextFormat(Qt.RichText)
         self.label.setWordWrap(True)
         self.label.setMaximumWidth(480)
-        layout.addWidget(self.label)
+        body.addWidget(self.label)
+        outer.addLayout(body)
         self.apply_style()
         self.hide()
 
     def apply_style(self):
         self.setStyleSheet(
-            f'#codeHoverPopup {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:10px; }}'
+            f'#codeHoverPopup {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; '
+            f'border-top:none; border-radius:11px; }}'
+        )
+        self.accent_bar.setStyleSheet(
+            f'background:{theme.ACCENT}; border-top-left-radius:11px; border-top-right-radius:11px;'
         )
         self.label.setStyleSheet(f'color:{theme.TEXT}; border:none; font-size:{theme.CODE_FONT_PT}pt;')
 
@@ -2525,15 +2545,40 @@ class ProjectTree(QTreeWidget):
 _APP_ICON_PATH = Path(__file__).resolve().parent / 'assets' / 'app_icon.png'
 
 
-def make_app_pixmap(size=64):
-    pixmap = QPixmap(str(_APP_ICON_PATH))
-    if pixmap.isNull():
+# [FN CATEGORY] make_app_pixmap / make_app_icon — the source file is a plain opaque square (no
+# alpha channel at all — confirmed: PIL reports mode 'RGB'), including its own four corner
+# triangles outside the gold rounded border drawn INTO the image. Displayed as-is, those corners
+# render as a hard black square poking out from behind the rounded badge against anything but a
+# pure-black background — this clips every requested size to a transparent rounded rect matching
+# that border's own radius, so the corners are actually transparent and the badge blends into
+# whatever theme background sits behind it instead of fighting it.
+# [FN] make_app_pixmap / make_app_icon — the app icon, masked to a transparent rounded rect
+# [FN OPEN] make_app_pixmap
+def _load_masked_app_pixmap(size):
+    source = QPixmap(str(_APP_ICON_PATH))
+    if source.isNull():
         return QPixmap(size, size)
-    return pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    scaled = source.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    masked = QPixmap(scaled.size())
+    masked.fill(Qt.transparent)
+    painter = QPainter(masked)
+    painter.setRenderHint(QPainter.Antialiasing)
+    path = QPainterPath()
+    radius = scaled.width() * 0.16  # matches the source image's own drawn border radius
+    path.addRoundedRect(QRectF(0, 0, scaled.width(), scaled.height()), radius, radius)
+    painter.setClipPath(path)
+    painter.drawPixmap(0, 0, scaled)
+    painter.end()
+    return masked
+
+
+def make_app_pixmap(size=64):
+    return _load_masked_app_pixmap(size)
 
 
 def make_app_icon():
-    return QIcon(str(_APP_ICON_PATH))
+    return QIcon(_load_masked_app_pixmap(256))
+# [FN CLOSED] make_app_pixmap
 
 
 # [FN CATEGORY] RecentFolderCard — a clickable row for the welcome screen's recent-projects list:

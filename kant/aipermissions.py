@@ -4,10 +4,11 @@ import os
 import secrets
 import socket
 import sys
-import tempfile
 import threading
 
 from PySide6.QtCore import QObject, Signal
+
+from kant.fileio import safe_mkstemp
 
 
 class PermissionBridge(QObject):
@@ -102,7 +103,7 @@ def write_permission_config(bridge):
             },
         },
     }
-    fd, path = tempfile.mkstemp(prefix='.kant-ai-permissions-', suffix='.json')
+    fd, path = safe_mkstemp(prefix='.kant-ai-permissions-', suffix='.json')
     with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as stream:
         json.dump(config, stream)
     return path

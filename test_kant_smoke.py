@@ -25,6 +25,7 @@ import kant_editor
 from kant import theme
 from kant import mainwindow as kant_mainwindow_module
 from kant import widgets as kant_widgets_module
+from kant import fileio as kant_fileio_module
 from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT, ROLE_LINE, ROLE_KEY
 from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
@@ -47,6 +48,7 @@ from kant.workspace import (
 )
 from kant.permission_mcp import handle_message
 from kant.groupings import load_groupings
+from kant.fileio import safe_mkstemp, safe_mkdtemp
 
 
 class LabelStub:
@@ -1254,6 +1256,45 @@ class KantSmokeTest(unittest.TestCase):
         assert not make_app_icon().isNull()
         pixmap = make_app_pixmap(76)
         assert not pixmap.isNull() and pixmap.width() == 76 and pixmap.height() == 76
+
+    def test_safe_mkstemp_and_mkdtemp_fall_back_on_missing_base_tempdir(self):
+        # regression for a real macOS CI failure: kant/aipermissions.py's write_permission_config
+        # calls tempfile.mkstemp() directly on every single `claude` chat message, with no
+        # fallback — the same transient "base temp dir doesn't exist" issue entries 52/55 already
+        # worked around in test_kant_smoke.py's own _temp_dir()/_mkdtemp_safe and
+        # kant/workspace.py's create_snapshot, just never fixed at its actual application-code
+        # source. safe_mkstemp/safe_mkdtemp (kant/fileio.py) are the shared fix; this simulates the
+        # transient failure directly rather than needing a real broken tempdir to reproduce it.
+        original_mkstemp = kant_fileio_module.tempfile.mkstemp
+        original_mkdtemp = kant_fileio_module.tempfile.mkdtemp
+
+        # only the FIRST call (no explicit dir=, i.e. the default system tempdir) simulates the
+        # transient failure — safe_mkstemp/mkdtemp's own retry passes a real, just-created
+        # fallback dir, which must actually succeed for real, not be swallowed by this stub too
+        def broken_mkstemp(**kwargs):
+            if kwargs.get('dir') is None:
+                raise FileNotFoundError('simulated: base temp dir transiently missing')
+            return original_mkstemp(**kwargs)
+
+        def broken_mkdtemp(**kwargs):
+            if kwargs.get('dir') is None:
+                raise FileNotFoundError('simulated: base temp dir transiently missing')
+            return original_mkdtemp(**kwargs)
+
+        kant_fileio_module.tempfile.mkstemp = broken_mkstemp
+        kant_fileio_module.tempfile.mkdtemp = broken_mkdtemp
+        try:
+            fd, path = safe_mkstemp(prefix='.kant-test-', suffix='.tmp')
+            os.close(fd)
+            assert os.path.isfile(path)
+            os.remove(path)
+
+            tmp_dir = safe_mkdtemp(prefix='kant-test-')
+            assert os.path.isdir(tmp_dir)
+            os.rmdir(tmp_dir)
+        finally:
+            kant_fileio_module.tempfile.mkstemp = original_mkstemp
+            kant_fileio_module.tempfile.mkdtemp = original_mkdtemp
 
     def test_xref_edges_ignore_comments_and_strings(self):
         xref_tree = parse_kant('\n'.join([
@@ -2689,6 +2730,38 @@ class KantSmokeTest(unittest.TestCase):
             window._on_tree_item_clicked(member_items[0], 0)
             assert window.active_tab is not None
             assert os.path.basename(window.active_tab.path) == target_rel
+            window.close()
+
+    def test_ai_context_page_cleared_on_tab_close_does_not_crash(self):
+        # regression for a real user-reported crash: _ai_context_page kept pointing at a FileTab
+        # after it closed; a background callback landing afterward (e.g. a git-status refresh
+        # finishing) walked _update_action_buttons -> refresh_focus_label -> _build_ai_focus_summary
+        # -> _visible_ai_context_uid, which touched the closed tab's (also closed) scroll_area and
+        # crashed with "RuntimeError: libshiboken: Internal C++ object (QScrollArea) already deleted".
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            source = project / 'a.py'
+            source.write_text('\n'.join([
+                '# [MOD OPEN] a.py',
+                '# [FN OPEN] alpha', 'def alpha(): pass', '# [FN CLOSED] alpha',
+                '# [MOD CLOSED] a.py',
+            ]), encoding='utf-8')
+            window = MainWindow()
+            window.project_root_path = str(project)
+            window.git_root = None
+            window.git_status = {}
+            window._build_project_tree(window.tree.invisibleRootItem(), str(project))
+            assert window._open_file(str(source))
+            tab = window.open_tabs[str(source)]
+            window._set_ai_context_page(tab)
+            assert window._ai_context_page is tab
+
+            window._close_tab(window.tabs.indexOf(tab))
+            assert window._ai_context_page is None  # cleared, not left dangling on the closed tab
+
+            # would previously raise RuntimeError here: _ai_context_page pointed at the now-closed
+            # (and C++-deleted) tab, whose scroll_area is deleted right along with it
+            window._update_action_buttons()
             window.close()
 
     def test_context_menu_add_kant_element_to_group(self):

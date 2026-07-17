@@ -19,6 +19,8 @@ from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
 from pathlib import Path
 
+import shiboken6
+
 from PySide6.QtCore import QFileSystemWatcher, QPoint, QPointF, Qt, QSettings, QSize, Signal, QTimer
 from PySide6.QtGui import (
     QColor, QFont, QKeySequence, QMouseEvent, QShortcut, QTextCursor, QTextDocument,
@@ -649,8 +651,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.setAlignment(Qt.AlignHCenter)
 
         badge = QLabel()
-        badge.setPixmap(make_app_pixmap(76))
-        badge.setFixedSize(76, 76)
+        badge.setPixmap(make_app_pixmap(96))
+        badge.setFixedSize(96, 96)
         badge.setAlignment(Qt.AlignCenter)
         badge_row = QHBoxLayout()
         badge_row.setAlignment(Qt.AlignCenter)
@@ -1085,9 +1087,19 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         return tab, getattr(page, '_ai_focus_uid', None) or self._visible_ai_context_uid(page) or default_uid
 
     def _visible_ai_context_uid(self, page):
-        if not hasattr(page, 'findChildren'):
+        if not hasattr(page, 'findChildren') or not shiboken6.isValid(page):
             return None
-        viewport = page.scroll_area.viewport() if isinstance(page, FileTab) else page.viewport()
+        # a stray reference to an already-closed tab (_ai_context_page/active_page) reaching here
+        # crashes on the FIRST Qt call it makes, not necessarily on `page` itself — e.g. its
+        # scroll_area child can be gone even when `page` still passes isValid(); reproduced via a
+        # real crash log (RuntimeError: ... QScrollArea already deleted) from a background git
+        # status refresh landing after the tab it was still pointing at had closed
+        if isinstance(page, FileTab):
+            if not shiboken6.isValid(page.scroll_area):
+                return None
+            viewport = page.scroll_area.viewport()
+        else:
+            viewport = page.viewport()
         best_area, best_uid = -1, None
         for edit in page.findChildren(CodeEdit):
             node = getattr(edit, 'kant_node', None)
@@ -2802,6 +2814,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._close_element_tabs_for(tab)
         if self._preview_file_tab is tab:
             self._preview_file_tab = None
+        if self._ai_context_page is tab:
+            # unlike _close_element_tab's equivalent guard, this can't reassign to self.active_tab
+            # here: removeTab() hasn't run yet, so if `tab` is still the current tab, active_tab
+            # would just resolve back to `tab` itself — the same stale reference. None is safe:
+            # _ai_context_target() already falls back to self.active_page (evaluated fresh, after
+            # removal, whenever it's next read) when _ai_context_page is None. Without this, a
+            # background callback (e.g. a git-status refresh landing after this tab closed) that
+            # reads the AI focus hint would still hold this now-deleted FileTab and crash trying to
+            # touch its (also deleted) scroll_area — reproduced via a real crash log.
+            self._ai_context_page = None
         index = self.tabs.indexOf(tab)  # child tabs may have been dragged before it and shifted it
         if index != -1:
             self.tabs.removeTab(index)

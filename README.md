@@ -6,7 +6,7 @@ KANT IDE is a desktop environment for understanding, directing, and reviewing so
 
 **KANT** stands for **Knowledge Annotation & Navigation Taxonomy**: a convention for annotating what code means and turning those annotations into paths through a software system.
 
-It adds explicit structure to ordinary source files and turns that structure into a navigable outline, focused editing views, dependency lenses, and an interactive project map.
+It adds explicit structure to ordinary source files and turns that structure into a navigable outline, focused editing views, dependency lenses, cross-file groupings, and an interactive project map.
 
 ```text
 source code  ->  explicit structure  ->  cognitive interface  ->  informed action
@@ -39,8 +39,9 @@ KANT gives both people and tools stable coordinates inside a codebase.
 | See what a system contains | A project outline organized by modules, classes, functions, constants, types, and tests |
 | Focus on one responsibility | Section-level editing without losing the surrounding hierarchy |
 | Understand relationships | Deterministic Incoming and Outgoing references |
+| Bundle related elements across files | Named **Groupings**, collecting elements from anywhere in the project regardless of folder or parent/child structure |
 | Move between detail and overview | An interactive **MAPPA** with filtering, clustering, and drill-down |
-| Direct powerful tools | Explicit boundaries and descriptions that provide usable context |
+| Direct powerful tools | The active file/element (or the whole project, via **GLOBAL**) is passed to the AI automatically, so it reads the right code instead of being asked to paste it |
 | Verify delegated work | AI snapshots, file/hunk review, atomic application, and rollback |
 
 The goal is not to make AI produce as much code as possible. It is to channel what these tools produce into forms that remain navigable, reviewable, and comprehensible to people.
@@ -104,6 +105,10 @@ Open one tagged section as an editable unit. The IDE updates the original source
 
 The **INCOMING** and **OUTGOING** panels show references crossing the selected section's boundary. Their graph is produced by deterministic source analysis rather than AI output.
 
+### Groupings
+
+A **Grouping** is a named, arbitrary bundle of tagged elements — any file, any tag, parent and child mixed freely — independent of the project's own folder or nesting structure. Build one from the **+ Nuovo gruppo** button or by right-clicking any element and adding it to a new or existing group; browse them from the **Gruppi** view next to **File**. Groupings persist per-project as plain JSON (`.kant/groupings.json`), separate from the KANT tags themselves.
+
 ### Map
 
 **MAPPA** turns the project graph into a spatial overview. Filter it, rearrange it, change flow direction, isolate elements, or drill into the direct children of a component.
@@ -119,8 +124,8 @@ KANT IDE also includes Git actions, a terminal, lightweight syntax checks, optio
 KANT IDE requires Python 3 and PySide6.
 
 ```powershell
-git clone https://github.com/FAUST-RD/KANT_IDE.git
-cd KANT_IDE
+git clone https://github.com/FAUST-RD/KANT_IDE_ALFA.git
+cd KANT_IDE_ALFA
 .\install.ps1
 python kant_editor.py
 ```
@@ -129,7 +134,7 @@ If PowerShell blocks the script (`running scripts is disabled on this system`), 
 `powershell -ExecutionPolicy Bypass -File install.ps1` instead.
 
 On Linux or macOS, `./install.sh` installs the Python dependency and prints the launch command.
-No native installer/executable yet — see [`PACKAGING.md`](PACKAGING.md) to build a standalone one with PyInstaller.
+No native installer/executable yet, and no packaging guide either — `pyinstaller kant_editor.py` works for a quick standalone build if you need one.
 
 Language-server features activate only when a compatible server is already available on `PATH`. The editor works without one.
 

@@ -61,6 +61,37 @@ def detect_line_ending(path):
 # [FN CLOSED] detect_line_ending
 
 
+# [FN CATEGORY] safe_mkstemp / safe_mkdtemp — observed on some macOS CI runners:
+# tempfile.gettempdir()'s reported base directory can transiently not exist, failing
+# mkstemp()/mkdtemp() outright (reproduced via a real macOS CI failure in
+# write_permission_config, kant/aipermissions.py — every `claude` chat message creates one of
+# these). Falls back to a directory under the user's own KANT IDE state folder (already used for
+# crash logs), guaranteed to exist, instead of losing the temp file/dir entirely.
+# [FN] safe_mkstemp / safe_mkdtemp — tempfile.mkstemp()/mkdtemp() with a guaranteed fallback base
+# [FN OPEN] safe_mkstemp
+def _fallback_tempdir():
+    fallback = os.path.join(os.path.expanduser('~'), '.kant_ide', 'tmp')
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+def safe_mkstemp(**kwargs):
+    try:
+        return tempfile.mkstemp(**kwargs)
+    except FileNotFoundError:
+        kwargs.pop('dir', None)
+        return tempfile.mkstemp(dir=_fallback_tempdir(), **kwargs)
+
+
+def safe_mkdtemp(**kwargs):
+    try:
+        return tempfile.mkdtemp(**kwargs)
+    except FileNotFoundError:
+        kwargs.pop('dir', None)
+        return tempfile.mkdtemp(dir=_fallback_tempdir(), **kwargs)
+# [FN CLOSED] safe_mkstemp
+
+
 def is_safe_child_name(name):
     return bool(name) and name == os.path.basename(name) and not os.path.isabs(name) and name not in ('.', '..')
 
