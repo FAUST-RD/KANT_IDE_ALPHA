@@ -67,7 +67,15 @@ def strip_unsafe_symlinks(root, ignored=()):
 
 
 def create_snapshot(root, ignored=()):
-    parent = tempfile.mkdtemp(prefix='kant-ai-snapshot-')
+    try:
+        parent = tempfile.mkdtemp(prefix='kant-ai-snapshot-')
+    except FileNotFoundError:
+        # same transient-missing-base-tempdir issue test_kant_smoke.py's _mkdtemp_safe works around
+        # (observed on some macOS CI runners) — fall back to a directory inside the project itself,
+        # guaranteed to exist, rather than losing the AI-review snapshot entirely
+        fallback = os.path.join(root, '.kant', 'tmp')
+        os.makedirs(fallback, exist_ok=True)
+        parent = tempfile.mkdtemp(prefix='kant-ai-snapshot-', dir=fallback)
     snapshot = os.path.join(parent, 'project')
     try:
         os.makedirs(snapshot)

@@ -11,7 +11,7 @@ from kant.fileio import is_safe_child_name
 from kant.syntax import check_syntax, check_kant_markers
 from kant.xref import build_xref
 from kant.gitutil import parse_git_status
-from kant.widgets import make_star_icon, CodeEdit
+from kant.widgets import make_app_icon, CodeEdit
 from kant.mainwindow import MainWindow
 
 
@@ -237,7 +237,7 @@ def main():
     _self_check()
     app = QApplication(sys.argv)
     app.setStyle(_HoverDelayStyle(app.style()))
-    app.setWindowIcon(make_star_icon())
+    app.setWindowIcon(make_app_icon())
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

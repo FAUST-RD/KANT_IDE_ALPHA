@@ -35,11 +35,12 @@ from kant.theme import set_theme
 from kant.icons import draw_icon
 from kant.model import (
     Run, Node, parse_kant, serialize_kant, read_top_level_label, read_top_level_label_result,
-    KantParseError, ELEMENT_LANGUAGES, build_new_element_node,
+    KantParseError, ELEMENT_LANGUAGES, build_new_element_node, build_new_file_content,
 )
-from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending
+from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending, is_safe_child_name
 from kant.syntax import check_file_syntax, run_command_for_path, _quote_arg
 from kant.xref import build_xref, _walk_nodes
+from kant.groupings import load_groupings, save_groupings, new_grouping, add_member
 from kant.lsp import LSP_SERVERS_BY_EXT, file_uri, path_from_file_uri, lsp_server_for_path, LspClient
 from kant.dialogs import IdeDialogsMixin
 from kant.gitops import GitOpsMixin
@@ -54,7 +55,7 @@ from kant.pyenv import (
 from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback_snapshot
 from kant.widgets import (
     CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
-    ProjectTree, make_star_icon, RecentFolderCard, TitleBar, FileTab,
+    ProjectTree, make_app_icon, make_app_pixmap, RecentFolderCard, TitleBar, FileTab,
     MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html, _markdown_to_html,
     set_vim_mode, vim_mode_enabled, show_code_hover_popup, hide_code_hover_popup,
 )
@@ -163,7 +164,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('KANT Editor')
-        self.setWindowIcon(make_star_icon())
+        self.setWindowIcon(make_app_icon())
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.resize(1500, 950)
         self.setFont(QFont('Consolas', 10))
@@ -238,7 +239,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.stack = QStackedWidget()
         shell_layout.addWidget(self.stack, 1)
         self.setCentralWidget(self.shell)
-        self.stack.addWidget(self._build_welcome_page())  # index 0: shown until a folder is opened
+        self.welcome_page = self._build_welcome_page()
+        self.stack.addWidget(self.welcome_page)  # index 0: shown until a folder is opened
         self.stack.addWidget(self._build_main_page())      # index 1: project tree + view
         self.stack.setCurrentIndex(0)
         self._set_project_chrome_visible(False)
@@ -282,7 +284,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _confirm_close — asks before quitting; its own method (not inlined) so tests can stub
     # just this decision without touching _ide_yes_no's other, unrelated uses elsewhere in the app
     def _confirm_close(self):
-        return self._ide_yes_no('Chiudi KANT IDE', 'Sei sicuro di voler chiudere KANT IDE?')
+        return self._ide_yes_no('Chiudi KANT IDE', 'Sei sicuro di voler chiudere KANT IDE?', accent=True)
 
     def closeEvent(self, event):
         if not self._confirm_close():
@@ -516,7 +518,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _tree_stylesheet — boxed KANT tree QSS with a theme-aware selection color
     # [FN OPEN] _tree_stylesheet
     def _tree_stylesheet(self):
-        selected_bg = '#1e293b' if self.night_mode else '#eef4ff'
+        selected_bg = '#1e293b' if self.night_mode else '#fdf3d8'
         return (
             f'QTreeWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
             f'border-radius:8px; padding:6px 4px; }} '
@@ -533,6 +535,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.welcome_title.setStyleSheet(f'color:{theme.ACCENT}; letter-spacing:3px;')
             self.welcome_desc.setStyleSheet(f'color:{theme.DIM};')
             self.recent_title.setStyleSheet(f'color:{theme.DIM};')
+            self._style_welcome_page()
         if hasattr(self, 'tree'):
             self.tree.setStyleSheet(self._tree_stylesheet())
             self._rebuild_tree()
@@ -616,32 +619,39 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             btn.setStyleSheet(style)
         self._action_toolbar_separator.setStyleSheet(f'color:{theme.BORDER};')
 
-    # [FN CATEGORY] _build_welcome_page — a centered card (not widgets floating directly on the
-    # raw background) holds title/description/CTA, with the recent-projects list as its own
-    # distinct section below — the same "one bordered panel, not loose elements" treatment already
-    # used for the project tree and coding panels, just applied to the very first screen too.
-    # [FN] _build_welcome_page — the startup screen: open-folder CTA plus recent projects
+    # [FN CATEGORY] _build_welcome_page — previously had a "+" new-project button floating in its
+    # own top_row inside the SAME centered outer layout as the card: since outer.setAlignment
+    # (Qt.AlignCenter) centers that whole two-item stack as a block, the button ended up stranded
+    # wherever the block happened to land vertically, nowhere near the window's actual top-right
+    # corner (a real layout bug, not just a taste issue). Fixed by dropping the floating button
+    # entirely and folding "new project" into the card itself as a peer action next to "Apri
+    # cartella…" — same dashed-outline "create new" language already used by the KANT panel's own
+    # "+ Nuovo file"/"+ Nuovo gruppo" buttons, so both places that mean "create" now look alike.
+    # A soft radial gradient behind the card (page itself, not the card) keeps a large window from
+    # reading as a mostly-empty void the way a single small centered card on a flat background did.
+    # [FN] _build_welcome_page — the pre-project screen: open/create a project, recent folders
     # [FN OPEN] _build_welcome_page
     def _build_welcome_page(self):
         page = QWidget()
+        page.setObjectName('welcomePage')
+        page.setAttribute(Qt.WA_StyledBackground, True)
+        self.welcome_page = page
         outer = QVBoxLayout(page)
-        outer.setAlignment(Qt.AlignCenter)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addStretch(1)
 
         card = QWidget()
         card.setObjectName('welcomeCard')
-        card.setFixedWidth(620)
+        card.setFixedWidth(640)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(48, 44, 48, 40)
         layout.setSpacing(22)
         layout.setAlignment(Qt.AlignHCenter)
 
-        badge = QLabel('KANT')
+        badge = QLabel()
+        badge.setPixmap(make_app_pixmap(76))
+        badge.setFixedSize(76, 76)
         badge.setAlignment(Qt.AlignCenter)
-        badge.setFixedSize(64, 64)
-        badge.setFont(QFont('Consolas', 15, QFont.Black))
-        badge.setStyleSheet(
-            f'background:{theme.ACCENT}; color:#ffffff; border-radius:32px; letter-spacing:1px;'
-        )
         badge_row = QHBoxLayout()
         badge_row.setAlignment(Qt.AlignCenter)
         badge_row.addWidget(badge)
@@ -666,19 +676,25 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         desc.setFont(QFont('Consolas', 12))
         layout.addWidget(desc)
 
-        open_btn = QPushButton('Apri cartella…')
-        open_btn.setFont(QFont('Consolas', 15, QFont.DemiBold))
-        open_btn.setCursor(Qt.PointingHandCursor)
-        open_btn.setToolTip('Scegli una cartella di progetto da aprire nell\'IDE')
-        open_btn.setStyleSheet(
-            f'QPushButton {{ background:{theme.ACCENT}; color:#ffffff; border:none; '
-            f'border-radius:9px; padding:14px 30px; }} '
-            f'QPushButton:hover {{ background:{theme.ACCENT}; }}'
-        )
-        open_btn.clicked.connect(self._open_folder)
+        self.welcome_open_btn = QPushButton('Apri cartella…')
+        self.welcome_open_btn.setFont(QFont('Consolas', 15, QFont.DemiBold))
+        self.welcome_open_btn.setCursor(Qt.PointingHandCursor)
+        self.welcome_open_btn.setToolTip('Scegli una cartella di progetto da aprire nell\'IDE')
+        self.welcome_open_btn.clicked.connect(self._open_folder)
+
+        # peer action, not a stray corner icon: same "create new" dashed-outline language as the
+        # KANT panel's "+ Nuovo file"/"+ Nuovo gruppo" (_build_main_page's add_row_style)
+        self.welcome_new_project_btn = QPushButton('＋  Nuovo progetto')
+        self.welcome_new_project_btn.setFont(QFont('Consolas', 15, QFont.DemiBold))
+        self.welcome_new_project_btn.setCursor(Qt.PointingHandCursor)
+        self.welcome_new_project_btn.setToolTip('Crea un progetto nuovo da zero')
+        self.welcome_new_project_btn.clicked.connect(self._prompt_new_project)
+
         btn_row = QHBoxLayout()
         btn_row.setAlignment(Qt.AlignCenter)
-        btn_row.addWidget(open_btn)
+        btn_row.setSpacing(12)
+        btn_row.addWidget(self.welcome_open_btn)
+        btn_row.addWidget(self.welcome_new_project_btn)
         layout.addLayout(btn_row)
 
         self.recent_title = QLabel('CARTELLE RECENTI')
@@ -693,13 +709,53 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.recent_layout.setSpacing(6)
         layout.addWidget(self.recent_wrap)
 
-        card.setStyleSheet(
-            f'#welcomeCard {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:16px; }}'
-        )
-        outer.addWidget(card)
+        self.welcome_card = card
+        center_row = QHBoxLayout()
+        center_row.addStretch(1)
+        center_row.addWidget(card)
+        center_row.addStretch(1)
+        outer.addLayout(center_row)
+        outer.addStretch(1)
+        self._style_welcome_page()
         self._refresh_recent_folders()
         return page
     # [FN CLOSED] _build_welcome_page
+
+    # [FN CATEGORY] _welcome_page_stylesheet / _style_welcome_page — split out of
+    # _build_welcome_page so _apply_theme can re-run the exact same styling after a day/night
+    # toggle instead of leaving the page's gradient background, card, and action buttons stuck
+    # with whichever theme was active when the page was first built (the pre-existing gap this
+    # closes: welcome_title/welcome_desc/recent_title were already refreshed on toggle, the rest
+    # of the page never was).
+    # [FN] _welcome_page_stylesheet — the welcome page's radial-gradient background CSS
+    # [FN OPEN] _welcome_page_stylesheet
+    def _welcome_page_stylesheet(self):
+        return (
+            f'#welcomePage {{ background: qradialgradient(cx:0.5, cy:0.4, radius:0.9, fx:0.5, fy:0.4, '
+            f'stop:0 {theme.PANEL}, stop:1 {theme.BG}); }}'
+        )
+    # [FN CLOSED] _welcome_page_stylesheet
+
+    # [FN] _style_welcome_page — re-applies theme colors to the welcome page and its card/buttons
+    # [FN OPEN] _style_welcome_page
+    def _style_welcome_page(self):
+        if not hasattr(self, 'welcome_page'):
+            return
+        self.welcome_page.setStyleSheet(self._welcome_page_stylesheet())
+        self.welcome_card.setStyleSheet(
+            f'#welcomeCard {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:16px; }}'
+        )
+        self.welcome_open_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.ACCENT}; color:#ffffff; border:none; '
+            f'border-radius:9px; padding:14px 28px; }} '
+            f'QPushButton:hover {{ background:{theme.ACCENT}; }}'
+        )
+        self.welcome_new_project_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; '
+            f'border:2px dashed {theme.BORDER}; border-radius:9px; padding:12px 26px; }} '
+            f'QPushButton:hover {{ border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
+        )
+    # [FN CLOSED] _style_welcome_page
 
     def _build_main_page(self):
         central = QWidget()
@@ -726,16 +782,31 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         tree_panel_layout.addWidget(self._build_view_mode_bar())
         tree_panel_layout.addWidget(self.tree, 1)
 
-        self.add_file_btn = QPushButton('+  Nuovo file')
-        self.add_file_btn.setCursor(Qt.PointingHandCursor)
-        self.add_file_btn.setToolTip('Crea un nuovo file nella cartella del progetto')
-        self.add_file_btn.setStyleSheet(
+        add_row_style = (
             f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.BORDER}; '
             f'border-radius:8px; padding:8px; font-weight:600; }} '
             f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
         )
+        self.add_file_btn = QPushButton('+  Nuovo file')
+        self.add_file_btn.setCursor(Qt.PointingHandCursor)
+        self.add_file_btn.setToolTip('Crea un nuovo file nella cartella del progetto')
+        self.add_file_btn.setStyleSheet(add_row_style)
         self.add_file_btn.clicked.connect(self._prompt_add_file)
-        tree_panel_layout.addWidget(self.add_file_btn)
+
+        # a grouping bundles elements from anywhere in the project (any tag, any file, any parent)
+        # under one name, independent of the source tree's own MOD/CLS/FN nesting — see
+        # kant/groupings.py for the persistence format and _prompt_add_grouping for the picker
+        self.add_grouping_btn = QPushButton('+  Nuovo gruppo')
+        self.add_grouping_btn.setCursor(Qt.PointingHandCursor)
+        self.add_grouping_btn.setToolTip('Raggruppa elementi da file diversi sotto un nome comune')
+        self.add_grouping_btn.setStyleSheet(add_row_style)
+        self.add_grouping_btn.clicked.connect(self._prompt_add_grouping)
+
+        add_row = QHBoxLayout()
+        add_row.setSpacing(6)
+        add_row.addWidget(self.add_file_btn)
+        add_row.addWidget(self.add_grouping_btn)
+        tree_panel_layout.addLayout(add_row)
 
         # MAPPA opens from a small tab stuck to the bottom-center edge of the window (like a
         # drawer handle) rather than a button buried in the tree panel; clicking it again while
@@ -802,7 +873,6 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.claude_pane.before_run = self._prepare_ai_snapshot
         self.claude_pane.context_hint = self._build_ai_context_hint
         self.claude_pane.focus_hint = self._build_ai_focus_summary
-        self.global_mode_btn.toggled.connect(lambda _checked: self.claude_pane.refresh_focus_label())
         self.claude_pane.refresh_focus_label()
         self.claude_pane.finished.connect(self._finish_ai_review)
         self.claude_pane.finished.connect(self._refresh_and_validate_after_ai)
@@ -964,25 +1034,25 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.file_view_btn.setToolTip('Mostra il file attivo come testo grezzo, senza la struttura a sezioni KANT')
         self.file_view_btn.clicked.connect(lambda: self._set_view_mode('file'))
 
+        self.groups_view_btn = QPushButton('Gruppi')
+        self.groups_view_btn.setCheckable(True)
+        self.groups_view_btn.setToolTip(
+            'Mostra i raggruppamenti del progetto (collezioni di elementi da file diversi) '
+            'invece dell\'albero dei file'
+        )
+        self.groups_view_btn.clicked.connect(lambda: self._set_view_mode('groups'))
+
         self.view_mode_group = QButtonGroup(self)
         self.view_mode_group.setExclusive(True)
         self.view_mode_group.addButton(self.code_view_btn)
         self.view_mode_group.addButton(self.file_view_btn)
+        self.view_mode_group.addButton(self.groups_view_btn)
 
         add_label('Vista')
         layout.addWidget(self.code_view_btn)
         layout.addWidget(self.file_view_btn)
+        layout.addWidget(self.groups_view_btn)
         layout.addStretch(1)
-        self.global_mode_btn = QPushButton(' GLOBAL')
-        self.global_mode_btn.setIcon(draw_icon('globe', 14))
-        self.global_mode_btn.setIconSize(QSize(14, 14))
-        self.global_mode_btn.setCheckable(True)
-        self.global_mode_btn.setToolTip(
-            "Se disattivo (default), i messaggi in chat AI includono un riferimento nascosto al file/elemento "
-            "attualmente aperto nella plancia di coding, cosi le modifiche restano mirate a quel punto. "
-            "Attiva GLOBAL per far considerare all'AI l'intero progetto invece di un file/elemento specifico."
-        )
-        layout.addWidget(self.global_mode_btn)
         self._style_view_mode_bar()
         self._update_action_buttons()
         return bar
@@ -994,7 +1064,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
         )
         for btn in self.view_mode_bar.findChildren(QPushButton):
-            highlight = btn in (self.code_view_btn, self.file_view_btn, self.global_mode_btn)
+            highlight = btn in (self.code_view_btn, self.file_view_btn, self.groups_view_btn)
             btn.setStyleSheet(checked_style if highlight else theme.BUTTON_STYLE)
 
     # [FN CATEGORY] _build_ai_context_hint — a hidden (never shown in the chat bubble) instruction
@@ -1060,7 +1130,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                     # ponytail: twelve names keep the hint bounded; the remainder count preserves scope.
                     symbol = ','.join(names[:12]) + (f',+{len(names) - 12}' if len(names) > 12 else '')
             target = f'{path}::{symbol}' if symbol else path
-        if self.global_mode_btn.isChecked():
+        if self.claude_pane.global_mode_btn.isChecked():
             root_label = (root or '.').replace(os.sep, '/')
             view = f' | {"Vista" if italian else "View"}: {target}' if target else ''
             return (
@@ -1094,7 +1164,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _build_ai_focus_summary — ClaudePane.focus_hint callback
     # [FN OPEN] _build_ai_focus_summary
     def _build_ai_focus_summary(self):
-        if self.global_mode_btn.isChecked():
+        if self.claude_pane.global_mode_btn.isChecked():
             return 'intero progetto'
         tab, uid = self._ai_context_target()
         if tab is None:
@@ -1523,6 +1593,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._refresh_git_status()
         if self.view_mode == 'code':
             self._build_project_tree(self.tree.invisibleRootItem(), self.project_root_path)
+        elif self.view_mode == 'groups':
+            self._build_groupings_tree(self.tree.invisibleRootItem(), self.project_root_path)
         else:
             self._build_plain_project_tree(self.tree.invisibleRootItem(), self.project_root_path)
         self.tree._rewrap_labels()
@@ -1983,6 +2055,45 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         self._open_project_folder(path)
 
+    # [FN CATEGORY] _prompt_new_project — the welcome page's "+" button: creates a brand-new
+    # project folder (not just opening an existing one, like _open_folder above) with an optional
+    # KANT-tagged starter module (reusing the exact same build_new_file_content machinery the "+"
+    # file/element dialogs already use — a new project's first file is language-correct and tagged
+    # from line one, not an empty shell) and an optional `git init`, then opens it the same way any
+    # existing folder would be.
+    # [FN] _prompt_new_project — the welcome page's "+" button click handler
+    # [FN OPEN] _prompt_new_project
+    def _prompt_new_project(self):
+        recent = self._recent_folders()
+        default_parent = os.path.dirname(recent[0]) if recent else os.path.expanduser('~')
+        result = self._ide_new_project_form(default_parent, default_language='Python')
+        if result is None:
+            return
+        name = result['name']
+        if not is_safe_child_name(name):
+            self._ide_message('Nuovo progetto', 'Usa solo un nome, senza percorsi.')
+            return
+        target_dir = os.path.join(result['parent_dir'], name)
+        if os.path.exists(target_dir):
+            self._ide_message('Nuovo progetto', 'Esiste già una cartella con questo nome.')
+            return
+        try:
+            os.makedirs(target_dir)
+            if result['create_starter']:
+                ext = ELEMENT_LANGUAGES.get(result['language'], ELEMENT_LANGUAGES['Generico'])['ext']
+                content = build_new_file_content('module', result['language'], name)
+                write_file_atomic(os.path.join(target_dir, f'main{ext}'), content)
+        except OSError as error:
+            self._ide_message('Nuovo progetto', f'Impossibile creare il progetto: {error}')
+            return
+        if result['init_git']:
+            git_result = self._run_git(['init'], target_dir)
+            if git_result is None or git_result.returncode:
+                error = (git_result.stderr or git_result.stdout) if git_result else 'Git non disponibile'
+                self._ide_message('Nuovo progetto', f'Progetto creato, ma "git init" non è riuscito:\n{error.strip()[:400]}')
+        self._open_project_folder(target_dir)
+    # [FN CLOSED] _prompt_new_project
+
     # [FN CATEGORY] _set_project_chrome_visible — title-bar menus and the action toolbar belong to
     # the project workspace, so the welcome screen keeps only the app identity and window controls.
     # [FN] _set_project_chrome_visible — shows/hides the project title-bar menus and toolbar
@@ -2130,7 +2241,23 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if not self.project_root_path:
             return ''
         self._check_kant_map(self.project_root_path)
-        result, errors, visual_errors = validate_kant_project(self.project_root_path, self.kant_map_path)
+        result, errors, visual_errors, map_out_of_sync = validate_kant_project(self.project_root_path, self.kant_map_path)
+
+        if map_out_of_sync:
+            # "map non coerente" (KANT_<project>.md missing entries the source now has) is the one
+            # validation failure that's mechanically, deterministically fixable — it's exactly what
+            # _sync_kant_map already regenerates from source on every save. No reason to surface it
+            # as an error the user has to notice and manually resync themselves; self-heal instead
+            # and only report whatever real (marker-syntax) errors remain, if any.
+            errors = [e for e in errors if not e.startswith('KANT map non coerente')]
+            self._sync_kant_map()
+            note = 'mappa KANT non coerente con il codice — rigenerata automaticamente'
+            if errors:
+                sample = '\n'.join(f'- {error}' for error in errors[:8])
+                extra = f'\n- ... altri {len(errors) - 8} errori' if len(errors) > 8 else ''
+                result = f'# KANT verifica: ERRORI\n{sample}{extra}\n# ({note})'
+            else:
+                result = f'# KANT verifica: OK ({note})'
 
         self._show_validation_results(errors, visual_errors)
         return result
@@ -2201,6 +2328,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             file_item = QTreeWidgetItem(parent_item)
             file_item.setData(0, ROLE_KIND, 'file')
             file_item.setData(0, ROLE_PATH, file_path)
+            file_item.setData(0, ROLE_UID, top_node.uid)  # the file's own top-level KANT element
             self.tree.setItemWidget(
                 file_item, 0, self._tree_label(
                     file_item, tag, desc, bold=True, git_status=self._git_status_for_path(file_path),
@@ -2278,6 +2406,57 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 self.tree.setItemWidget(file_item, 0, self._plain_file_label(file_item, entry.name, self._git_status_for_path(entry.path)))
     # [FN CLOSED] _build_plain_project_tree
 
+    # [FN CATEGORY] _build_groupings_tree — "Gruppi" mode: one top-level row per saved Grouping
+    # (kant/groupings.py), its members as children — resolved against the same cross-reference
+    # graph (_get_xref) the Incoming/Outgoing panel already builds, so a member row gets real tag/
+    # file/description for free instead of needing its own lookup. A member whose element no longer
+    # resolves (renamed/deleted since the grouping was saved) still shows, dimmed, rather than
+    # silently vanishing — the grouping itself is the source of truth, not today's xref snapshot.
+    # [FN] _build_groupings_tree — renders every project grouping and its members ("Gruppi" mode)
+    # [FN OPEN] _build_groupings_tree
+    def _build_groupings_tree(self, parent_item, dir_path):
+        groupings = load_groupings(dir_path)
+        if not groupings:
+            empty_item = QTreeWidgetItem(parent_item, ['Nessun gruppo — usa "+ Nuovo gruppo" per crearne uno'])
+            empty_item.setData(0, ROLE_KIND, 'grouping_empty')
+            empty_item.setForeground(0, QColor(theme.DIM))
+            return
+        xref = self._get_xref()
+        for grouping in groupings:
+            group_item = QTreeWidgetItem(parent_item)
+            group_item.setData(0, ROLE_KIND, 'grouping')
+            group_item.setData(0, ROLE_KEY, grouping.id)
+            label = _TreeItemLabel(
+                self.tree, group_item,
+                f'<span style="font-weight:700">{html_escape(grouping.name)}</span> '
+                f'<span style="color:{theme.DIM}">({len(grouping.members)})</span>'
+            )
+            label.setFont(QFont('Consolas', theme.TREE_FONT_PT, QFont.DemiBold))
+            label.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:0px 4px;')
+            label.setCursor(Qt.PointingHandCursor)
+            self.tree.setItemWidget(group_item, 0, label)
+            for key in grouping.members:
+                member_item = QTreeWidgetItem(group_item)
+                member_item.setData(0, ROLE_KIND, 'grouping_member')
+                member_item.setData(0, ROLE_KEY, key)
+                element = xref.get(key)
+                if element is not None:
+                    self.tree.setItemWidget(
+                        member_item, 0,
+                        self._tree_label(member_item, element.tag, element.desc or element.name, detail=element.file),
+                    )
+                else:
+                    rel = key.split('::', 1)[0]
+                    dim_label = _TreeItemLabel(
+                        self.tree, member_item,
+                        f'<span style="color:{theme.DIM}">{html_escape(rel)} (non risolvibile)</span>',
+                    )
+                    dim_label.setFont(QFont('Consolas', theme.TREE_FONT_PT))
+                    dim_label.setStyleSheet('background:transparent; padding:0px 4px;')
+                    self.tree.setItemWidget(member_item, 0, dim_label)
+            group_item.setExpanded(True)
+    # [FN CLOSED] _build_groupings_tree
+
     def _invalid_file_label(self, item, name, error):
         lbl = _TreeItemLabel(
             self.tree, item,
@@ -2313,6 +2492,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                     self._update_io_tabs(None)
         elif kind in ('plainfile', 'invalidfile'):
             self._open_file(item.data(0, ROLE_PATH))
+        elif kind == 'grouping_member':
+            self._navigate_to_element(item.data(0, ROLE_KEY))
         elif kind == 'section':
             path = item.data(0, ROLE_PATH)
             order = item.data(0, ROLE_ORDER)
@@ -3810,6 +3991,71 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 first_edit.setFocus()
     # [FN CLOSED] _prompt_add_element
 
+    # [FN CATEGORY] _prompt_add_grouping — the "+ Nuovo gruppo" button's handler: offers every
+    # element currently in the project's cross-reference graph (_get_xref, the same data the
+    # Incoming/Outgoing panel already builds) as candidates, then saves the chosen subset under the
+    # given name via kant/groupings.py. Switches to "Gruppi" view so the new group is immediately
+    # visible instead of landing in whichever view mode was active before.
+    # [FN] _prompt_add_grouping — the "+ Nuovo gruppo" button's click handler
+    # [FN OPEN] _prompt_add_grouping
+    def _prompt_add_grouping(self, preselected_key=None):
+        if not self.project_root_path:
+            self._ide_message('Nuovo gruppo', 'Apri prima una cartella di progetto.')
+            return
+        xref = self._get_xref()
+        elements = sorted(
+            ((key, el.tag, el.desc or el.name, el.file) for key, el in xref.items()),
+            key=lambda row: (row[3], row[2]),
+        )
+        preselected = (preselected_key,) if preselected_key else ()
+        result = self._ide_new_grouping_form(elements, preselected=preselected)
+        if result is None:
+            return
+        name, member_keys = result
+        if not name:
+            return
+        grouping = new_grouping(name)
+        grouping.members = member_keys
+        groupings = load_groupings(self.project_root_path)
+        groupings.append(grouping)
+        save_groupings(self.project_root_path, groupings)
+        if self.view_mode != 'groups':
+            self.groups_view_btn.setChecked(True)
+            self._set_view_mode('groups')
+        else:
+            self._rebuild_tree()
+    # [FN CLOSED] _prompt_add_grouping
+
+    # [FN CATEGORY] _xref_key_for_tree_item — resolves a 'file' or 'section' KANT-tree row to its
+    # xref key (kant/xref.py's '<rel_path>::<uid>' format), the same lookup _on_tree_item_clicked
+    # already does for navigation — reused here so the right-click "add to group" action targets a
+    # real xref element instead of inventing a second identifier scheme just for groupings.
+    # [FN] _xref_key_for_tree_item — the xref key for a 'file'/'section' tree item, or None
+    # [FN OPEN] _xref_key_for_tree_item
+    def _xref_key_for_tree_item(self, item):
+        if not self.project_root_path or item is None:
+            return None
+        kind = item.data(0, ROLE_KIND)
+        path = item.data(0, ROLE_PATH)
+        if kind not in ('file', 'section') or not path:
+            return None
+        rel = os.path.relpath(path, self.project_root_path).replace(os.sep, '/')
+        xref = self._get_xref()
+        uid = item.data(0, ROLE_UID)
+        key = f'{rel}::{uid}'
+        if key in xref:
+            return key
+        # a legacy (no #id) file mints a fresh uid on every reparse, the same mismatch
+        # _on_tree_item_clicked already works around via document order — a 'file' row is always
+        # document order 0 (the file's own top-level element, per _build_project_tree's comment),
+        # a 'section' row carries its own ROLE_ORDER (children start at 1)
+        order = 0 if kind == 'file' else item.data(0, ROLE_ORDER)
+        if order is None:
+            return None
+        candidates = sorted((el for el in xref.values() if el.file == rel), key=lambda el: el.order)
+        return candidates[order].key if order < len(candidates) else None
+    # [FN CLOSED] _xref_key_for_tree_item
+
     def _find_node_by_uid(self, node, uid):
         for item in node.body:
             if not isinstance(item, Node):
@@ -4022,6 +4268,37 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 run_test_action = menu.addAction(f'Esegui questo test ({test_name})')
                 run_test_action.setToolTip(f'Esegue solo pytest {test_name}, non l\'intera suite')
 
+        # KANT-element-only actions: 'file'/'section' rows are actual tagged elements (resolvable
+        # in the xref graph), unlike a 'plainfile'/'dir' row — groupings in particular only ever
+        # bundle real KANT elements, on request, so the "add to group" action simply never appears
+        # on anything else. If no group exists yet, the single action creates the first one with
+        # this element already checked in _ide_new_grouping_form, instead of a dead end that would
+        # send the user hunting for "+ Nuovo gruppo" themselves right after they asked to add one.
+        element_key = self._xref_key_for_tree_item(item) if item is not None else None
+        copy_name_action = copy_path_action = add_to_new_group_action = None
+        # (action, grouping) pairs captured while the submenu is still fresh — checked against
+        # `chosen` below instead of re-querying the submenu itself after exec() returns, since a
+        # transient addMenu() popup is not guaranteed to still be alive once its parent menu closes
+        group_actions = []
+        if element_key is not None:
+            menu.addSeparator()
+            copy_name_action = menu.addAction('Copia nome elemento')
+            copy_path_action = menu.addAction('Copia percorso file')
+            menu.addSeparator()
+            groupings = load_groupings(self.project_root_path)
+            if groupings:
+                add_to_group_menu = menu.addMenu('Aggiungi a un gruppo')
+                add_to_group_menu.setToolTipsVisible(True)
+                for grouping in groupings:
+                    already_in = element_key in grouping.members
+                    group_action = add_to_group_menu.addAction(grouping.name)
+                    group_action.setEnabled(not already_in)
+                    group_action.setToolTip('Già in questo gruppo' if already_in else f'Aggiungi a "{grouping.name}"')
+                    group_actions.append((group_action, grouping))
+            else:
+                add_to_new_group_action = menu.addAction('Aggiungi a un nuovo gruppo…')
+                add_to_new_group_action.setToolTip('Crea il primo gruppo del progetto con questo elemento già incluso')
+
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if chosen is new_file_action:
             self._create_new_file(target_dir)
@@ -4041,6 +4318,19 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._git_stage_file(item.data(0, ROLE_PATH), staged=False)
         elif run_test_action is not None and chosen is run_test_action:
             self._run_single_test(item.data(0, ROLE_PATH), test_name)
+        elif copy_name_action is not None and chosen is copy_name_action:
+            el = self._get_xref().get(element_key)
+            QApplication.clipboard().setText(el.desc or el.name if el is not None else '')
+        elif copy_path_action is not None and chosen is copy_path_action:
+            QApplication.clipboard().setText(item.data(0, ROLE_PATH))
+        elif add_to_new_group_action is not None and chosen is add_to_new_group_action:
+            self._prompt_add_grouping(preselected_key=element_key)
+        else:
+            matched_group = next((g for a, g in group_actions if a is chosen), None)
+            if matched_group is not None:
+                add_member(self.project_root_path, matched_group.id, element_key)
+                if self.view_mode == 'groups':
+                    self._rebuild_tree()
     # [FN CLOSED] _show_tree_context_menu
 
     # [FN CATEGORY] _section_test_name — resolves a tree item's KANT node the same way

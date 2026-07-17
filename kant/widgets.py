@@ -13,7 +13,6 @@ stay in ``workspace.py``; widgets expose signals/callbacks instead of importing 
 """
 import hashlib
 import locale
-import math
 import os
 import re
 import shutil
@@ -27,9 +26,10 @@ from pathlib import Path
 import shiboken6
 
 from PySide6.QtCore import (
-    QElapsedTimer, QFileSystemWatcher, QObject, QPoint, QPointF, QProcess, QRect, QRectF, Qt, QSettings,
+    QByteArray, QElapsedTimer, QFileSystemWatcher, QObject, QPoint, QPointF, QProcess, QRect, QRectF, Qt, QSettings,
     QSize, QStringListModel, Signal, QTimer,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
     QPainterPathStroker, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
@@ -1104,8 +1104,38 @@ def _normalize_ai_text(raw_bytes):
 # so **x** doesn't leave stray single *s for the italic pattern to also match.
 _MD_CODE_FENCE_RE = re.compile(r'```(?:\w+)?\n?(.*?)```', re.DOTALL)
 _MD_INLINE_CODE_RE = re.compile(r'`([^`\n]+)`')
-_MD_BOLD_RE = re.compile(r'\*\*(.+?)\*\*|__(.+?)__')
-_MD_ITALIC_RE = re.compile(r'(?<!\*)\*([^*\n]+)\*(?!\*)|(?<!_)_([^_\n]+)_(?!_)')
+_MD_BOLD_RE = re.compile(r'\*\*(.+?)\*\*|(?<![\w_])__(.+?)__(?![\w_])')
+# underscore emphasis is intraword-blind per CommonMark: bare `*` counts anywhere, but `_` only
+# starts/ends emphasis when NOT flanked by a word character on that side — otherwise identifiers
+# like add_item or cart_id (extremely common in any code-related chat message) get mangled into
+# "add<i>item(cart</i>id...)" by treating their own underscores as italic delimiters
+_MD_ITALIC_RE = re.compile(r'(?<!\*)\*([^*\n]+)\*(?!\*)|(?<![\w_])_([^_\n]+)_(?![\w_])')
+# a table row/separator always has outer pipes here — the far more common shape an AI response or
+# a pasted table actually uses; the no-outer-pipe GFM variant ("A | B" / "---|---") is not handled
+_MD_TABLE_ROW_RE = re.compile(r'^\s*\|(.+)\|\s*$')
+_MD_TABLE_SEP_CELL_RE = re.compile(r'^:?-+:?$')
+
+
+def _split_table_row(line):
+    return [cell.strip() for cell in line.strip()[1:-1].split('|')]
+
+
+def _is_table_separator_row(line):
+    match = _MD_TABLE_ROW_RE.match(line)
+    if not match:
+        return False
+    cells = _split_table_row(line)
+    return bool(cells) and all(_MD_TABLE_SEP_CELL_RE.match(cell) for cell in cells)
+
+
+def _render_table_html(header_cells, body_rows):
+    cell_style = f'border:1px solid {theme.BORDER}; padding:3px 9px; text-align:left;'
+    head = ''.join(f'<th style="{cell_style}">{cell}</th>' for cell in header_cells)
+    body = ''.join(
+        '<tr>' + ''.join(f'<td style="{cell_style}">{cell}</td>' for cell in row) + '</tr>'
+        for row in body_rows
+    )
+    return f'<table style="border-collapse:collapse; margin:4px 0;"><tr>{head}</tr>{body}</table>'
 
 
 # [FN CATEGORY] _markdown_to_html — not a full CommonMark implementation, just the subset an AI
@@ -1154,12 +1184,28 @@ def _markdown_to_html(text):
             escaped,
         )
         rendered_lines = []
-        for line in escaped.split('\n'):
+        lines = escaped.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # a table is a header row immediately followed by a |---|---| separator row (bold/
+            # italic/inline-code already ran above, so cells get that formatting for free); consumes
+            # every following row that still looks like a table row, not just the header+separator
+            if i + 1 < len(lines) and _MD_TABLE_ROW_RE.match(line) and _is_table_separator_row(lines[i + 1]):
+                header_cells = _split_table_row(line)
+                i += 2
+                body_rows = []
+                while i < len(lines) and _MD_TABLE_ROW_RE.match(lines[i]):
+                    body_rows.append(_split_table_row(lines[i]))
+                    i += 1
+                rendered_lines.append(_render_table_html(header_cells, body_rows))
+                continue
             stripped = line.lstrip()
             if stripped[:2] in ('- ', '* '):
                 rendered_lines.append('&nbsp;&nbsp;• ' + stripped[2:])
             else:
                 rendered_lines.append(line)
+            i += 1
         html_parts.append('<br>'.join(rendered_lines))
     return ''.join(html_parts)
 # [FN CLOSED] _markdown_to_html
@@ -1393,6 +1439,22 @@ class ClaudePane(QWidget):
         self.auto_permissions.setToolTip('Approva i permessi Claude; le modifiche restano soggette alla revisione finale.')
         self.auto_permissions.toggled.connect(self._automatic_permissions_changed)
         header.addWidget(self.auto_permissions)
+        # scopes every message: default is the coding panel's current file/element (context_hint,
+        # a hidden system-prompt addition — see mainwindow.py's _build_ai_context_hint); GLOBAL
+        # suppresses that scoping so the AI considers the whole project instead. Lives here (not the
+        # KANT-tree view-mode bar it used to share a row with) since it's an AI-chat-scoped control,
+        # not a project-tree display mode.
+        self.global_mode_btn = QPushButton(' GLOBAL')
+        self.global_mode_btn.setIcon(draw_icon('globe', 14))
+        self.global_mode_btn.setIconSize(QSize(14, 14))
+        self.global_mode_btn.setCheckable(True)
+        self.global_mode_btn.setToolTip(
+            "Se disattivo (default), i messaggi in chat AI includono un riferimento nascosto al file/elemento "
+            "attualmente aperto nella plancia di coding, cosi le modifiche restano mirate a quel punto. "
+            "Attiva GLOBAL per far considerare all'AI l'intero progetto invece di un file/elemento specifico."
+        )
+        self.global_mode_btn.toggled.connect(lambda _checked: self.refresh_focus_label())
+        header.addWidget(self.global_mode_btn)
         layout.addWidget(self.controls_bar)
 
         # a quiet line under the selector row surfacing what focus_hint() currently resolves to —
@@ -1466,6 +1528,9 @@ class ClaudePane(QWidget):
         self.model_select.setStyleSheet(combo_style)
         self.effort_select.setStyleSheet(combo_style)
         self.auto_permissions.setStyleSheet(f'color:{theme.WARN}; font-weight:600; spacing:6px;')
+        self.global_mode_btn.setStyleSheet(
+            theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
+        )
         self.focus_label.setStyleSheet(f'color:{theme.DIM};')
         self.send_btn.setStyleSheet(
             f'QPushButton {{ background:{theme.WARN}; color:#ffffff; border:none; border-radius:9px; '
@@ -2454,24 +2519,33 @@ class ProjectTree(QTreeWidget):
 # [FN CLOSED] ProjectTree
 
 
-def make_star_icon():
-    pixmap = QPixmap(64, 64)
+# [CST] _APP_ICON_SVG — the app/window icon: a stylized side-profile bust (gold face, cream wig,
+# black rounded-square badge with a gold border), recreated as hand-authored vector paths from a
+# reference image the user supplied — drawn, not loaded from a raster file, so it renders crisp at
+# any requested size the same way make_star_icon (the icon it replaces) always did.
+_APP_ICON_SVG = b"""<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <rect x="6" y="6" width="188" height="188" rx="34" fill="#000000" stroke="#f3bd27" stroke-width="9"/>
+  <polygon points="66,55 82,32 112,22 145,30 168,52 174,78 163,92 163,106 148,116 138,104 140,120 126,113 118,138 108,116 98,146 90,160 108,166 100,146" fill="#f4ede0"/>
+  <polygon points="148,98 163,106 150,116 140,105" fill="#000000"/>
+  <polygon points="112,48 104,66 62,104 50,118 68,126 64,138 80,146 90,162 108,166 116,146 128,146 124,116 116,92 110,66" fill="#f3bd27"/>
+  <polygon points="76,97 92,94 87,101" fill="#000000"/>
+  <path d="M92,162 L78,182 M108,166 L128,184" stroke="#f4ede0" stroke-width="7" fill="none" stroke-linecap="round"/>
+</svg>"""
+
+
+def make_app_pixmap(size=64):
+    renderer = QSvgRenderer(QByteArray(_APP_ICON_SVG))
+    pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
-
-    center = QPointF(32, 32)
-    points = []
-    for i in range(10):
-        radius = 25 if i % 2 == 0 else 11
-        angle = math.radians(-90 + i * 36)
-        points.append(QPointF(center.x() + radius * math.cos(angle), center.y() + radius * math.sin(angle)))
-
-    painter.setBrush(QBrush(QColor(theme.HOT)))
-    painter.setPen(QPen(QColor(theme.TEXT), 3))
-    painter.drawPolygon(QPolygonF(points))
+    renderer.render(painter)
     painter.end()
-    return QIcon(pixmap)
+    return pixmap
+
+
+def make_app_icon():
+    return QIcon(make_app_pixmap(256))
 
 
 # [FN CATEGORY] RecentFolderCard — a clickable row for the welcome screen's recent-projects list:

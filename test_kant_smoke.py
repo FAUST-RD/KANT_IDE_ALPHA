@@ -25,7 +25,7 @@ import kant_editor
 from kant import theme
 from kant import mainwindow as kant_mainwindow_module
 from kant import widgets as kant_widgets_module
-from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT, ROLE_LINE
+from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT, ROLE_LINE, ROLE_KEY
 from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
 from kant.pyenv import (
@@ -46,6 +46,7 @@ from kant.workspace import (
     render_review_text, safe_project_path,
 )
 from kant.permission_mcp import handle_message
+from kant.groupings import load_groupings
 
 
 class LabelStub:
@@ -82,6 +83,24 @@ class _StatusButtonStub:
         pass
 
 
+# [FN CATEGORY] _mkdtemp_safe — observed on some macOS CI runners: tempfile.gettempdir()'s reported
+# base directory can transiently not exist mid-run, failing mkdtemp() outright for every test after
+# whichever one first hits it (a whole-suite cascade, not one flaky test). Every direct
+# tempfile.mkdtemp() call in this file (and _temp_dir below) routes through this instead, falling
+# back to a directory this process just created itself (guaranteed to exist) rather than letting
+# the base OS temp dir's transient absence fail an unrelated test.
+# [FN] _mkdtemp_safe — tempfile.mkdtemp() with a guaranteed-to-exist fallback base directory
+# [FN OPEN] _mkdtemp_safe
+def _mkdtemp_safe(**kwargs):
+    try:
+        return tempfile.mkdtemp(**kwargs)
+    except FileNotFoundError:
+        fallback = os.path.join(os.getcwd(), '.pytest_tmp')
+        os.makedirs(fallback, exist_ok=True)
+        return tempfile.mkdtemp(dir=fallback, **kwargs)
+# [FN CLOSED] _mkdtemp_safe
+
+
 # [FN CATEGORY] _temp_dir — a MainWindow constructed against this path may still hold its
 # QFileSystemWatcher open on it after .close() (Qt hides on close, it doesn't tear down child
 # objects), which on Windows can make the OS refuse to delete the directory for a moment.
@@ -91,15 +110,7 @@ class _StatusButtonStub:
 # [FN OPEN] _temp_dir
 @contextlib.contextmanager
 def _temp_dir():
-    try:
-        path = tempfile.mkdtemp()
-    except FileNotFoundError:
-        # observed on some macOS CI runners: tempfile.gettempdir()'s reported base directory can
-        # transiently not exist, failing mkdtemp() outright — fall back to a directory we just
-        # created ourselves (guaranteed to exist) instead of letting the whole test error out
-        fallback = os.path.join(os.getcwd(), '.pytest_tmp')
-        os.makedirs(fallback, exist_ok=True)
-        path = tempfile.mkdtemp(dir=fallback)
+    path = _mkdtemp_safe()
     try:
         yield path
     finally:
@@ -282,7 +293,7 @@ class KantSmokeTest(unittest.TestCase):
 
         # the errors tab mirrors whatever _apply_syntax_status just decided for the active file —
         # exercised directly here with a synthetic bad result, same as a real failed local check
-        source_dir = Path(tempfile.mkdtemp())
+        source_dir = Path(_mkdtemp_safe())
         source = _write_app_py(source_dir)
         errors_tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
         window.tabs.addTab(errors_tab, 'app.py')
@@ -529,7 +540,7 @@ class KantSmokeTest(unittest.TestCase):
         hint_tab = type('Tab', (), {'tree': hint_tree, 'path': 'hint.py', 'filter_uid': None})()
         hint_window = MainWindow.__new__(MainWindow)
         hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: hint_tab})()
-        hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
+        hint_window.claude_pane = type('Pane', (), {'global_mode_btn': type('Btn', (), {'isChecked': lambda _self: False})()})()
         hint_window.settings = type('Settings', (), {'value': lambda _self, _key, _default: 'it'})()
         whole_file_hint = MainWindow._build_ai_context_hint(hint_window)
         assert whole_file_hint == (
@@ -555,14 +566,14 @@ class KantSmokeTest(unittest.TestCase):
         assert 'VAR' not in variable_hint and 'exported package modules' not in variable_hint
         hint_window.settings = type('Settings', (), {'value': lambda _self, _key, _default: 'en'})()
         assert MainWindow._build_ai_context_hint(hint_window).startswith('Implicit context: hint.py::__all__,TEST_USER_EMAIL.')
-        hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: True})()
+        hint_window.claude_pane = type('Pane', (), {'global_mode_btn': type('Btn', (), {'isChecked': lambda _self: True})()})()
         hint_window.project_root_path = 'C:/project'
         hint_tab.path = 'C:/project/hint.py'
         global_hint = MainWindow._build_ai_context_hint(hint_window)
         assert global_hint.startswith('Root: C:/project | View: hint.py::__all__,TEST_USER_EMAIL.')
         assert 'Use the whole root' in global_hint
         hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: None})()
-        hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
+        hint_window.claude_pane = type('Pane', (), {'global_mode_btn': type('Btn', (), {'isChecked': lambda _self: False})()})()
         assert MainWindow._build_ai_context_hint(hint_window) is None  # no open tab -> nothing to scope to
 
     def test_tree_label_click_forwarding(self):
@@ -1225,6 +1236,16 @@ class KantSmokeTest(unittest.TestCase):
         # re-interpreted as bold/italic
         assert '<b>' not in _markdown_to_html('```\n**not bold**\n```')
         assert '<i>' not in _markdown_to_html('`*not italic*`')
+        # a single _ inside an identifier (add_item, cart_id — extremely common in any code-related
+        # message) must never be read as italic emphasis; a real _word_ still is
+        assert '<i>' not in _markdown_to_html('add_item(cart_id, quantity)')
+        assert _markdown_to_html('_italic_') == '<i>italic</i>'
+        # a GFM pipe table (header + |---|---| separator + body rows) renders as a real <table>,
+        # with bold/inline-code inside cells still applied (these substitutions already ran on the
+        # whole segment before table rows are split out)
+        table = _markdown_to_html('| Fn | Does |\n|---|---|\n| add_item(a, b) | **adds** stock |')
+        assert table.count('<table') == 1 and table.count('<th') == 2 and table.count('<td') == 2
+        assert '<b>adds</b>' in table and 'add_item(a, b)' in table
 
     def test_xref_edges_ignore_comments_and_strings(self):
         xref_tree = parse_kant('\n'.join([
@@ -1591,7 +1612,7 @@ class KantSmokeTest(unittest.TestCase):
     def test_git_commit_and_branch_switch(self):
         # real repo, real `git` subprocess calls (_run_git shells out), only the modal dialogs are
         # stubbed to bypass .exec()
-        git_root = Path(tempfile.mkdtemp())
+        git_root = Path(_mkdtemp_safe())
         subprocess.run(['git', 'init', '-q'], cwd=git_root, check=True)
         subprocess.run(['git', 'config', 'user.email', 'test@test.local'], cwd=git_root, check=True)
         subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=git_root, check=True)
@@ -1623,7 +1644,7 @@ class KantSmokeTest(unittest.TestCase):
         # the one-window Git panel: real repo, real git subprocess calls throughout (refresh,
         # stage-via-checkbox, diff-on-click, commit) — nothing here is mocked except the window
         # it's attached to, matching the other git tests' style
-        git_root = Path(tempfile.mkdtemp())
+        git_root = Path(_mkdtemp_safe())
         subprocess.run(['git', 'init', '-q'], cwd=git_root, check=True)
         subprocess.run(['git', 'config', 'user.email', 'test@test.local'], cwd=git_root, check=True)
         subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=git_root, check=True)
@@ -1676,7 +1697,7 @@ class KantSmokeTest(unittest.TestCase):
         # GitPanelDialog is swapped for a lightweight fake so this doesn't need a real Qt-parented
         # MainWindow just to reach the init logic (same shiboken constraint test_git_panel_dialog
         # hit — GitPanelDialog(window) needs an actually-constructed parent)
-        project_root = Path(tempfile.mkdtemp())
+        project_root = Path(_mkdtemp_safe())
         window = MainWindow.__new__(MainWindow)
         window.git_root = None
         window.git_status = {}
@@ -1730,7 +1751,7 @@ class KantSmokeTest(unittest.TestCase):
     def test_run_tests_pytest_integration(self):
         # a real pytest subprocess against an isolated temp project with one passing and one failing
         # test, checking the FAILED-line parser feeds results_view with a clickable entry
-        test_project = Path(tempfile.mkdtemp())
+        test_project = Path(_mkdtemp_safe())
         (test_project / 'test_sample.py').write_text(
             'def test_ok():\n    assert True\n\n\ndef test_should_fail():\n    assert False\n',
             encoding='utf-8',
@@ -1844,8 +1865,8 @@ class KantSmokeTest(unittest.TestCase):
     def test_welcome_page_recent_folder_cards(self):
         # RecentFolderCard has its own mousePressEvent (QPushButton can't bold just one line of its
         # own text), so a real click needs exercising end-to-end rather than trusting a signal exists
-        recent_a = Path(tempfile.mkdtemp())
-        recent_b = Path(tempfile.mkdtemp())
+        recent_a = Path(_mkdtemp_safe())
+        recent_b = Path(_mkdtemp_safe())
         QSettings('KANT', 'KANT Editor').setValue('recentFolders', [str(recent_a), str(recent_b)])
         window = MainWindow()
         assert window.recent_layout.count() == 2
@@ -1887,7 +1908,7 @@ class KantSmokeTest(unittest.TestCase):
         assert all(btn.isHidden() for btn in project_menus)
         assert window.action_toolbar.isHidden()
 
-        project_root = Path(tempfile.mkdtemp())
+        project_root = Path(_mkdtemp_safe())
         window._ide_yes_no = lambda *_args, **_kwargs: False  # decline the KANT-tagging prompts
         window._open_project_folder(str(project_root))
         assert all(not btn.isHidden() for btn in project_menus)
@@ -1923,6 +1944,37 @@ class KantSmokeTest(unittest.TestCase):
         assert log_files, 'no crash log file was written'
         assert 'ValueError' in log_files[-1].read_text(encoding='utf-8')
         assert 'synthetic crash' in log_files[-1].read_text(encoding='utf-8')
+
+    def test_validate_kant_project_auto_resyncs_stale_map(self):
+        # regression for the "the KANT board should fix itself when it finds a discrepancy" request:
+        # a KANT_*.md map that's fallen behind the source (missing an entry validate_kant_project's
+        # own coherence check would flag) is auto-regenerated by _validate_kant_project itself,
+        # instead of just reporting an error the user has to notice and manually re-sync.
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            source_dir = root / 'src'
+            source_dir.mkdir()
+            _write_app_py(source_dir)  # tags one MOD: src/app.py
+
+            map_path = root / f'KANT_{root.name}.md'
+            stale_map = '# KANT Code Map - stale\n\n## Struttura\n\n```\n```\n'
+            map_path.write_text(stale_map, encoding='utf-8')
+
+            w = MainWindow.__new__(MainWindow)
+            w.project_root_path = str(root)
+            w.kant_map_path = None
+            w.kant_map_label = LabelStub()
+            w._xref_cache = None
+            w._xref_generation = 0
+            w._xref_pending_generation = None
+            w.map_dialog = None
+            w._map_sync_generation = 0
+            w._run_background = lambda work, done: done(work(), None)
+
+            result = MainWindow._validate_kant_project(w)
+            assert 'mancano' not in result  # not surfaced as an unresolved "missing X" error
+            assert 'rigenerata automaticamente' in result  # noted as self-healed instead
+            assert 'src/app.py' in map_path.read_text(encoding='utf-8')  # actually rewritten on disk
 
     def test_kant_map_sync_trash_restore_and_ai_review(self):
         with _temp_dir() as tmp:
@@ -2584,6 +2636,187 @@ class KantSmokeTest(unittest.TestCase):
             assert 'parte 1' in stream_label.text() and 'parte 3' in stream_label.text()
         finally:
             pane.deleteLater()
+
+    def test_grouping_create_persist_and_navigate(self):
+        # regression for the new "raggruppamento" feature: an arbitrary named bundle of elements
+        # from different files/parents (kant/groupings.py), created via the "+ Nuovo gruppo" button,
+        # shown in "Gruppi" view mode, and navigable by clicking a member (reuses
+        # _navigate_to_element, the same the Incoming/Outgoing panel already uses).
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            (project / 'auth.py').write_text('\n'.join([
+                '# [MOD OPEN] auth.py',
+                '# [FN OPEN] login', 'def login(): pass', '# [FN CLOSED] login',
+                '# [MOD CLOSED] auth.py',
+            ]), encoding='utf-8')
+            (project / 'server.py').write_text('\n'.join([
+                '# [MOD OPEN] server.py',
+                '# [FN OPEN] handle', 'def handle(): pass', '# [FN CLOSED] handle',
+                '# [MOD CLOSED] server.py',
+            ]), encoding='utf-8')
+            window = MainWindow()
+            window.project_root_path = str(project)
+            window.git_root = None
+            window.git_status = {}
+            window._build_project_tree(window.tree.invisibleRootItem(), str(project))
+
+            trees = {
+                'auth.py': parse_kant((project / 'auth.py').read_text(encoding='utf-8')),
+                'server.py': parse_kant((project / 'server.py').read_text(encoding='utf-8')),
+            }
+            window._xref_cache = build_xref(trees)
+            fn_keys = [key for key, el in window._xref_cache.items() if el.tag == 'FN']
+            assert len(fn_keys) == 2  # one from each file — a grouping mixing files/parents
+
+            window._ide_new_grouping_form = lambda elements, preselected=(): ('Auth flow', fn_keys)
+            assert window.add_grouping_btn is not None
+            window.add_grouping_btn.click()
+
+            assert window.view_mode == 'groups'  # switched automatically to show the new group
+            saved = load_groupings(str(project))
+            assert len(saved) == 1 and saved[0].name == 'Auth flow' and set(saved[0].members) == set(fn_keys)
+
+            # the tree shows one 'grouping' row with two 'grouping_member' children
+            it = window.tree.invisibleRootItem()
+            group_items = [it.child(i) for i in range(it.childCount()) if it.child(i).data(0, ROLE_KIND) == 'grouping']
+            assert len(group_items) == 1
+            member_items = [group_items[0].child(i) for i in range(group_items[0].childCount())]
+            assert len(member_items) == 2
+            assert {item.data(0, ROLE_KIND) for item in member_items} == {'grouping_member'}
+
+            # clicking a member navigates to its file via the existing xref-key navigation path
+            target_key = member_items[0].data(0, ROLE_KEY)
+            target_rel = target_key.split('::', 1)[0]
+            window._on_tree_item_clicked(member_items[0], 0)
+            assert window.active_tab is not None
+            assert os.path.basename(window.active_tab.path) == target_rel
+            window.close()
+
+    def test_context_menu_add_kant_element_to_group(self):
+        # regression for "right-click a KANT element -> add to group (or create the first one with
+        # it preselected)": exercises _xref_key_for_tree_item for both a top-level 'file' row (a
+        # MOD) and a nested 'section' row (an FN), then the two right-click paths in
+        # _show_tree_context_menu — no groups yet vs. an existing group to add into.
+        # QMenu.exec() is a real blocking native call — unlike QMessageBox.critical (a plain Python
+        # staticmethod the crash-handler test overrides directly on the class), overriding
+        # QMenu.exec at the class level does NOT intercept it (verified: it still blocks forever
+        # offscreen). QMenu.__init__ is patched instead, to stamp an instance-level .exec override
+        # onto every menu as it's constructed — same effect as this file's own working precedent
+        # (test_git_button_hover_does_not_show_dropdown patches a specific menu INSTANCE's .exec),
+        # just applied at creation time since _show_tree_context_menu's menu is a fresh local, not
+        # one already reachable from the test.
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'auth.py').write_text('\n'.join([
+                '# [MOD OPEN] auth.py',
+                '# [FN OPEN] login', 'def login(): pass', '# [FN CLOSED] login',
+                '# [MOD CLOSED] auth.py',
+            ]), encoding='utf-8')
+            (root / 'server.py').write_text('\n'.join([
+                '# [MOD OPEN] server.py',
+                '# [FN OPEN] handle', 'def handle(): pass', '# [FN CLOSED] handle',
+                '# [MOD CLOSED] server.py',
+            ]), encoding='utf-8')
+
+            window = MainWindow()
+            window.project_root_path = str(root)
+            window.git_root = None
+            window.git_status = {}
+            window._build_project_tree(window.tree.invisibleRootItem(), str(root))
+            trees = {
+                'auth.py': parse_kant((root / 'auth.py').read_text(encoding='utf-8')),
+                'server.py': parse_kant((root / 'server.py').read_text(encoding='utf-8')),
+            }
+            window._xref_cache = build_xref(trees)
+
+            auth_file_item = next(
+                window.tree.topLevelItem(i) for i in range(window.tree.topLevelItemCount())
+                if window.tree.topLevelItem(i).data(0, ROLE_PATH) == str(root / 'auth.py')
+            )
+            assert auth_file_item.data(0, ROLE_KIND) == 'file'
+            auth_key = window._xref_key_for_tree_item(auth_file_item)
+            assert auth_key is not None and window._xref_cache[auth_key].tag == 'MOD'
+
+            login_item = auth_file_item.child(0)
+            assert login_item.data(0, ROLE_KIND) == 'section'
+            login_key = window._xref_key_for_tree_item(login_item)
+            assert login_key is not None and window._xref_cache[login_key].tag == 'FN'
+
+            server_file_item = next(
+                window.tree.topLevelItem(i) for i in range(window.tree.topLevelItemCount())
+                if window.tree.topLevelItem(i).data(0, ROLE_PATH) == str(root / 'server.py')
+            )
+            server_key = window._xref_key_for_tree_item(server_file_item)
+
+            captured = {}
+            window._ide_new_grouping_form = lambda elements, preselected=(): (
+                captured.__setitem__('preselected', preselected) or ('Backend', list(preselected))
+            )
+
+            # stamps every QMenu (main menu and any submenu) with an instance-level .exec override
+            # at construction time, picking whichever action `picker[0]` currently selects
+            picker = [None]
+            original_init = QMenu.__init__
+
+            def patched_init(menu_self, *a, **k):
+                original_init(menu_self, *a, **k)
+                menu_self.exec = lambda *_a, **_k: picker[0](menu_self)
+
+            QMenu.__init__ = patched_init
+            try:
+                picker[0] = lambda menu_self: next(
+                    a for a in menu_self.actions() if a.text() == 'Aggiungi a un nuovo gruppo…'
+                )
+                window._show_tree_context_menu(window.tree.visualItemRect(auth_file_item).center())
+
+                assert captured['preselected'] == (auth_key,)
+                groupings = load_groupings(str(root))
+                assert len(groupings) == 1 and groupings[0].members == [auth_key]
+
+                # creating the group switched view_mode to 'groups', which cleared and rebuilt the
+                # whole tree — server_file_item's underlying QTreeWidgetItem is gone; re-resolve it
+                # against a fresh 'code' rebuild instead of the now-deleted C++ object
+                window._set_view_mode('code')
+                server_file_item = next(
+                    window.tree.topLevelItem(i) for i in range(window.tree.topLevelItemCount())
+                    if window.tree.topLevelItem(i).data(0, ROLE_PATH) == str(root / 'server.py')
+                )
+                assert window._xref_key_for_tree_item(server_file_item) == server_key
+
+                def pick_existing_group(menu_self):
+                    for action in menu_self.actions():
+                        submenu = action.menu()
+                        if submenu is not None:
+                            return submenu.actions()[0]
+                    raise AssertionError('no "Aggiungi a un gruppo" submenu offered')
+
+                picker[0] = pick_existing_group
+                window._show_tree_context_menu(window.tree.visualItemRect(server_file_item).center())
+            finally:
+                QMenu.__init__ = original_init
+
+            groupings = load_groupings(str(root))
+            assert len(groupings) == 1
+            assert set(groupings[0].members) == {auth_key, server_key}
+            window.close()
+
+    def test_new_project_creates_folder_with_starter_module_and_opens(self):
+        with _temp_dir() as tmp:
+            window = MainWindow()
+            window._ide_yes_no = lambda *a, **k: False  # decline the "generate KANT map?" follow-up
+            window._ide_new_project_form = lambda *a, **k: {
+                'name': 'my-project', 'parent_dir': tmp, 'language': 'Python',
+                'create_starter': True, 'init_git': False,
+            }
+            window._prompt_new_project()
+            target = Path(tmp) / 'my-project'
+            assert target.is_dir()
+            main_py = target / 'main.py'
+            assert main_py.is_file()
+            content = main_py.read_text(encoding='utf-8')
+            assert '[MOD OPEN' in content and 'my-project' in content
+            assert window.project_root_path == str(target)
+            window.close()
 # [TST CLOSED] KantSmokeTest
 
 

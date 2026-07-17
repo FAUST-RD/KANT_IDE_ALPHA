@@ -6,7 +6,7 @@ visible to widgets built afterward.
 """
 
 BG = '#ffffff'; PANEL = '#fbfcff'; BORDER = '#d7dce5'; TEXT = '#111827'
-DIM = '#64748b'; ACCENT = '#2563eb'; CODE_BG = '#f3f5f9'
+DIM = '#64748b'; ACCENT = '#f3bd27'; CODE_BG = '#f3f5f9'
 HOT = '#f2b705'; OK = '#15803d'; WARN = '#7c3aed'
 HL_COMMENT = '#7a7f87'; HL_STRING = '#067d17'; HL_NUMBER = '#1750eb'; HL_KEYWORD = '#cf5b00'
 
@@ -44,7 +44,7 @@ QPushButton {{
     background:{PANEL}; color:{TEXT}; border:1px solid {BORDER};
     border-radius:8px; padding:7px 13px; font-weight:700;
 }}
-QPushButton:hover {{ background:#eef4ff; color:{ACCENT}; border-color:{ACCENT}; }}
+QPushButton:hover {{ background:#fdf3d8; color:{ACCENT}; border-color:{ACCENT}; }}
 QPushButton:pressed {{ background:{ACCENT}; color:#ffffff; }}
 QPushButton:disabled {{ color:{DIM}; border-color:#e2e8f0; background:#f1f5f9; }}
 '''
@@ -56,7 +56,7 @@ def set_theme(night=False):
 
     if night:
         BG = '#0f172a'; PANEL = '#111827'; BORDER = '#334155'; TEXT = '#e5e7eb'
-        DIM = '#94a3b8'; ACCENT = '#60a5fa'; CODE_BG = '#0b1120'
+        DIM = '#94a3b8'; ACCENT = '#f3bd27'; CODE_BG = '#0b1120'
         HOT = '#facc15'; OK = '#4ade80'; WARN = '#c084fc'
         HL_COMMENT = '#94a3b8'; HL_STRING = '#86efac'; HL_NUMBER = '#93c5fd'; HL_KEYWORD = '#f59e0b'
         TAG_COLORS.clear(); TAG_COLORS.update(NIGHT_TAG_COLORS)
@@ -64,12 +64,12 @@ def set_theme(night=False):
         hover = '#1e293b'; disabled_border = '#334155'; disabled_bg = '#111827'
     else:
         BG = '#ffffff'; PANEL = '#fbfcff'; BORDER = '#d7dce5'; TEXT = '#111827'
-        DIM = '#64748b'; ACCENT = '#2563eb'; CODE_BG = '#f3f5f9'
+        DIM = '#64748b'; ACCENT = '#f3bd27'; CODE_BG = '#f3f5f9'
         HOT = '#f2b705'; OK = '#15803d'; WARN = '#7c3aed'
         HL_COMMENT = '#7a7f87'; HL_STRING = '#067d17'; HL_NUMBER = '#1750eb'; HL_KEYWORD = '#cf5b00'
         TAG_COLORS.clear(); TAG_COLORS.update(DAY_TAG_COLORS)
         TAG_BACKGROUNDS.clear(); TAG_BACKGROUNDS.update(DAY_TAG_BACKGROUNDS)
-        hover = '#eef4ff'; disabled_border = '#e2e8f0'; disabled_bg = '#f1f5f9'
+        hover = '#fdf3d8'; disabled_border = '#e2e8f0'; disabled_bg = '#f1f5f9'
 
     APP_STYLE = f'''
 QWidget {{ background:{BG}; color:{TEXT}; selection-background-color:{ACCENT}; selection-color:#ffffff; }}

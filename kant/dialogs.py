@@ -4,8 +4,8 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QPushButton, QTextEdit, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from kant import theme
@@ -35,7 +35,7 @@ class _PaletteInput(QLineEdit):
 
 
 class IdeDialogsMixin:
-    def _dialog(self, title, message, width=460):
+    def _dialog(self, title, message, width=460, accent=False):
         dialog = QDialog(self)
         dialog.setModal(True)
         dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
@@ -49,7 +49,11 @@ class IdeDialogsMixin:
         layout.setSpacing(12)
         heading = QLabel(title)
         heading.setFont(QFont('Consolas', theme.TREE_FONT_PT + 2, QFont.DemiBold))
-        heading.setStyleSheet(f'color:{theme.WARN};')
+        # WARN (a distinct purple) is the default "this is a decision point" heading color shared
+        # by every _ide_choice/_ide_yes_no caller (discard changes, git init, ...); accent=True is
+        # an opt-in for the few that should read as on-brand rather than as a warning — the app-close
+        # confirmation (_confirm_close) specifically, on request, not every confirmation dialog
+        heading.setStyleSheet(f'color:{theme.ACCENT if accent else theme.WARN};')
         layout.addWidget(heading)
         prompt = QLabel(message)
         prompt.setWordWrap(True)
@@ -110,10 +114,10 @@ class IdeDialogsMixin:
         return dialog, outer, QVBoxLayout()
     # [FN CLOSED] _internal_window
 
-    def _ide_choice(self, title, message, choices):
+    def _ide_choice(self, title, message, choices, accent=False):
         """choices: (label, value) pairs, or (label, value, tooltip) triples for a consequential
         choice where the label alone doesn't make what happens obvious."""
-        dialog, layout = self._dialog(title, message)
+        dialog, layout = self._dialog(title, message, accent=accent)
         layout.setSpacing(14)
         result = {'value': None}
         row = QHBoxLayout()
@@ -134,8 +138,8 @@ class IdeDialogsMixin:
         layout.addLayout(row)
         return result['value'] if dialog.exec() == QDialog.Accepted else None
 
-    def _ide_yes_no(self, title, message):
-        return self._ide_choice(title, message, [('No', False), ('Si', True)]) is True
+    def _ide_yes_no(self, title, message, accent=False):
+        return self._ide_choice(title, message, [('No', False), ('Si', True)], accent=accent) is True
 
     def _ide_message(self, title, message):
         self._ide_choice(title, message, [('OK', True)])
@@ -677,3 +681,206 @@ class IdeDialogsMixin:
         chosen = listbox.currentItem()
         return chosen.text() if chosen is not None else None
     # [FN CLOSED] _ide_python_interpreter_form
+
+    # [FN CATEGORY] _ide_new_grouping_form — a grouping bundles elements from anywhere in the
+    # project (any tag, any file, any parent) under one name — this picker is name + a filterable,
+    # checkable list of every element the caller hands in. `elements` is [(key, tag, desc, file),
+    # ...]; this dialog only presents/filters/collects the checked keys, kant/groupings.py owns
+    # what a valid key means and how it round-trips.
+    # [FN] _ide_new_grouping_form — grouping name + filterable multi-select element picker
+    # [FN OPEN] _ide_new_grouping_form
+    def _ide_new_grouping_form(self, elements, preselected=()):
+        dialog, outer, body = self._internal_window('Nuovo gruppo', 480, 'Chiudi senza creare')
+        body.setContentsMargins(18, 14, 18, 14)
+        body.setSpacing(8)
+
+        field_style = (
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:6px; padding:6px;'
+        )
+
+        name_label = QLabel('Nome del gruppo:')
+        name_label.setStyleSheet(f'color:{theme.TEXT}; border:none;')
+        body.addWidget(name_label)
+        name_field = QLineEdit()
+        name_field.setPlaceholderText('es. Autenticazione')
+        name_field.setStyleSheet(field_style)
+        body.addWidget(name_field)
+
+        members_label = QLabel(f'Elementi da includere ({len(elements)} nel progetto):')
+        members_label.setStyleSheet(f'color:{theme.TEXT}; border:none; margin-top:4px;')
+        body.addWidget(members_label)
+
+        listbox = QListWidget()
+        listbox.setStyleSheet(field_style)
+        listbox.setMinimumHeight(220)
+        preselected = set(preselected)
+        for key, tag, desc, file in elements:
+            item = QListWidgetItem(f'[{tag}] {desc}  —  {file}')
+            item.setData(Qt.UserRole, key)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if key in preselected else Qt.Unchecked)
+            listbox.addItem(item)
+
+        filter_field = _PaletteInput(listbox)
+        filter_field.setPlaceholderText('Filtra per tag, nome o file…')
+        filter_field.setStyleSheet(field_style)
+
+        def apply_filter(text):
+            needle = text.strip().lower()
+            for i in range(listbox.count()):
+                row = listbox.item(i)
+                row.setHidden(bool(needle) and needle not in row.text().lower())
+
+        filter_field.textChanged.connect(apply_filter)
+        body.addWidget(filter_field)
+        body.addWidget(listbox)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton('Annulla')
+        cancel.setToolTip('Chiudi senza creare nulla')
+        ok = QPushButton('Crea')
+        ok.setToolTip('Crea il gruppo con gli elementi selezionati')
+        ok.setDefault(True)
+        for button in (cancel, ok):
+            button.setStyleSheet(theme.BUTTON_STYLE)
+            buttons.addWidget(button)
+        cancel.clicked.connect(dialog.reject)
+        ok.clicked.connect(dialog.accept)
+        body.addLayout(buttons)
+        outer.addLayout(body)
+
+        name_field.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        name = name_field.text().strip()
+        if not name:
+            return None
+        selected_keys = [
+            listbox.item(i).data(Qt.UserRole) for i in range(listbox.count())
+            if listbox.item(i).checkState() == Qt.Checked
+        ]
+        return name, selected_keys
+    # [FN CLOSED] _ide_new_grouping_form
+
+    # [FN CATEGORY] _ide_new_project_form — the welcome page's "+" button: name, where to create it,
+    # primary language (reuses ELEMENT_LANGUAGES/build_new_file_content — the exact same machinery
+    # the "+" element/file dialogs already use, so a brand-new project's starter module is
+    # language-correct and KANT-tagged from the first line), whether to seed a starter module, and
+    # whether to run `git init`. Live preview of the resulting folder layout, same "show exactly
+    # what you're about to get" spirit as the other creation dialogs.
+    # [FN] _ide_new_project_form — new-project name/location/language/starter/git picker
+    # [FN OPEN] _ide_new_project_form
+    def _ide_new_project_form(self, default_parent_dir, default_language='Python'):
+        dialog, outer, body = self._internal_window('Nuovo progetto', 520, 'Chiudi senza creare')
+        body.setContentsMargins(18, 16, 18, 16)
+        body.setSpacing(8)
+
+        field_style = (
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:6px; padding:6px;'
+        )
+
+        def field_label(text):
+            label = QLabel(text)
+            label.setStyleSheet(f'color:{theme.TEXT}; border:none; margin-top:4px;')
+            body.addWidget(label)
+
+        field_label('Nome del progetto:')
+        name_field = QLineEdit()
+        name_field.setPlaceholderText('es. shop-backend')
+        name_field.setStyleSheet(field_style)
+        body.addWidget(name_field)
+
+        field_label('Cartella principale (il progetto verrà creato al suo interno):')
+        location_row = QHBoxLayout()
+        location_field = QLineEdit(default_parent_dir)
+        location_field.setStyleSheet(field_style)
+        location_row.addWidget(location_field, 1)
+        browse_btn = QPushButton('Sfoglia...')
+        browse_btn.setStyleSheet(theme.BUTTON_STYLE)
+
+        def browse():
+            chosen = QFileDialog.getExistingDirectory(dialog, 'Cartella principale', location_field.text())
+            if chosen:
+                location_field.setText(chosen)
+
+        browse_btn.clicked.connect(browse)
+        location_row.addWidget(browse_btn)
+        body.addLayout(location_row)
+
+        field_label('Linguaggio principale (determina il modulo di esempio):')
+        lang_box = QComboBox()
+        lang_box.addItems(list(ELEMENT_LANGUAGES))
+        lang_box.setCurrentText(default_language)
+        lang_box.setStyleSheet(field_style)
+        body.addWidget(lang_box)
+
+        starter_check = QCheckBox('Crea un modulo di esempio con tag KANT')
+        starter_check.setChecked(True)
+        starter_check.setStyleSheet(f'color:{theme.TEXT};')
+        body.addWidget(starter_check)
+
+        git_check = QCheckBox('Inizializza un repository Git')
+        git_check.setChecked(True)
+        git_check.setStyleSheet(f'color:{theme.TEXT};')
+        body.addWidget(git_check)
+
+        field_label('Anteprima:')
+        preview = QTextEdit()
+        preview.setReadOnly(True)
+        preview.setFixedHeight(120)
+        preview.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+        preview.setStyleSheet(field_style)
+        body.addWidget(preview)
+
+        def refresh_preview():
+            name = name_field.text().strip() or 'nome-progetto'
+            language = lang_box.currentText()
+            ext = ELEMENT_LANGUAGES.get(language, ELEMENT_LANGUAGES['Generico'])['ext']
+            lines = [f'{name}/']
+            if starter_check.isChecked():
+                lines.append(f'  main{ext}')
+            if git_check.isChecked():
+                lines.append('  .git/')
+            if not starter_check.isChecked() and not git_check.isChecked():
+                lines.append('  (cartella vuota)')
+            preview.setPlainText('\n'.join(lines))
+            if starter_check.isChecked():
+                stem = 'main'
+                preview.append('\n--- main' + ext + ' ---\n' + build_new_file_content('module', language, name))
+
+        name_field.textChanged.connect(refresh_preview)
+        lang_box.currentIndexChanged.connect(refresh_preview)
+        starter_check.toggled.connect(refresh_preview)
+        git_check.toggled.connect(refresh_preview)
+        refresh_preview()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton('Annulla')
+        cancel.setToolTip('Chiudi senza creare nulla')
+        ok = QPushButton('Crea progetto')
+        ok.setToolTip('Crea la cartella con queste opzioni e aprila')
+        ok.setDefault(True)
+        for button in (cancel, ok):
+            button.setStyleSheet(theme.BUTTON_STYLE)
+            buttons.addWidget(button)
+        cancel.clicked.connect(dialog.reject)
+        ok.clicked.connect(dialog.accept)
+        body.addLayout(buttons)
+        outer.addLayout(body)
+
+        name_field.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        name = name_field.text().strip()
+        location = location_field.text().strip()
+        if not name or not location:
+            return None
+        return {
+            'name': name, 'parent_dir': location, 'language': lang_box.currentText(),
+            'create_starter': starter_check.isChecked(), 'init_git': git_check.isChecked(),
+        }
+    # [FN CLOSED] _ide_new_project_form

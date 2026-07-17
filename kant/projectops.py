@@ -121,9 +121,11 @@ def validate_kant_project(root, map_path):
         label = read_top_level_label(path)
         if label is not None:
             tagged.append((rel, label[0]))
+    map_out_of_sync = False
     if map_text:
         missing = [rel for rel, tag in tagged if f'[{tag} {rel}]' not in map_text]
         if missing:
+            map_out_of_sync = True
             sample = ', '.join(missing[:5])
             extra = f' (+{len(missing) - 5})' if len(missing) > 5 else ''
             errors.append(f'KANT map non coerente: mancano {sample}{extra}')
@@ -134,7 +136,7 @@ def validate_kant_project(root, map_path):
         summary = f'# KANT verifica: ERRORI\n{sample}{extra}'
     else:
         summary = f'# KANT verifica: OK ({map_name}, {checked_markers} file con marker)'
-    return summary, errors, visual_errors
+    return summary, errors, visual_errors, map_out_of_sync
 
 
 def definition_locations(root, symbol, limit=200):
