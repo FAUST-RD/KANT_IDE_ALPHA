@@ -36,7 +36,7 @@ from kant.xref import build_xref, XrefElement
 from kant.widgets import (
     ClaudePane, CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard,
     _AiReviewCard, _agent_command, _markdown_to_html, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
-    _code_hover_popup_instance,
+    _code_hover_popup_instance, make_app_icon, make_app_pixmap,
 )
 from kant.mappa import MIN_NODE_GAP, XrefMapDialog, XrefMapView, _force_layout_positions, _element_degree, _element_size
 from kant import gitops as kant_gitops_module
@@ -1246,6 +1246,15 @@ class KantSmokeTest(unittest.TestCase):
         table = _markdown_to_html('| Fn | Does |\n|---|---|\n| add_item(a, b) | **adds** stock |')
         assert table.count('<table') == 1 and table.count('<th') == 2 and table.count('<td') == 2
         assert '<b>adds</b>' in table and 'add_item(a, b)' in table
+
+    def test_app_icon_loads_from_bundled_asset(self):
+        # guards kant/assets/app_icon.png staying present and readable — make_app_icon/pixmap load
+        # the user's own image file directly (QIcon(path)/QPixmap(path)), not a generated fallback,
+        # so a missing/renamed file would otherwise fail silently (QIcon.isNull()) with no test to
+        # catch it before someone notices the taskbar/home icon went blank
+        assert not make_app_icon().isNull()
+        pixmap = make_app_pixmap(76)
+        assert not pixmap.isNull() and pixmap.width() == 76 and pixmap.height() == 76
 
     def test_xref_edges_ignore_comments_and_strings(self):
         xref_tree = parse_kant('\n'.join([

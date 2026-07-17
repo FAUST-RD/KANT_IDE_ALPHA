@@ -26,10 +26,9 @@ from pathlib import Path
 import shiboken6
 
 from PySide6.QtCore import (
-    QByteArray, QElapsedTimer, QFileSystemWatcher, QObject, QPoint, QPointF, QProcess, QRect, QRectF, Qt, QSettings,
+    QElapsedTimer, QFileSystemWatcher, QObject, QPoint, QPointF, QProcess, QRect, QRectF, Qt, QSettings,
     QSize, QStringListModel, Signal, QTimer,
 )
-from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
     QPainterPathStroker, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
@@ -2519,33 +2518,22 @@ class ProjectTree(QTreeWidget):
 # [FN CLOSED] ProjectTree
 
 
-# [CST] _APP_ICON_SVG — the app/window icon: a stylized side-profile bust (gold face, cream wig,
-# black rounded-square badge with a gold border), recreated as hand-authored vector paths from a
-# reference image the user supplied — drawn, not loaded from a raster file, so it renders crisp at
-# any requested size the same way make_star_icon (the icon it replaces) always did.
-_APP_ICON_SVG = b"""<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-  <rect x="6" y="6" width="188" height="188" rx="34" fill="#000000" stroke="#f3bd27" stroke-width="9"/>
-  <polygon points="66,55 82,32 112,22 145,30 168,52 174,78 163,92 163,106 148,116 138,104 140,120 126,113 118,138 108,116 98,146 90,160 108,166 100,146" fill="#f4ede0"/>
-  <polygon points="148,98 163,106 150,116 140,105" fill="#000000"/>
-  <polygon points="112,48 104,66 62,104 50,118 68,126 64,138 80,146 90,162 108,166 116,146 128,146 124,116 116,92 110,66" fill="#f3bd27"/>
-  <polygon points="76,97 92,94 87,101" fill="#000000"/>
-  <path d="M92,162 L78,182 M108,166 L128,184" stroke="#f4ede0" stroke-width="7" fill="none" stroke-linecap="round"/>
-</svg>"""
+# [CST] _APP_ICON_PATH — the app/window icon, a real image file the user supplied (a stylized
+# side-profile bust, gold/cream/black), bundled at kant/assets/app_icon.png rather than drawn —
+# unlike make_star_icon (the icon this replaces), the user asked for this exact image, pixel for
+# pixel, not a recreation.
+_APP_ICON_PATH = Path(__file__).resolve().parent / 'assets' / 'app_icon.png'
 
 
 def make_app_pixmap(size=64):
-    renderer = QSvgRenderer(QByteArray(_APP_ICON_SVG))
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.Antialiasing)
-    renderer.render(painter)
-    painter.end()
-    return pixmap
+    pixmap = QPixmap(str(_APP_ICON_PATH))
+    if pixmap.isNull():
+        return QPixmap(size, size)
+    return pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
 def make_app_icon():
-    return QIcon(make_app_pixmap(256))
+    return QIcon(str(_APP_ICON_PATH))
 
 
 # [FN CATEGORY] RecentFolderCard — a clickable row for the welcome screen's recent-projects list:
