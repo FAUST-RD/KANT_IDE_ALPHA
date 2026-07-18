@@ -104,5 +104,9 @@ COORDINATED_LEAF_TAGS = {'CST'}
 SEARCH_MAX_BYTES = 2_000_000
 
 TREE_FONT_PT = 10
+# the left tree's own description/"comment" line (under each row's tag+name) — deliberately its own
+# constant, not derived from TREE_FONT_PT or CODE_FONT_PT, so resizing the coding board's own
+# CATEGORY text never drags this along with it (or vice versa); kept small, this is a dense outline
+TREE_DETAIL_FONT_PT = 8
 CODE_FONT_PT = 11
 TREE_MIN_WIDTH = 420

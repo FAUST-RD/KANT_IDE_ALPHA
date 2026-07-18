@@ -1570,15 +1570,15 @@ class ClaudePane(QWidget):
         self.model_select.setToolTip("Modello per l'agente selezionato")
         self.model_select.addItems(CLAUDE_MODELS)
         self.model_select.setCursor(Qt.PointingHandCursor)
-        self.model_select.setIconSize(QSize(14, 14))
-        self.model_select.setMinimumWidth(118)
+        self.model_select.setIconSize(QSize(18, 18))
+        self.model_select.setFixedWidth(44)
         header.addWidget(self.model_select)
         self.effort_select = QComboBox()
         self.effort_select.setToolTip("Reasoning effort per l'agente selezionato")
         self.effort_select.addItems(EFFORT_LEVELS['claude'])
         self.effort_select.setCursor(Qt.PointingHandCursor)
-        self.effort_select.setIconSize(QSize(14, 14))
-        self.effort_select.setMinimumWidth(88)
+        self.effort_select.setIconSize(QSize(18, 18))
+        self.effort_select.setFixedWidth(44)
         header.addWidget(self.effort_select)
         header.addStretch(1)
         self.auto_permissions = QCheckBox('Automatico')
@@ -1706,11 +1706,24 @@ class ClaudePane(QWidget):
             f'QComboBox::drop-down {{ border:none; width:16px; }}'
         )
         self.agent_select.setStyleSheet(combo_style)
-        # model/effort used to be icon-only faces (color:transparent, full value only in the
-        # tooltip/dropdown) — real text is more reliable than an icon nobody can read the meaning
-        # of at a glance, and removes an entire class of "why can't I see what's selected" reports
-        self.model_select.setStyleSheet(combo_style)
-        self.effort_select.setStyleSheet(combo_style)
+        # model/effort: icon-only closed face (compact, on request — the full value is still in the
+        # tooltip), but the OPEN dropdown always shows real, unabbreviated names — color:{theme.TEXT}
+        # on QAbstractItemView is the row text color, and the explicit view().setMinimumWidth() below
+        # is what actually guarantees the popup itself is wide enough not to clip a long model name,
+        # regardless of how narrow the closed face is; that minimum width is the one part a bare QSS
+        # rule can't express, so it's set in code rather than the stylesheet string.
+        icon_combo_style = (
+            f'QComboBox {{ background:{theme.PANEL}; color:transparent; border:1px solid {theme.BORDER}; '
+            f'border-radius:8px; padding:4px 15px 4px 5px; }} '
+            f'QComboBox:hover {{ border-color:{theme.ACCENT}; }} '
+            f'QComboBox::drop-down {{ border:none; width:14px; }} '
+            f'QComboBox QAbstractItemView {{ background:{theme.PANEL}; color:{theme.TEXT}; '
+            f'border:1px solid {theme.BORDER}; selection-background-color:{theme.CODE_BG}; }}'
+        )
+        self.model_select.setStyleSheet(icon_combo_style)
+        self.model_select.view().setMinimumWidth(180)
+        self.effort_select.setStyleSheet(icon_combo_style)
+        self.effort_select.view().setMinimumWidth(120)
         self.auto_permissions.setStyleSheet(f'color:{theme.ACCENT}; font-weight:600; spacing:6px;')
         self.global_mode_btn.setStyleSheet(
             theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
@@ -1781,21 +1794,21 @@ class ClaudePane(QWidget):
         }.get(level, theme.DIM)
     # [FN CLOSED] _effort_color
 
-    # [FN CATEGORY] _refresh_selector_icons — model and effort show their real text now (see
-    # apply_style), plus a small leading icon for a quick visual anchor. Effort's icon is
+    # [FN CATEGORY] _refresh_selector_icons — model and effort stay icon-only, compact closed faces
+    # (their dropdown is what shows the real, full-width text — see apply_style). Effort's icon is
     # additionally colored per level (_effort_color) instead of one fixed color for every level — the
     # combo's closed face always shows its current item's own icon, so the color alone signals the
-    # selected effort even before reading the text next to it.
+    # selected effort even before opening the dropdown to read the name.
     # [FN] _refresh_selector_icons — refreshes AI selector icons and selected-value tooltips
     # [FN OPEN] _refresh_selector_icons
     def _refresh_selector_icons(self):
-        model_icon = draw_icon('model', 14)
+        model_icon = draw_icon('model', 18)
         for index in range(self.model_select.count()):
             self.model_select.setItemIcon(index, model_icon)
         self.model_select.setToolTip(f'Modello: {self.model_select.currentText()}')
         for index in range(self.effort_select.count()):
             level = self.effort_select.itemText(index).strip()
-            self.effort_select.setItemIcon(index, draw_icon('effort', 14, self._effort_color(level)))
+            self.effort_select.setItemIcon(index, draw_icon('effort', 18, self._effort_color(level)))
         self.effort_select.setToolTip(f'Effort: {self.effort_select.currentText()}')
     # [FN CLOSED] _refresh_selector_icons
 

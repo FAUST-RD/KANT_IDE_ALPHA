@@ -2657,9 +2657,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         )
         compact = self.view_mode == 'code' and self.compact_kant_view
         # rich-text spans ignore QLabel.setFont proportionally, so the size needs to be explicit
-        # here rather than inherited — one point larger than the label's own TREE_FONT_PT
+        # here rather than inherited — its own dedicated (smaller) size, independent of both the
+        # tree's own row font and the coding board's CATEGORY text (see theme.TREE_DETAIL_FONT_PT)
         detail_html = (
-            f'<br><span style="color:{theme.DIM}; font-size:{theme.TREE_FONT_PT + 1}pt">{html_escape(detail)}</span>'
+            f'<br><span style="color:{theme.DIM}; font-size:{theme.TREE_DETAIL_FONT_PT}pt">{html_escape(detail)}</span>'
             if detail and not compact else ''
         )
         # compact/list mode drops the full tag-colored pill background (too heavy for a dense list),

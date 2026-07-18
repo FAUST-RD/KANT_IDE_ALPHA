@@ -248,12 +248,14 @@ class KantSmokeTest(unittest.TestCase):
         pane = window.claude_pane
         pane.set_agent('claude')
         assert not pane.model_select.isEditable() and not pane.effort_select.isEditable()
-        # regression: these used to be icon-only faces (fixed 44px, color:transparent) with the
-        # selected value shown only in the tooltip — real, always-visible text now, wide enough to
-        # actually show it, since the icon-only design was reported unreadable more than once
-        assert pane.model_select.minimumWidth() >= 100 and pane.effort_select.minimumWidth() >= 70
-        assert 'transparent' not in pane.model_select.styleSheet()
-        assert 'transparent' not in pane.effort_select.styleSheet()
+        # the closed face stays compact/icon-only on request, but the dropdown itself must always be
+        # wide enough to show a full model/effort name — the actual regression before was reportedly
+        # about the OPEN dropdown, not the closed face, so this is the width that has to hold
+        assert pane.model_select.width() == 44 and pane.effort_select.width() == 44
+        assert 'color:transparent' in pane.model_select.styleSheet()
+        assert 'color:transparent' in pane.effort_select.styleSheet()
+        assert pane.model_select.view().minimumWidth() >= 150
+        assert pane.effort_select.view().minimumWidth() >= 100
         assert not pane.model_select.itemIcon(0).isNull() and not pane.effort_select.itemIcon(0).isNull()
         # effort's icon is colored per level, not the same icon/color for every entry
         low_icon = pane.effort_select.itemIcon(pane.effort_select.findText('low')).pixmap(14, 14).toImage()

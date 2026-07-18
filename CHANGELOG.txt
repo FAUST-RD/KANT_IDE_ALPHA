@@ -1,5 +1,9 @@
 KANT IDE changelog
 
+2026-07-19 (72)
+- Left tree's per-row description ("comment") line is now its own, smaller, dedicated font size (`theme.TREE_DETAIL_FONT_PT`) instead of being derived from either the tree's own row font or the coding board's CATEGORY text size.
+- Reverted the AI model/effort selectors' closed face back to compact icon-only (entry 70 made them show text on the closed face too, wider than intended): the closed face stays a narrow icon, only the open dropdown shows full names — now with an explicit minimum popup width so a long model name is never clipped there, regardless of the closed face's own narrow width.
+
 2026-07-19 (71)
 - Moved each KANT element's CATEGORY description closer to its header (tighter left indent, no top margin) and bumped its font a point larger, so it reads as immediately attached to the fold-arrow/name row above it instead of floating with its old wider indent.
 - Clicking the KANT tab in the terminal sidebar now runs a real validation scan instead of just showing whatever `kant_errors_view` last had (stale, or empty if "Verifica" was never run this session) — the scan itself runs off the UI thread via `_run_background`, same as map-sync/xref-build already do.
