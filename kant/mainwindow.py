@@ -1957,6 +1957,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.terminal_stack.setCurrentIndex(index)
         if index == 1 and self.python_terminal.process is None:
             self.python_terminal.run_python_repl(self._active_python())
+        elif index == 3:
+            self._run_kant_validation_background()
 
     def _toggle_info_popup(self, widget, force_open=False):
         if self.info_popup.currentWidget() is widget and self.info_popup.isVisible() and not force_open:
@@ -2481,7 +2483,18 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if not self.project_root_path:
             return ''
         self._check_kant_map(self.project_root_path)
-        result, errors, visual_errors, map_state, warnings = validate_kant_project(self.project_root_path, self.kant_map_path)
+        raw = validate_kant_project(self.project_root_path, self.kant_map_path)
+        return self._apply_kant_validation_result(raw, extra_sync_states)
+    # [FN CLOSED] _validate_kant_project
+
+    # [FN CATEGORY] _apply_kant_validation_result — the result-composition half of
+    # _validate_kant_project, split out so a background-scanned result (see
+    # _run_kant_validation_background) can go through the exact same self-heal/warnings-append/
+    # display logic as the synchronous path, instead of a second hand-rolled copy of it.
+    # [FN] _apply_kant_validation_result — turns a raw validate_kant_project() tuple into result text
+    # [FN OPEN] _apply_kant_validation_result
+    def _apply_kant_validation_result(self, raw, extra_sync_states=()):
+        result, errors, visual_errors, map_state, warnings = raw
 
         # states _sync_kant_map can actually resolve outright: an out-of-date map, or none at all
         # yet. 'errore_generazione' (unreadable existing file / generation itself raised) is NOT
@@ -2515,12 +2528,37 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
         self._show_validation_results(errors, visual_errors)
         return result
-    # [FN CLOSED] _validate_kant_project
+    # [FN CLOSED] _apply_kant_validation_result
 
     def _run_kant_validation(self):
         result = self._validate_kant_project()
         if result:
             self.terminal.write_info('\n' + result + '\n')
+
+    # [FN CATEGORY] _run_kant_validation_background — the KANT tab in the terminal sidebar used to
+    # just show whatever _show_validation_results last left in kant_errors_view (stale, or empty if
+    # "Verifica" was never run this session) — clicking it now kicks off a real scan. The scan itself
+    # (validate_kant_project's full project walk) runs off the UI thread via _run_background, the
+    # same as map-sync/xref-build already do; only the result composition/display touches widgets, in
+    # the completion callback that _run_background marshals back onto the main thread.
+    # [FN] _run_kant_validation_background — scans the project for KANT problems without blocking the UI
+    # [FN OPEN] _run_kant_validation_background
+    def _run_kant_validation_background(self):
+        if not self.project_root_path:
+            return
+        self._check_kant_map(self.project_root_path)
+        root, map_path = self.project_root_path, self.kant_map_path
+
+        def scan():
+            return validate_kant_project(root, map_path)
+
+        def apply(raw, error):
+            if error or root != self.project_root_path:
+                return
+            self._apply_kant_validation_result(raw)
+
+        self._run_background(scan, apply)
+    # [FN CLOSED] _run_kant_validation_background
 
     def _show_validation_results(self, errors, visual_errors):
         if not hasattr(self, 'kant_errors_view'):

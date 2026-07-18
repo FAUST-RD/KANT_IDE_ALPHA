@@ -711,7 +711,6 @@ class KantSmokeTest(unittest.TestCase):
             assert theme.CODE_BG in window.terminal.styleSheet()
             assert window._add_row_button_style() == window.add_file_btn.styleSheet()
             assert window._add_row_button_style() == window.add_grouping_btn.styleSheet()
-            assert theme.ACCENT in window.claude_pane.title.styleSheet()
             assert theme.ACCENT in window.claude_pane.send_btn.styleSheet()
             assert f'border-bottom:2px solid {theme.ACCENT}' in window.tabs.tabBar().styleSheet()
             assert f'background-color:{theme.NIGHT_TAG_BACKGROUNDS["MOD"]}' in element_page._tab_label.text()
@@ -1244,7 +1243,8 @@ class KantSmokeTest(unittest.TestCase):
             completion_edit._trigger_completion()
             assert completion_calls == [completion_edit]
 
-            # local (no-LSP-server) fallback: candidates are identifiers already in the open file
+            # local (no-LSP-server) fallback: candidates are identifiers already in the open file.
+            # Shown as inline ghost text (just the remaining suffix), not a popup list — Tab accepts.
             no_lsp_tab_tree = parse_kant('# [FN OPEN] x\ndef alpha_function():\n    pass\n# [FN CLOSED] x\n')
             lsp_window.tabs = type('Tabs', (), {
                 'currentWidget': lambda _self: type('T', (), {'tree': no_lsp_tab_tree})(),
@@ -1257,13 +1257,13 @@ class KantSmokeTest(unittest.TestCase):
             local_completion_edit.setFocus()
             app.processEvents()
             lsp_window._local_completion(local_completion_edit)
-            assert local_completion_edit._completer.popup().isVisible()
-            model = local_completion_edit._completer.completionModel()
-            assert [model.index(i, 0).data() for i in range(model.rowCount())] == ['alpha_function']
-            local_completion_edit._insert_completion('alpha_function')
+            assert local_completion_edit._ghost_suggestion == 'ha_function'
+            local_completion_edit._accept_ghost_suggestion()
             assert local_completion_edit.toPlainText() == '    alpha_function'
+            assert local_completion_edit._ghost_suggestion == ''
 
-            # LSP-driven path: _apply_completion_result dedupes items and forwards labels to the popup
+            # LSP-driven path: _apply_completion_result dedupes items and forwards labels; the first
+            # one that actually extends the typed prefix becomes the ghost suggestion
             lsp_completion_edit = CodeEdit('a')
             cursor = lsp_completion_edit.textCursor()
             cursor.movePosition(QTextCursor.End)
@@ -1274,8 +1274,12 @@ class KantSmokeTest(unittest.TestCase):
             lsp_window._apply_completion_result(lsp_completion_edit, {'items': [
                 {'label': 'alpha', 'insertText': 'alpha'}, {'label': 'alpha'}, {'label': 'abc'},
             ]})
-            model = lsp_completion_edit._completer.completionModel()
-            assert [model.index(i, 0).data() for i in range(model.rowCount())] == ['alpha', 'abc']
+            assert lsp_completion_edit._ghost_suggestion == 'lpha'
+
+            # any further typing invalidates a pending suggestion immediately, not just after the
+            # next debounced completion request resolves
+            QTest.keyClicks(lsp_completion_edit, 'x')
+            assert lsp_completion_edit._ghost_suggestion == ''
             lsp_window.close()
 
     def test_hover_tooltip_and_gesture_vocabulary(self):

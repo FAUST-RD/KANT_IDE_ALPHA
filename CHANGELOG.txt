@@ -1,5 +1,11 @@
 KANT IDE changelog
 
+2026-07-19 (71)
+- Moved each KANT element's CATEGORY description closer to its header (tighter left indent, no top margin) and bumped its font a point larger, so it reads as immediately attached to the fold-arrow/name row above it instead of floating with its old wider indent.
+- Clicking the KANT tab in the terminal sidebar now runs a real validation scan instead of just showing whatever `kant_errors_view` last had (stale, or empty if "Verifica" was never run this session) — the scan itself runs off the UI thread via `_run_background`, same as map-sync/xref-build already do.
+- Replaced the autocomplete popup (`QCompleter`) with inline "ghost text": the top suggestion now appears dimmed/italic directly after the cursor, accepted with Tab or dismissed with Escape/further typing, instead of a dropdown list.
+- Removed the "CHAT AI" label from the AI pane.
+
 2026-07-19 (70)
 - Fixed a real regression from entry 69's effort color-coding: the model/effort selectors' closed face was already `color:transparent` by design (icon-only, full value only in the tooltip) — reported unreadable a second time, so this drops the fragile icon-only design entirely. Both now show real, always-visible text (same combo style already used by the working agent selector) plus a small leading icon; effort's icon stays colored per level.
 - Removed the "KANT IDE / STRUCTURAL CODE ARCHIVE" title-bar wordmark to reclaim vertical space; the row is now 38px instead of 54px.

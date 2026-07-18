@@ -27,14 +27,14 @@ import shiboken6
 
 from PySide6.QtCore import (
     QElapsedTimer, QFileSystemWatcher, QObject, QPoint, QPointF, QProcess, QRect, QRectF, Qt, QSettings,
-    QSize, QStringListModel, Signal, QTimer,
+    QSize, Signal, QTimer,
 )
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
     QPainterPathStroker, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog, QFileDialog, QFrame,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
     QGraphicsDropShadowEffect, QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
     QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMenuBar, QPlainTextEdit, QPushButton, QScrollArea,
@@ -230,17 +230,17 @@ class CodeEdit(QPlainTextEdit):
         # autocomplete-as-you-type: mainwindow sets completion_provider to a callable(edit) that
         # fires an async LSP textDocument/completion request (or a local fallback) and later calls
         # back into show_completions on THIS same instance — kept as a callback, not a direct
-        # import, so this module stays decoupled from mainwindow (see module docstring)
+        # import, so this module stays decoupled from mainwindow (see module docstring).
+        # Shown as inline "ghost text" right after the cursor (like Copilot/VS Code), not a popup
+        # list — Tab accepts it, any other key/edit drops it, on request ("senza quella finestra
+        # contestuale ingombrante").
         self.completion_provider = None
-        self._completer = QCompleter(self)
-        self._completer.setWidget(self)
-        self._completer.setCompletionMode(QCompleter.PopupCompletion)
-        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self._completer.activated.connect(self._insert_completion)
+        self._ghost_suggestion = ''
         self._completion_timer = QTimer(self)
         self._completion_timer.setSingleShot(True)
         self._completion_timer.timeout.connect(self._trigger_completion)
         self.textChanged.connect(self._on_text_changed_for_completion)
+        self.cursorPositionChanged.connect(self._clear_ghost_suggestion)
 
         # PyCharm-style quick-doc-on-hover: mainwindow sets hover_provider to a callable(edit,
         # cursor, global_pos) that fires an async LSP textDocument/hover (or a local fallback) and
@@ -344,21 +344,21 @@ class CodeEdit(QPlainTextEdit):
             bottom = top + int(self.blockBoundingRect(block).height())
             block_number += 1
 
-    # [FN CATEGORY] autocomplete-as-you-type — QCompleter driven by an async provider (LSP
-    # textDocument/completion, or a local fallback) instead of a static word list. Typing restarts
-    # a short debounce timer; when it fires, completion_provider (set by mainwindow) is asked for
-    # fresh candidates and calls back into show_completions on this same widget once they arrive.
-    # keyPressEvent only needs to get out of the popup's way for accept/dismiss keys — Up/Down
-    # navigation and the popup's own positioning are handled by QCompleter itself (setWidget(self)
-    # installs its event filter), matching Qt's own "Custom Completer" reference pattern.
-    # [FN] keyPressEvent — lets the completer popup handle accept/dismiss keys when it's open
+    # [FN CATEGORY] autocomplete-as-you-type — driven by an async provider (LSP textDocument/
+    # completion, or a local fallback) instead of a static word list. Typing restarts a short
+    # debounce timer; when it fires, completion_provider (set by mainwindow) is asked for fresh
+    # candidates and calls back into show_completions on this same widget once they arrive, which
+    # renders the top match as inline ghost text (see paintEvent) rather than a popup list.
+    # [FN] keyPressEvent — Tab accepts a pending ghost-text suggestion, Escape dismisses it
     # [FN OPEN] keyPressEvent
     def keyPressEvent(self, event):
-        if self._completer.popup().isVisible() and event.key() in (
-            Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape, Qt.Key_Tab, Qt.Key_Backtab,
-        ):
-            event.ignore()
-            return
+        if self._ghost_suggestion:
+            if event.key() == Qt.Key_Tab:
+                self._accept_ghost_suggestion()
+                return
+            if event.key() == Qt.Key_Escape:
+                self._clear_ghost_suggestion()
+                return
         if event.key() == Qt.Key_F2 and self.rename_provider is not None:
             self.rename_provider(self)
             return
@@ -723,6 +723,9 @@ class CodeEdit(QPlainTextEdit):
     # [FN CLOSED] mousePressEvent
 
     def _on_text_changed_for_completion(self):
+        # the suggestion just became stale (the text it was computed against no longer matches) —
+        # drop it immediately rather than leaving it on screen for the 200ms debounce to catch up
+        self._clear_ghost_suggestion()
         if self.completion_provider is not None and self.hasFocus():
             self._completion_timer.start(200)
 
@@ -735,35 +738,56 @@ class CodeEdit(QPlainTextEdit):
         cursor.select(QTextCursor.WordUnderCursor)
         return cursor.selectedText()
 
-    # [FN] show_completions — populates and pops up the completer with fresh candidates, called
-    # back by mainwindow once its async completion request (LSP or local) resolves
+    # [FN CATEGORY] show_completions — called back by mainwindow once its async completion request
+    # (LSP or local) resolves. Picks the first candidate that actually extends the current prefix and
+    # shows just the remaining characters as inline "ghost text" right after the cursor — Tab accepts
+    # it, any other keystroke drops it (_on_text_changed_for_completion) — rather than a QCompleter
+    # popup listing every candidate, on request.
+    # [FN] show_completions — computes and displays the ghost-text suggestion, if any
     # [FN OPEN] show_completions
     def show_completions(self, candidates):
-        if not candidates or not self.hasFocus():
-            self._completer.popup().hide()
+        if not candidates or not self.hasFocus() or self.textCursor().hasSelection():
+            self._clear_ghost_suggestion()
             return
         prefix = self._text_under_cursor()
-        self._completer.setModel(QStringListModel(candidates, self._completer))
-        self._completer.setCompletionPrefix(prefix)
-        if self._completer.completionCount() == 0:
-            self._completer.popup().hide()
-            return
-        self._completer.popup().setCurrentIndex(self._completer.completionModel().index(0, 0))
-        cr = self.cursorRect()
-        cr.setWidth(
-            self._completer.popup().sizeHintForColumn(0)
-            + self._completer.popup().verticalScrollBar().sizeHint().width()
+        match = next(
+            (c for c in candidates if prefix and c.lower().startswith(prefix.lower()) and len(c) > len(prefix)),
+            None,
         )
-        self._completer.complete(cr)
+        if match is None:
+            self._clear_ghost_suggestion()
+            return
+        self._ghost_suggestion = match[len(prefix):]
+        self.viewport().update()
     # [FN CLOSED] show_completions
 
-    def _insert_completion(self, completion):
+    def _clear_ghost_suggestion(self):
+        if self._ghost_suggestion:
+            self._ghost_suggestion = ''
+            self.viewport().update()
+
+    def _accept_ghost_suggestion(self):
+        suggestion = self._ghost_suggestion
+        self._ghost_suggestion = ''
         cursor = self.textCursor()
-        extra = len(completion) - len(self._completer.completionPrefix())
-        cursor.movePosition(QTextCursor.Left)
-        cursor.movePosition(QTextCursor.EndOfWord)
-        cursor.insertText(completion[-extra:] if extra > 0 else '')
+        cursor.insertText(suggestion)
         self.setTextCursor(cursor)
+
+    # [FN] paintEvent — draws the pending ghost-text suggestion (if any) right after the cursor,
+    # dimmed and italic, after the normal text/cursor paint everything else already handles
+    # [FN OPEN] paintEvent
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._ghost_suggestion or not self.hasFocus():
+            return
+        painter = QPainter(self.viewport())
+        font = QFont(self.font())
+        font.setItalic(True)
+        painter.setFont(font)
+        painter.setPen(QColor(theme.DIM))
+        rect = self.cursorRect()
+        painter.drawText(rect.right() + 1, rect.bottom() - self.fontMetrics().descent(), self._ghost_suggestion)
+    # [FN CLOSED] paintEvent
 
     # [FN CATEGORY] quick-doc-on-hover — mirrors PyCharm/VS Code: resting the mouse over a symbol
     # (no click needed) shows its documentation as a tooltip. mouseMoveEvent just restarts a
@@ -1530,13 +1554,6 @@ class ClaudePane(QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
 
-        title_row = QHBoxLayout()
-        self.title = QLabel('CHAT AI')
-        self.title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-        title_row.addWidget(self.title)
-        title_row.addStretch(1)
-        layout.addLayout(title_row)
-
         # agent/model/effort/auto-permissions grouped as one visually distinct "controls chip"
         # (own rounded background, own row) instead of loose combo boxes floating in the title row
         self.controls_bar = QWidget()
@@ -1671,7 +1688,6 @@ class ClaudePane(QWidget):
 
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-left:1px solid {theme.BORDER};')
-        self.title.setStyleSheet(f'color:{theme.ACCENT}; letter-spacing:2px;')
         self.controls_bar.setStyleSheet(
             f'#claudeControlsBar {{ background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; border-radius:9px; }}'
         )
@@ -2718,8 +2734,10 @@ class CollapsibleSection(QWidget):
         if node.category_desc:
             cat = QLabel(html_escape(node.category_desc))
             cat.setWordWrap(True)
-            cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 12px;')
-            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+            # pulled closer to the fold-arrow toggle button above it (less left indent, no extra
+            # top margin) and bumped a point larger, on request
+            cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 6px; margin-top: 0px;')
+            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT + 1))
             outer.addWidget(cat)
 
         self.content = QWidget()
@@ -2778,8 +2796,8 @@ class LeafSection(QWidget):
         if node.category_desc:
             cat = QLabel(html_escape(node.category_desc))
             cat.setWordWrap(True)
-            cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 4px;')
-            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+            cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 2px; margin-top: 0px;')
+            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT + 1))
             outer.addWidget(cat)
 
         self.content = QWidget()
