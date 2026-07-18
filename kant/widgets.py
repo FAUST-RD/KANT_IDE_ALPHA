@@ -1486,7 +1486,9 @@ class _PromptEdit(QPlainTextEdit):
 # engine doesn't alpha-composite a semi-transparent background-image over background-color at all
 # (confirmed empirically — a fully opaque test tile rendered, anything with transparency silently
 # didn't), so a real paintEvent is the only reliable way to get a subtle overlay instead of an
-# all-or-nothing one. Day mode only; a CRT glow has no business in a dark room.
+# all-or-nothing one. Active in both themes — a dark line at low alpha reads as basically invisible
+# against night mode's own dark background, so the line color itself flips (light in night mode,
+# dark in day mode) rather than just being disabled there.
 # [FN] ScanlineOverlay — QWidget that paints faint scanlines over whatever sits beneath it
 # [FN OPEN] ScanlineOverlay
 class ScanlineOverlay(QWidget):
@@ -1496,10 +1498,8 @@ class ScanlineOverlay(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground)
 
     def paintEvent(self, event):
-        if theme.NIGHT:
-            return
         painter = QPainter(self)
-        painter.setPen(QColor(0, 0, 0, 12))
+        painter.setPen(QColor(255, 255, 255, 14) if theme.NIGHT else QColor(0, 0, 0, 12))
         for y in range(0, self.height(), 2):
             painter.drawLine(0, y, self.width(), y)
 # [FN CLOSED] ScanlineOverlay
@@ -2800,7 +2800,7 @@ class LeafSection(QWidget):
         if show_header:
             header_row, header = _build_header_row(self, node)
             if compact:
-                header.setStyleSheet(f'padding:4px 0; border-bottom:1px solid #eef2f7;')
+                header.setStyleSheet(f'padding:4px 0; border-bottom:1px solid {theme.BORDER};')
             outer.addLayout(header_row)
         else:
             meta_row, _label = _build_header_row(self, node, show_label=False)
@@ -3129,23 +3129,24 @@ class TitleBar(QWidget):
         self.theme_menu_action.setText('Giorno' if self.window.night_mode else 'Notte')
         # flat text entries (no button chrome/border) — a real menu bar, not a row of buttons.
         # QMenu (the dropdown itself) gets its own rule too: unstyled, its items default to Qt's
-        # native cramped single-line rows — bumped up here on request ("più corpose"), with an
+        # native cramped single-line rows. Kept legible (readable padding, no items lost) but pared
+        # back from an earlier bulkier pass — no bold weight, no heavy borders/radius, thin rows.
         # explicit :disabled rule since styling QMenu::item at all suppresses Qt's own built-in
         # disabled dimming unless it's redeclared — a plain setEnabled(False) used to just stop the
         # click from doing anything, with no clear color change to actually show it was unavailable.
         self.menu_bar.setStyleSheet(
-            f'QMenuBar {{ background:transparent; border:none; spacing:4px; }} '
-            f'QMenuBar::item {{ background:transparent; color:{theme.TEXT}; padding:6px 10px; '
-            f'border-radius:6px; font-weight:600; }} '
+            f'QMenuBar {{ background:transparent; border:none; spacing:2px; }} '
+            f'QMenuBar::item {{ background:transparent; color:{theme.TEXT}; padding:4px 8px; '
+            f'border-radius:4px; }} '
             f'QMenuBar::item:selected {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; }} '
             f'QMenuBar::item:pressed {{ background:{theme.ACCENT}; color:#ffffff; }} '
             f'QMenu {{ background:{theme.PANEL}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:8px; padding:4px; }} '
-            f'QMenu::item {{ background:transparent; padding:8px 24px 8px 14px; border-radius:6px; '
+            f'border-radius:5px; padding:2px; }} '
+            f'QMenu::item {{ background:transparent; padding:5px 18px 5px 10px; border-radius:4px; '
             f'font-size:{theme.CODE_FONT_PT}pt; }} '
             f'QMenu::item:selected {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; }} '
             f'QMenu::item:disabled {{ color:{theme.DIM}; }} '
-            f'QMenu::separator {{ height:1px; background:{theme.BORDER}; margin:4px 8px; }}'
+            f'QMenu::separator {{ height:1px; background:{theme.BORDER}; margin:3px 6px; }}'
         )
         tool_button_style = theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton')
         # back_btn is icon-only now — theme.BUTTON_STYLE's 7px/13px padding (sized for a text

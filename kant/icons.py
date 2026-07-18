@@ -34,7 +34,7 @@ _SVG_BODIES = {
     'terminal': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 16h4"/>',
     'repl': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M6 10l2 2-2 2M10 10l2 2-2 2M14 15h4"/>',
     'warning': '<path d="M12 3L2.5 20h19z"/><path d="M12 9v5M12 17h.01"/>',
-    'debug': '<path d="M8 8h8v9a4 4 0 0 1-8 0zM9 8a3 3 0 0 1 6 0M4 13h4M16 13h4M5 18h3M16 18h3M8 4L6 2M16 4l2-2M12 8v13"/>',
+    'debug': '<path d="M8 8h8v9a4 4 0 0 1-8 0zM9 8a3 3 0 0 1 6 0M5 13h3M16 13h3M9 4L7 2M15 4l2-2"/>',
     'home': '<path d="M3 11l9-8 9 8v10h-6v-6H9v6H3z"/>',
     'sun': '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
     'moon': '<path d="M20 15.5A9 9 0 0 1 8.5 4 9 9 0 1 0 20 15.5z"/>',

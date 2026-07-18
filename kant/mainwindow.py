@@ -700,6 +700,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             btn.clicked.connect(callback)
             layout.addWidget(btn)
             self.action_toolbar_buttons[key] = btn
+            if key == 'run':
+                # what Ctrl+R actually runs is always the whole file, so this names the KANT
+                # parent element (module/class — never a leaf) that identifies whatever's
+                # currently isolated in the coding board; blank whenever that's a leaf, since a
+                # leaf has no run identity of its own
+                self.run_target_label = QLabel('')
+                layout.addWidget(self.run_target_label)
         self.action_toolbar = bar
         self._style_action_toolbar()
         return bar
@@ -711,6 +718,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         for btn in self.action_toolbar_buttons.values():
             btn.setStyleSheet(style)
         self._action_toolbar_separator.setStyleSheet(f'color:{theme.BORDER};')
+        self.run_target_label.setStyleSheet(f'color:{theme.DIM}; font-size:{theme.CODE_FONT_PT - 1}pt; padding-left:2px;')
 
     # [FN CATEGORY] _build_welcome_page — previously had a "+" new-project button floating in its
     # own top_row inside the SAME centered outer layout as the card: since outer.setAlignment
@@ -1363,6 +1371,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.action_toolbar_buttons['find'].setEnabled(has_tab)
         self.action_toolbar_buttons['run'].setEnabled(has_tab)
         self.action_toolbar_buttons['debug'].setEnabled(has_tab)
+        self.run_target_label.setText(self._run_target_text())
         self.title_bar.project_search_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.project_replace_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.git_refresh_menu_action.setEnabled(bool(self.git_root))
@@ -3203,6 +3212,21 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _kant_identity_text(self, tab, fallback_to_top_level=False):
         node = self._kant_identity_node(tab, fallback_to_top_level)
         return f'[{node.tag}] {node.desc or node.name}' if node is not None else None
+
+    # [FN] _run_target_text — KANT "[TAG] name" of whatever Ctrl+R would run, shown next to the
+    # Run button. Only ever names a parent element (one with nested KANT children) since a leaf
+    # has no run identity of its own — blank whenever the coding board is isolated on a leaf.
+    def _run_target_text(self):
+        tab = self.active_tab
+        if tab is None or tab.tree is None:
+            return ''
+        uid = self._active_filter_uid()
+        node = self._find_node_by_uid(tab.tree, uid) if uid else None
+        if node is None:
+            node = next((item for item in tab.tree.body if isinstance(item, Node)), None)
+        if node is None or not any(isinstance(c, Node) for c in node.body):
+            return ''
+        return f'[{node.tag}] {node.name}'
 
     # [FN CATEGORY] _update_tab_title — the main tab is titled by the KANT identity of whatever
     # it's isolated on, or the file's own top-level tag in whole-file view — matching the title

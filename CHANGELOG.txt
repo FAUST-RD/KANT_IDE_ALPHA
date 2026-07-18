@@ -1,5 +1,12 @@
 KANT IDE changelog
 
+2026-07-19 (73)
+- CRT-scanline overlay (entry 70) now runs in night mode too: the line color flips (a faint light pen instead of a faint dark one) instead of the effect just being skipped there.
+- Title-bar dropdown menus pared back from entry 70's bulkier padding/weight to a more minimal look — thinner rows, no bold, softer radius — without dropping any menu entries or the disabled-item graying.
+- Simplified the debug icon's SVG path (fewer legs, no separate body centerline) so it reads at a glance instead of as a cluttered insect.
+- The action toolbar's Run button now shows the KANT "[TAG] name" of whatever parent element the coding board is currently isolated on (module/class, never a leaf, since a leaf has no run identity of its own) — blank in views isolated on a leaf.
+- Night-mode audit pass over this session's UI work: found and fixed one real bug, a hardcoded light-gray divider under the compact leaf header that was wrong (invisible/clashing) against the dark palette — replaced with `theme.BORDER`. Everything else added this session (menu, disabled-item color, pill tabs, loading spinner, ghost text, category-desc position, run-target label) already read live theme colors and needed no changes.
+
 2026-07-19 (72)
 - Left tree's per-row description ("comment") line is now its own, smaller, dedicated font size (`theme.TREE_DETAIL_FONT_PT`) instead of being derived from either the tree's own row font or the coding board's CATEGORY text size.
 - Reverted the AI model/effort selectors' closed face back to compact icon-only (entry 70 made them show text on the closed face too, wider than intended): the closed face stays a narrow icon, only the open dropdown shows full names — now with an explicit minimum popup width so a long model name is never clipped there, regardless of the closed face's own narrow width.
