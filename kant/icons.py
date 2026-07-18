@@ -1,290 +1,70 @@
-"""Small drawn vector icons for toolbar/button chrome — QPainter shapes (not files, not emoji),
-matching the same custom-painted-badge convention already used for MAPPA's pin/eye markers.
-Kept in its own module (not theme.py) so theme.py stays importable by non-Qt modules
-(projectops.py) without pulling PySide6 into a deterministic-scan code path.
-"""
-import math
+"""Central monochrome SVG icons used by KANT IDE chrome."""
 
-from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from html import escape
+
+from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtGui import QIcon, QPainter, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 
 from kant import theme
 
 
-# [FN CATEGORY] draw_icon — every shape is drawn fresh into a small QPixmap at call time (cheap,
-# no asset files, always matches the current theme's color); pen width scales with the icon's own
-# `size` so it looks consistent whether it's rendered at 14px or 20px.
-# [FN] draw_icon — renders one named icon shape as a QIcon
+# [CST CATEGORY] _SVG_BODIES — compact Lucide-style paths keep every IDE icon on one visual grid;
+# the wrapper in draw_icon supplies the live theme color, stroke and dimensions.
+# [CST] _SVG_BODIES — SVG fragments keyed by the public draw_icon names
+# [CST OPEN] _SVG_BODIES
+_SVG_BODIES = {
+    'arrow-left': '<path d="M15 18l-6-6 6-6"/>',
+    'arrow-right': '<path d="M9 18l6-6-6-6"/>',
+    'arrow-up': '<path d="M18 15l-6-6-6 6"/>',
+    'arrow-down': '<path d="M6 9l6 6 6-6"/>',
+    'run': '<path d="M6 4l14 8-14 8z"/>',
+    'save': '<path d="M5 3h12l2 2v16H5z"/><path d="M8 3v6h8V3M8 21v-7h8v7"/>',
+    'undo': '<path d="M9 7L4 12l5 5"/><path d="M5 12h8a6 6 0 0 1 6 6"/>',
+    'redo': '<path d="M15 7l5 5-5 5"/><path d="M19 12h-8a6 6 0 0 0-6 6"/>',
+    'find': '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/>',
+    'format': '<path d="M4 6h16M4 12h11M4 18h14"/>',
+    'target': '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/>',
+    'flame': '<path d="M12 22c4 0 7-3 7-7 0-3-2-6-5-10 0 4-2 5-3 7-1-2-2-3-2-5-3 3-4 6-4 9 0 3 3 6 7 6z"/>',
+    'swap': '<path d="M4 7h14l-3-3M20 17H6l3 3"/>',
+    'nest': '<rect x="3" y="3" width="18" height="18" rx="2"/><rect x="8" y="8" width="8" height="8" rx="1"/>',
+    'globe': '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+    'expand': '<path d="M9 3H3v6M15 3h6v6M9 21H3v-6M15 21h6v-6"/>',
+    'collapse': '<path d="M3 9h6V3M21 9h-6V3M3 15h6v6M21 15h-6v6"/>',
+    'terminal': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 16h4"/>',
+    'repl': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M6 10l2 2-2 2M10 10l2 2-2 2M14 15h4"/>',
+    'warning': '<path d="M12 3L2.5 20h19z"/><path d="M12 9v5M12 17h.01"/>',
+    'debug': '<path d="M8 8h8v9a4 4 0 0 1-8 0zM9 8a3 3 0 0 1 6 0M4 13h4M16 13h4M5 18h3M16 18h3M8 4L6 2M16 4l2-2M12 8v13"/>',
+    'home': '<path d="M3 11l9-8 9 8v10h-6v-6H9v6H3z"/>',
+    'sun': '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+    'moon': '<path d="M20 15.5A9 9 0 0 1 8.5 4 9 9 0 1 0 20 15.5z"/>',
+    'attach': '<path d="M21 11.5l-8.8 8.8a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/>',
+    'model': '<rect x="5" y="5" width="14" height="14" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>',
+    'effort': '<path d="M4 18a8 8 0 1 1 16 0"/><path d="M12 18l4-7M7 18h10"/>',
+    'kant': '<path d="M7 3v18M18 3L7 13M11 10l8 11"/>',
+    'grid': '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+    'pin': '<path d="M9 3h6l-1 6 3 3H7l3-3zM12 12v9"/>',
+    'close': '<path d="M6 6l12 12M18 6L6 18"/>',
+}
+# [CST CLOSED] _SVG_BODIES
+
+
+# [FN CATEGORY] draw_icon — renders one central SVG fragment into a transparent QIcon; omitted
+# colors follow normal text by day and the requested gold accent in night mode.
+# [FN] draw_icon — renders one named, theme-aware SVG icon
 # [FN OPEN] draw_icon
 def draw_icon(kind, size=16, color=None):
-    color = color or theme.TEXT
-    pm = QPixmap(size, size)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    p.setPen(Qt.NoPen)
-    p.setBrush(QColor(color))
-    m = size * 0.22
-    mid = size / 2
-
-    if kind in ('arrow-left', 'arrow-right', 'arrow-up', 'arrow-down'):
-        path = QPainterPath()
-        if kind == 'arrow-left':
-            path.moveTo(size - m, m); path.lineTo(m, mid); path.lineTo(size - m, size - m)
-        elif kind == 'arrow-right':
-            path.moveTo(m, m); path.lineTo(size - m, mid); path.lineTo(m, size - m)
-        elif kind == 'arrow-up':
-            path.moveTo(m, size - m); path.lineTo(mid, m); path.lineTo(size - m, size - m)
-        else:
-            path.moveTo(m, m); path.lineTo(mid, size - m); path.lineTo(size - m, m)
-        path.closeSubpath()
-        p.drawPath(path)
-
-    elif kind == 'run':
-        path = QPainterPath()
-        path.moveTo(m + 1, m * 0.7); path.lineTo(size - m + 1, mid); path.lineTo(m + 1, size - m * 0.7)
-        path.closeSubpath()
-        p.drawPath(path)
-
-    elif kind == 'save':
-        outer = m * 0.6
-        p.drawRoundedRect(QRectF(outer, outer, size - 2 * outer, size - 2 * outer), 2, 2)
-        p.setBrush(Qt.transparent)
-        p.setPen(QColor(theme.BG))
-        inner = size * 0.32
-        p.drawRect(QRectF(mid - inner / 2, outer + 1, inner, size * 0.24))
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(theme.BG))
-        p.drawRect(QRectF(outer + 2, size - outer - size * 0.3, size - 2 * outer - 4, size * 0.18))
-
-    elif kind in ('undo', 'redo'):
-        radius = size * 0.32
-        rect = QRectF(mid - radius, mid - radius, radius * 2, radius * 2)
-        p.setBrush(Qt.transparent)
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.13)
-        p.setPen(pen)
-        start_angle = 200 if kind == 'undo' else -20
-        span = 220 if kind == 'undo' else -220
-        p.drawArc(rect, start_angle * 16, span * 16)
-        head_angle = math.radians(start_angle + span)
-        hx, hy = mid + radius * math.cos(head_angle), mid - radius * math.sin(head_angle)
-        tangent = head_angle + math.radians(90 if kind == 'undo' else -90)
-        dx, dy = math.cos(tangent), -math.sin(tangent)
-        hs = size * 0.16
-        head = QPainterPath()
-        head.moveTo(hx + dy * hs, hy + dx * hs)
-        head.lineTo(hx - dy * hs, hy - dx * hs)
-        head.lineTo(hx + dx * hs * 1.4, hy - dy * hs * 1.4)
-        head.closeSubpath()
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(color))
-        p.drawPath(head)
-
-    elif kind == 'find':
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.14)
-        p.setPen(pen)
-        p.setBrush(Qt.transparent)
-        r = size * 0.28
-        cx, cy = mid - size * 0.08, mid - size * 0.08
-        p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
-        p.drawLine(int(cx + r * 0.7), int(cy + r * 0.7), int(size - m * 0.6), int(size - m * 0.6))
-
-    elif kind == 'format':
-        widths = (0.8, 0.55, 0.7)
-        bar_h = size * 0.12
-        gap = size * 0.2
-        top = mid - (bar_h * 3 + gap * 2) / 2
-        for i, w in enumerate(widths):
-            p.drawRoundedRect(QRectF(m * 0.6, top + i * (bar_h + gap), (size - 2 * m * 0.6) * w, bar_h), 1, 1)
-
-    elif kind == 'target':  # isolate
-        p.setBrush(Qt.transparent)
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.11)
-        p.setPen(pen)
-        p.drawEllipse(QRectF(m * 0.7, m * 0.7, size - 1.4 * m, size - 1.4 * m))
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(color))
-        r = size * 0.13
-        p.drawEllipse(QRectF(mid - r, mid - r, r * 2, r * 2))
-
-    elif kind == 'flame':  # heatmap
-        path = QPainterPath()
-        path.moveTo(mid, m * 0.6)
-        path.cubicTo(size - m * 0.9, mid * 0.7, size - m * 0.7, size - m * 0.8, mid, size - m * 0.5)
-        path.cubicTo(m * 0.7, size - m * 0.8, m * 0.9, mid * 0.7, mid, m * 0.6)
-        p.drawPath(path)
-
-    elif kind == 'swap':  # direction toggle
-        head = size * 0.16
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.11)
-        p.setPen(pen)
-        p.drawLine(int(m * 0.6), int(mid - size * 0.12), int(size - m * 0.6), int(mid - size * 0.12))
-        p.drawLine(int(m * 0.6), int(mid + size * 0.12), int(size - m * 0.6), int(mid + size * 0.12))
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(color))
-        left_head = QPainterPath()
-        left_head.moveTo(m * 0.6 + head, mid - size * 0.12 - head * 0.7)
-        left_head.lineTo(m * 0.6, mid - size * 0.12)
-        left_head.lineTo(m * 0.6 + head, mid - size * 0.12 + head * 0.7)
-        left_head.closeSubpath()
-        p.drawPath(left_head)
-        right_head = QPainterPath()
-        right_head.moveTo(size - m * 0.6 - head, mid + size * 0.12 - head * 0.7)
-        right_head.lineTo(size - m * 0.6, mid + size * 0.12)
-        right_head.lineTo(size - m * 0.6 - head, mid + size * 0.12 + head * 0.7)
-        right_head.closeSubpath()
-        p.drawPath(right_head)
-
-    elif kind == 'nest':  # containment
-        p.setBrush(Qt.transparent)
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.1)
-        p.setPen(pen)
-        p.drawRoundedRect(QRectF(m * 0.5, m * 0.5, size - m, size - m), 2, 2)
-        inner = size * 0.32
-        p.drawRoundedRect(QRectF(mid - inner / 2, mid - inner / 2, inner, inner), 1, 1)
-
-    elif kind == 'globe':  # scope toggle (GLOBAL)
-        p.setBrush(Qt.transparent)
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.1)
-        p.setPen(pen)
-        r = size * 0.36
-        p.drawEllipse(QRectF(mid - r, mid - r, r * 2, r * 2))
-        p.drawEllipse(QRectF(mid - r * 0.45, mid - r, r * 0.9, r * 2))
-        p.drawLine(int(mid - r), int(mid), int(mid + r), int(mid))
-
-    elif kind in ('expand', 'collapse'):
-        _corner_arrows(p, size, color, outward=(kind == 'expand'))
-
-    elif kind == 'terminal':
-        p.setBrush(Qt.transparent)
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.1)
-        p.setPen(pen)
-        p.drawRoundedRect(QRectF(m * 0.4, m * 0.7, size - m * 0.8, size - m * 1.4), 2, 2)
-        pen.setWidthF(size * 0.13)
-        p.setPen(pen)
-        p.drawLine(int(m * 1.1), int(mid - size * 0.05), int(mid - size * 0.05), int(mid + size * 0.08))
-        p.drawLine(int(m * 1.1), int(mid + size * 0.21), int(mid - size * 0.05), int(mid + size * 0.08))
-        p.drawLine(int(mid + size * 0.02), int(size - m * 1.1), int(size - m * 1.1), int(size - m * 1.1))
-
-    elif kind == 'repl':  # python/interactive terminal — ">>>" prompt glyph
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.11)
-        p.setPen(pen)
-        p.setBrush(Qt.transparent)
-        for i in range(3):
-            x0 = m * 0.5 + i * size * 0.24
-            p.drawLine(int(x0), int(mid - size * 0.16), int(x0 + size * 0.14), int(mid))
-            p.drawLine(int(x0), int(mid + size * 0.16), int(x0 + size * 0.14), int(mid))
-
-    elif kind == 'warning':
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.09)
-        p.setPen(pen)
-        p.setBrush(Qt.transparent)
-        path = QPainterPath()
-        path.moveTo(mid, m * 0.5)
-        path.lineTo(size - m * 0.5, size - m * 0.6)
-        path.lineTo(m * 0.5, size - m * 0.6)
-        path.closeSubpath()
-        p.drawPath(path)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(color))
-        p.drawRoundedRect(QRectF(mid - size * 0.05, mid - size * 0.12, size * 0.1, size * 0.24), 1, 1)
-        r = size * 0.055
-        p.drawEllipse(QRectF(mid - r, size - m * 0.95, r * 2, r * 2))
-
-    elif kind == 'debug':
-        # a simple ladybug glyph (oval body + antennae + three legs per side) — the common
-        # "debug" shorthand across IDEs, distinct enough from 'run' (a plain play triangle) at a
-        # glance even at small sizes
-        p.setBrush(QColor(color))
-        body_w, body_h = size * 0.42, size * 0.56
-        p.drawEllipse(QRectF(mid - body_w / 2, mid - body_h / 2, body_w, body_h))
-        p.setBrush(Qt.transparent)
-        pen = QPen(QColor(color))
-        pen.setWidthF(max(1.0, size * 0.07))
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        top = mid - body_h / 2
-        for dx, dy in ((-1, -1), (-1, 0), (-1, 1), (1, -1), (1, 0), (1, 1)):
-            p.drawLine(
-                int(mid + dx * body_w * 0.45), int(mid + dy * body_h * 0.28),
-                int(mid + dx * body_w * 0.9), int(mid + dy * body_h * 0.42),
-            )
-        p.drawLine(int(mid - body_w * 0.18), int(top), int(mid - body_w * 0.35), int(top - size * 0.12))
-        p.drawLine(int(mid + body_w * 0.18), int(top), int(mid + body_w * 0.35), int(top - size * 0.12))
-
-    elif kind == 'home':
-        # outline-only (like target/nest/warning above), not a solid fill — a filled silhouette's
-        # door would need to be cut out in the exact backdrop color, which varies with theme/hover
-        # state; an outline never has that problem
-        p.setBrush(Qt.transparent)
-        pen = QPen(QColor(color))
-        pen.setWidthF(size * 0.1)
-        p.setPen(pen)
-        house = QPainterPath()
-        house.moveTo(mid, m * 0.4)
-        house.lineTo(size - m * 0.4, mid * 0.9)
-        house.lineTo(size - m * 0.4, size - m * 0.5)
-        house.lineTo(m * 0.4, size - m * 0.5)
-        house.lineTo(m * 0.4, mid * 0.9)
-        house.closeSubpath()
-        p.drawPath(house)
-        door_w, door_h = size * 0.22, size * 0.32
-        p.drawRect(QRectF(mid - door_w / 2, size - m * 0.5 - door_h, door_w, door_h))
-
-    elif kind == 'sun':
-        p.setBrush(QColor(color))
-        r = size * 0.2
-        p.drawEllipse(QRectF(mid - r, mid - r, r * 2, r * 2))
-        pen = QPen(QColor(color))
-        pen.setWidthF(max(1.2, size * 0.08))
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        inner, outer = r + size * 0.07, r + size * 0.07 + size * 0.13
-        for angle_deg in range(0, 360, 45):
-            angle = math.radians(angle_deg)
-            p.drawLine(
-                int(mid + inner * math.cos(angle)), int(mid + inner * math.sin(angle)),
-                int(mid + outer * math.cos(angle)), int(mid + outer * math.sin(angle)),
-            )
-
-    elif kind == 'moon':
-        # a crescent (full circle minus an offset smaller circle) rather than a filled disc — the
-        # one shape unambiguously read as "moon" instead of "sun" or "dot" at a glance
-        p.setBrush(QColor(color))
-        r = size * 0.3
-        full = QPainterPath()
-        full.addEllipse(QRectF(mid - r, mid - r, r * 2, r * 2))
-        cut_r = r * 0.82
-        cut = QPainterPath()
-        cut.addEllipse(QRectF(mid - cut_r + r * 0.5, mid - cut_r - r * 0.12, cut_r * 2, cut_r * 2))
-        p.drawPath(full.subtracted(cut))
-
-    p.end()
-    return QIcon(pm)
+    color = color or (theme.ACCENT if theme.NIGHT else theme.TEXT)
+    body = _SVG_BODIES.get(kind, _SVG_BODIES['warning'])
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+        f'fill="none" stroke="{escape(color)}" stroke-width="2" '
+        f'stroke-linecap="round" stroke-linejoin="round">{body}</svg>'
+    )
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    QSvgRenderer(QByteArray(svg.encode('utf-8'))).render(painter)
+    painter.end()
+    return QIcon(pixmap)
 # [FN CLOSED] draw_icon
-
-
-def _corner_arrows(p, size, color, outward):
-    m = size * 0.2
-    arm = size * 0.22
-    p.setPen(Qt.NoPen)
-    p.setBrush(QColor(color))
-    corners = [(m, m, 1, 1), (size - m, m, -1, 1), (m, size - m, 1, -1), (size - m, size - m, -1, -1)]
-    for x, y, sx, sy in corners:
-        path = QPainterPath()
-        if outward:
-            path.moveTo(x, y); path.lineTo(x + sx * arm, y); path.lineTo(x, y + sy * arm)
-        else:
-            tx, ty = x - sx * arm * 0.6, y - sy * arm * 0.6
-            path.moveTo(tx, ty); path.lineTo(tx + sx * arm, ty); path.lineTo(tx, ty + sy * arm)
-        path.closeSubpath()
-        p.drawPath(path)

@@ -4,14 +4,15 @@ import sys
 import traceback
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QMessageBox, QProxyStyle, QStyle
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMessageBox, QProxyStyle, QSplashScreen, QStyle
 
 from kant.model import parse_kant, serialize_kant, read_top_level_label_result, Node, KantParseError
 from kant.fileio import is_safe_child_name
 from kant.syntax import check_syntax, check_kant_markers
 from kant.xref import build_xref
 from kant.gitutil import parse_git_status
-from kant.widgets import make_app_icon, CodeEdit
+from kant.widgets import make_app_icon, make_app_pixmap, CodeEdit
 from kant.mainwindow import MainWindow
 
 
@@ -232,14 +233,27 @@ def _self_check():
 # [FN CLOSED] _self_check
 
 
+# [FN CATEGORY] _make_splash — the native Qt splash reuses the bundled app logo and stays above
+# startup work; QSplashScreen.finish closes it only after the main window is visible.
+# [FN] _make_splash — builds the large startup logo window
+# [FN OPEN] _make_splash
+def _make_splash():
+    return QSplashScreen(make_app_pixmap(320), Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+# [FN CLOSED] _make_splash
+
+
 def main():
     _install_crash_handler()
-    _self_check()
     app = QApplication(sys.argv)
     app.setStyle(_HoverDelayStyle(app.style()))
     app.setWindowIcon(make_app_icon())
+    splash = _make_splash()
+    splash.show()
+    app.processEvents()
+    _self_check()
     window = MainWindow()
     window.show()
+    splash.finish(window)
     sys.exit(app.exec())
 
 

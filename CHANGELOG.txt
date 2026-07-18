@@ -1,5 +1,33 @@
 KANT IDE changelog
 
+2026-07-19 (69)
+- Effort selector now color-codes each level (green low, gold medium, orange high, red xhigh/max, purple ultracode/ultra) instead of one flat icon for every level — the combo's closed face always shows its current item's own icon, so the selected effort reads at a glance.
+- The "+ Aggiungi un elemento" card at the bottom of the whole-file KANT outline now sits behind a clear divider line instead of a bare top margin, so it doesn't read as attached to whatever leaf element happens to be the last one rendered above it.
+- Added a very faint horizontal-scanline texture (old CRT look) over the AI chat pane's background, day mode only — a real `background-image` QSS layer turned out to not alpha-composite over `background-color` at all in PySide6 (a fully opaque test tile rendered, anything with transparency silently didn't), so this is a direct `QPainter` overlay (`_ScanlineWidget`) instead.
+- MAPPA's node layout now animates smoothly when the graph is refreshed for the same project (e.g. a newly detected element after an xref rebuild) instead of snapping instantly — `set_graph` now requests the same `relayout_to` transition every filter/isolate action already used, reserving the instant path for a genuinely new project or the very first render.
+- The app-close confirmation ("Sei sicuro di voler chiudere KANT IDE?") is now a distinct red/danger dialog (new `theme.DANGER`) instead of sharing the same gold accent as ordinary on-brand confirmations — thicker red border, red heading, and the "Si" button itself turns red on hover.
+- Fixed squashed/overlapping rows in the Incoming/Outgoing panel: the row's `QListWidgetItem.setSizeHint` was computed from an unparented `QLabel`'s unreliable `sizeHint()`, with no allowance for the list item's own QSS padding eating into (not adding to) that already-too-tight box.
+- The left tree's tag-colored pill loses its background fill in compact/list-style mode by design (too heavy for a dense list) — it now keeps a thin colored underline instead of losing the color entirely.
+- "Verifica KANT" validation results were already project-wide (not scoped to the open file); clicking one now resolves and scrolls to the actual containing KANT element via `parse_kant`'s `open_line`/`closed_line` span tracking, instead of `_goto_line`'s block-counting walk — which only ever saw each element's own Run body and had no idea about the CATEGORY/tagline/OPEN/CLOSED marker lines between elements, so it drifted further off the real position the deeper into the file an error sat.
+- `claude_tab_btn` (the AI pane's collapse/expand handle) is now a true pill (rounded on all sides, radius = half its width) centered ON the splitter seam instead of flush against it — half over the coding board, half over the AI pane — and switches from a subdued outline to a solid accent fill only while the pane is fully collapsed, so it reads as a "pull me back out" handle exactly when that's the only way back in. `map_tab_btn` got the matching treatment for its own closed/open states.
+
+2026-07-19 (68)
+- Simplified the project-view bar: removed “Vista”, renamed “Codice” to “KANT”, separated “Gruppi”, and added a four-square toggle for a compact expandable KANT tree alongside the existing block view.
+
+2026-07-19 (67)
+- Added a native startup splash showing the bundled app logo at 320 px from process start until the main window becomes visible.
+
+2026-07-18 (66)
+- Completed new-element KANT scaffolding (CATEGORY/tag/OPEN/code/CLOSED, with the description required from the dialog) and ensured isolated leaf views never retain the whole-file “add element” control.
+- Replaced IDE chrome glyphs with a central monochrome SVG set, gold by default at night; fixed coding-tab theme refresh, flipped the MAPPA handle arrow while open, and kept KANT references in the shared tag palette/monospace treatment.
+- Modernized the AI pane with compact SVG model/effort selectors, a sober attachment icon, clearer prompt placeholder, and gold primary actions. Added a dedicated K-icon terminal page for KANT validation errors.
+
+2026-07-18 (65)
+- Limited automated testing to Windows for now: removed the Ubuntu and macOS GitHub Actions matrix jobs, the now-unused Linux Qt runtime installation step, and the macOS-specific missing-temp-directory regression test.
+
+2026-07-18 (64)
+- Unified file-parent and element-child previews into one visible coding-board slot. Opening an unpinned child now hides its unpinned parent tab; opening any other parent or child replaces the current unpinned preview. Only pressing pin makes a tab persist. A hidden parent `FileTab` remains solely as the child's shared source/undo/save model, and pending edits are flushed before its final replacement.
+
 2026-07-18 (63)
 - Code-review pass (bugs + performance leaks) on the hardening pass from entry 62, plus two independently reported real-usage bugs. Fixed:
   - `resolved()`'s AI-review apply branch (kant/workspace.py) was hand-rolling a partial reimplementation of validation instead of reusing `_validate_kant_project()`: it used a stale `kant_map_path` (a map created moments ago by the review itself wasn't seen), self-healed on the wrong map-state condition, and silently dropped every `audit_kant_headers` warning from the chat output. Now delegates to `_validate_kant_project(extra_sync_states=...)` (new parameter), which also generates the map on a first-ever apply.

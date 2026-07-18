@@ -52,6 +52,7 @@ Required invariants:
 - Marker raw text and ordering remain authoritative for serialization.
 - A legacy file without stable IDs can receive new UIDs on each parse. Tree and xref navigation therefore fall back to pre-order document position when a stored UID misses.
 - `FileTab` owns dirty/undo/autosave state; `MainWindow` renders and routes edits but does not duplicate the source model.
+- File and element views share one visible unpinned preview slot. A child may keep its parent `FileTab` hidden as its model, but no visible tab survives navigation unless the user explicitly pins it.
 
 ## Filesystem and AI safety
 
@@ -78,6 +79,7 @@ The project tree, syntax status, Git badges, generated KANT map, and xref graph 
 - Expensive project scans run through `_run_background`; Qt objects are updated only in the completion callback.
 - Filesystem watcher events distinguish clean tabs (reload) from dirty tabs (explicit conflict decision).
 - Theme values are mutable module globals. Consumers read `theme.<NAME>` at use time; importing individual colors would make runtime theme changes stale.
+- Interface icons come from `icons.draw_icon`; they are monochrome SVG paths and are regenerated on theme changes (gold by default at night).
 
 ## Cross-references and MAPPA
 

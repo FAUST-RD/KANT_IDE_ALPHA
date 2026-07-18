@@ -25,7 +25,6 @@ import kant_editor
 from kant import theme
 from kant import mainwindow as kant_mainwindow_module
 from kant import widgets as kant_widgets_module
-from kant import fileio as kant_fileio_module
 from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT, ROLE_LINE, ROLE_KEY
 from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, build_new_element_node, parse_kant, serialize_kant, read_top_level_label_result
@@ -54,7 +53,6 @@ from kant.permission_mcp import handle_message
 from kant.groupings import load_groupings, new_grouping, save_groupings
 from kant.syntax import audit_kant_headers, check_kant_markers
 from kant.projectops import _canonical_map_text, build_kant_map, validate_kant_project
-from kant.fileio import safe_mkstemp, safe_mkdtemp
 
 
 class LabelStub:
@@ -250,6 +248,10 @@ class KantSmokeTest(unittest.TestCase):
         pane = window.claude_pane
         pane.set_agent('claude')
         assert not pane.model_select.isEditable() and not pane.effort_select.isEditable()
+        assert pane.model_select.width() == 44 and pane.effort_select.width() == 44
+        assert not pane.model_select.itemIcon(0).isNull() and not pane.effort_select.itemIcon(0).isNull()
+        assert pane.attach_btn.text() == '' and not pane.attach_btn.icon().isNull()
+        assert 'analizza il codice' in pane.prompt.placeholderText()
         # effort options sync per agent, same shape as the existing model selector
         assert pane.effort_select.currentText() == MODEL_DEFAULT
         claude_efforts = [pane.effort_select.itemText(i) for i in range(pane.effort_select.count())]
@@ -298,6 +300,11 @@ class KantSmokeTest(unittest.TestCase):
         window._switch_terminal_tab(2)
         assert window.terminal_stack.currentIndex() == 2
         assert window.terminal_stack.currentWidget() is window.errors_view
+        assert window.terminal_sidebar_group.button(3).property('kantIcon') == 'kant'
+        window._show_validation_results(['sample.py: errore KANT'], [])
+        assert window.terminal_stack.currentWidget() is window.kant_errors_view
+        assert window.terminal_sidebar_group.button(3).isChecked()
+        assert 'errore KANT' in window.kant_errors_view.topLevelItem(0).child(0).text(0)
 
         # the errors tab mirrors whatever _apply_syntax_status just decided for the active file —
         # exercised directly here with a synthetic bad result, same as a real failed local check
@@ -618,6 +625,47 @@ class KantSmokeTest(unittest.TestCase):
         window._toggle_theme()  # back to the original theme, tidy for anything after this test
         window.close()
 
+    def test_kant_view_bar_and_compact_tree_toggle(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            source = _write_app_py(project)
+            source.write_text('\n'.join([
+                '# [MOD OPEN #m1] app.py',
+                '# [FN OPEN #f1] helper', 'def helper(): pass', '# [FN CLOSED #f1] helper',
+                '# [MOD CLOSED #m1] app.py',
+            ]), encoding='utf-8')
+            window = MainWindow()
+            window.project_root_path = str(project)
+            window.git_root = None
+            window.git_status = {}
+            window._rebuild_tree(refresh_git=False)
+            window.stack.setCurrentIndex(1)
+            window._set_project_chrome_visible(True)
+            window.show()
+            QApplication.processEvents()
+
+            assert window.code_view_btn.text() == 'KANT'
+            assert not any(label.text() == 'Vista' for label in window.view_mode_bar.findChildren(QLabel))
+            assert window.groups_view_btn.x() - (window.file_view_btn.x() + window.file_view_btn.width()) >= 14
+            assert window.compact_kant_btn.x() > window.groups_view_btn.x()
+            assert window.compact_kant_btn.property('kantIcon') == 'grid' and not window.compact_kant_btn.icon().isNull()
+
+            file_item = window.tree.topLevelItem(0)
+            assert file_item.data(0, ROLE_PATH) == str(source)
+            assert window.tree.itemWidget(file_item, 0).wordWrap()
+            assert file_item.childCount() > 0
+
+            window.compact_kant_btn.click()
+            QApplication.processEvents()
+            compact_item = window.tree.topLevelItem(0)
+            assert window.compact_kant_view and window.compact_kant_btn.isChecked()
+            assert not window.tree.itemWidget(compact_item, 0).wordWrap()
+            assert compact_item.childCount() > 0  # same native expandable hierarchy
+            assert 'padding:2px' in window.tree.styleSheet()
+
+            window.compact_kant_btn.click()
+            window.close()
+
     def test_vim_mode_disabled_by_default(self):
         # regression: _VIM_MODE_ENABLED defaulted to True (left over from developing the vim
         # keybindings feature) — a fresh install/launch had modal editing on unasked, on request
@@ -640,13 +688,34 @@ class KantSmokeTest(unittest.TestCase):
             window._ide_yes_no = lambda *a, **k: False
             window._open_project_folder(str(project))
 
+            if window.night_mode:
+                window._toggle_theme()
+            assert window._open_file(str(project / 'a.py'))
+            tab = window.open_tabs[str(project / 'a.py')]
+            module = next(item for item in tab.tree.body if isinstance(item, Node))
+            window._show_element_tab(tab, module.uid)
+            element_page = window.tabs.currentWidget()
+            window._pin_element_page(element_page)
+
             window._toggle_theme()
             assert theme.CODE_BG in window.python_terminal.styleSheet()
             assert theme.CODE_BG in window.terminal.styleSheet()
             assert window._add_row_button_style() == window.add_file_btn.styleSheet()
             assert window._add_row_button_style() == window.add_grouping_btn.styleSheet()
+            assert theme.ACCENT in window.claude_pane.title.styleSheet()
+            assert theme.ACCENT in window.claude_pane.send_btn.styleSheet()
+            assert f'border-bottom:2px solid {theme.ACCENT}' in window.tabs.tabBar().styleSheet()
+            assert f'background-color:{theme.NIGHT_TAG_BACKGROUNDS["MOD"]}' in element_page._tab_label.text()
 
-            window._toggle_theme()  # back to the original theme, tidy for anything after this test
+            image = window.action_toolbar_buttons['save'].icon().pixmap(18, 18).toImage()
+            assert any(
+                image.pixelColor(x, y).name().lower() == theme.ACCENT.lower()
+                for x in range(image.width()) for y in range(image.height())
+                if image.pixelColor(x, y).alpha()
+            )
+
+            if window.night_mode:
+                window._toggle_theme()  # back to day, tidy for anything after this test
             window.close()
 
     def test_welcome_theme_toggle_button_flips_mode_and_stays_pinned_to_corner(self):
@@ -705,7 +774,7 @@ class KantSmokeTest(unittest.TestCase):
             )
             assert not file_item.isExpanded()
             assert 'ERRORI' in tree_window._validate_kant_project()
-            assert tree_window.results_view.topLevelItemCount() == 1
+            assert tree_window.kant_errors_view.topLevelItemCount() == 1
             assert tree_window._open_file(str(source))
             opened_tab = tree_window.open_tabs[str(source)]
             source.write_text(source.read_text(encoding='utf-8').replace('print(1)', 'print(9)'), encoding='utf-8')
@@ -891,7 +960,7 @@ class KantSmokeTest(unittest.TestCase):
             main_filter_before = legacy_tab.filter_uid
             tab_count_before = tree_window.tabs.count()
             tree_window._on_tree_item_clicked(alpha_section, 0)
-            assert tree_window.tabs.count() == tab_count_before + 1
+            assert tree_window.tabs.count() == tab_count_before  # replaces the unrelated unpinned preview
             assert legacy_tab.filter_uid == main_filter_before  # main pane untouched
             alpha_page = tree_window.tabs.currentWidget()
             assert '[FN]' in alpha_page._tab_label.text() and 'alpha' in alpha_page._tab_label.text()
@@ -901,7 +970,7 @@ class KantSmokeTest(unittest.TestCase):
 
             # double-clicking the SAME element again switches to its existing tab, no duplicate
             tree_window._on_tree_item_double_clicked(alpha_section, 0)
-            assert tree_window.tabs.count() == tab_count_before + 1
+            assert tree_window.tabs.count() == tab_count_before
             assert tree_window.tabs.currentWidget() is alpha_page
 
             # alpha's tab is still the one reusable "preview" tab (VS Code-style: a single click
@@ -912,7 +981,7 @@ class KantSmokeTest(unittest.TestCase):
 
             # a DIFFERENT element (same parent module) opens its own tab alongside the first
             tree_window._on_tree_item_clicked(beta_section, 0)
-            assert tree_window.tabs.count() == tab_count_before + 2
+            assert tree_window.tabs.count() == tab_count_before + 1
             beta_page = tree_window.tabs.currentWidget()
             assert '[FN]' in beta_page._tab_label.text() and 'beta' in beta_page._tab_label.text()
             assert tree_window.active_tab is legacy_tab and tree_window._active_filter_uid() == beta_page._element_key[1]
@@ -981,6 +1050,7 @@ class KantSmokeTest(unittest.TestCase):
             # the MAPPA tab sits centered on the dialog's own top edge while open (pointing down
             # at the map content below it), not the shell's bottom edge (already the title/toolbar)
             assert mappa_window.map_tab_btn.parent() is dialog
+            assert mappa_window.map_tab_btn.property('kantIcon') == 'arrow-down'
             assert mappa_window.map_tab_btn.y() == 0
             expected_x = (dialog.width() - mappa_window.map_tab_btn.width()) // 2
             assert abs(mappa_window.map_tab_btn.x() - expected_x) <= 1
@@ -993,6 +1063,7 @@ class KantSmokeTest(unittest.TestCase):
             app.processEvents()
             # closed, the tab goes back to the shell's own bottom edge instead
             assert mappa_window.map_tab_btn.parent() is mappa_window.shell
+            assert mappa_window.map_tab_btn.property('kantIcon') == 'arrow-up'
             assert mappa_window.map_tab_btn.y() == mappa_window.shell.height() - mappa_window.map_tab_btn.height()
             # must stay above the MAPPA toolbar's own minimum content width (many buttons), same
             # constraint as window_width_at_show above, or Qt can't honor the narrower resize
@@ -1321,44 +1392,11 @@ class KantSmokeTest(unittest.TestCase):
         pixmap = make_app_pixmap(76)
         assert not pixmap.isNull() and pixmap.width() == 76 and pixmap.height() == 76
 
-    def test_safe_mkstemp_and_mkdtemp_fall_back_on_missing_base_tempdir(self):
-        # regression for a real macOS CI failure: kant/aipermissions.py's write_permission_config
-        # calls tempfile.mkstemp() directly on every single `claude` chat message, with no
-        # fallback — the same transient "base temp dir doesn't exist" issue entries 52/55 already
-        # worked around in test_kant_smoke.py's own _temp_dir()/_mkdtemp_safe and
-        # kant/workspace.py's create_snapshot, just never fixed at its actual application-code
-        # source. safe_mkstemp/safe_mkdtemp (kant/fileio.py) are the shared fix; this simulates the
-        # transient failure directly rather than needing a real broken tempdir to reproduce it.
-        original_mkstemp = kant_fileio_module.tempfile.mkstemp
-        original_mkdtemp = kant_fileio_module.tempfile.mkdtemp
-
-        # only the FIRST call (no explicit dir=, i.e. the default system tempdir) simulates the
-        # transient failure — safe_mkstemp/mkdtemp's own retry passes a real, just-created
-        # fallback dir, which must actually succeed for real, not be swallowed by this stub too
-        def broken_mkstemp(**kwargs):
-            if kwargs.get('dir') is None:
-                raise FileNotFoundError('simulated: base temp dir transiently missing')
-            return original_mkstemp(**kwargs)
-
-        def broken_mkdtemp(**kwargs):
-            if kwargs.get('dir') is None:
-                raise FileNotFoundError('simulated: base temp dir transiently missing')
-            return original_mkdtemp(**kwargs)
-
-        kant_fileio_module.tempfile.mkstemp = broken_mkstemp
-        kant_fileio_module.tempfile.mkdtemp = broken_mkdtemp
-        try:
-            fd, path = safe_mkstemp(prefix='.kant-test-', suffix='.tmp')
-            os.close(fd)
-            assert os.path.isfile(path)
-            os.remove(path)
-
-            tmp_dir = safe_mkdtemp(prefix='kant-test-')
-            assert os.path.isdir(tmp_dir)
-            os.rmdir(tmp_dir)
-        finally:
-            kant_fileio_module.tempfile.mkstemp = original_mkstemp
-            kant_fileio_module.tempfile.mkdtemp = original_mkdtemp
+        splash = kant_editor._make_splash()
+        splash.show()
+        QApplication.processEvents()
+        assert splash.isVisible() and splash.pixmap().width() == 320
+        splash.close()
 
     def test_xref_edges_ignore_comments_and_strings(self):
         xref_tree = parse_kant('\n'.join([
@@ -1397,6 +1435,8 @@ class KantSmokeTest(unittest.TestCase):
             # module's own empty direct incoming/outgoing
             assert io_window.incoming_view.count() == 1 and 'helper' in io_window.incoming_view.item(0).text()
             assert io_window.outgoing_view.count() == 1 and 'helper' in io_window.outgoing_view.item(0).text()
+            incoming_label = io_window.incoming_view.itemWidget(io_window.incoming_view.item(0))
+            assert '[FN]' in incoming_label.text() and 'border-bottom:2px solid' in incoming_label.styleSheet()
             # the whole-file view (uid=None — file tree item, or a tab with no section filter) is the
             # same module element, not "nothing selected"; it must aggregate the same way
             io_window.incoming_view.clear()
@@ -2450,11 +2490,9 @@ class KantSmokeTest(unittest.TestCase):
                 set_vim_mode(False)
             window.close()
 
-    def test_file_and_element_preview_tabs_reuse_until_pinned_or_dirty(self):
-        # regression for the VS Code-style preview slot: a single unpinned tab is reused (closed +
-        # reopened for files, retargeted in place for elements) as long as its content is clean, but
-        # editing it must auto-pin instead of letting a later click silently swap the view away —
-        # see _open_file/_show_element_tab/_pin_file_tab/_pin_element_page in kant/mainwindow.py.
+    def test_file_and_element_preview_tabs_survive_only_when_pinned(self):
+        # One visible preview slot is shared by files and elements. Edits are flushed on replacement;
+        # only pressing the pin button may leave a visible tab behind.
         with _temp_dir() as tmp:
             project = Path(tmp)
             paths = {}
@@ -2473,6 +2511,7 @@ class KantSmokeTest(unittest.TestCase):
             window.git_root = None
             window.git_status = {}
             window._build_project_tree(window.tree.invisibleRootItem(), str(project))
+            visible_tabs = lambda: sum(window.tabs.isTabVisible(i) for i in range(window.tabs.count()))
 
             def find_section(name):
                 it = window.tree.invisibleRootItem()
@@ -2506,39 +2545,47 @@ class KantSmokeTest(unittest.TestCase):
             assert window.tabs.count() == count_before + 1
             assert str(paths['f3']) in window.open_tabs
 
-            # editing an element preview's content auto-pins it instead of letting the next
-            # element click silently swap it away
+            # A child replaces its unpinned parent visually; a sibling then replaces that child,
+            # even after an edit. The shared FileTab retains and later flushes the source change.
             alpha_item = find_section('f1_alpha')
             beta_item = find_section('f1_beta')
             assert alpha_item is not None and beta_item is not None
+            f1_tab = window.open_tabs[str(paths['f1'])]
+            visible_before = visible_tabs()
             window._on_tree_item_clicked(alpha_item, 0)
             alpha_page = window.tabs.currentWidget()
+            assert not window.tabs.isTabVisible(window.tabs.indexOf(f1_tab))
+            assert visible_tabs() == visible_before
             alpha_page.findChildren(CodeEdit)[0].setPlainText('def f1_alpha(): return 1')
             count_before = window.tabs.count()
             window._on_tree_item_clicked(beta_item, 0)
-            assert window.tabs.count() == count_before + 1
-            assert window.tabs.indexOf(alpha_page) != -1  # still open, not silently discarded
+            assert window.tabs.count() == count_before
+            assert window.tabs.indexOf(alpha_page) == -1
+            assert visible_tabs() == visible_before
 
-            # same rule for a dirty whole-file preview: pinned instead of closed on the next open
+            # A dirty whole-file preview is saved before replacement, not silently auto-pinned.
             assert window._open_file(str(paths['f4']))
             f4_tab = window.open_tabs[str(paths['f4'])]
             f4_tab.findChildren(CodeEdit)[0].setPlainText('# edited')
             count_before = window.tabs.count()
             assert window._open_file(str(paths['f5']))
-            assert window.tabs.count() == count_before + 1
-            assert str(paths['f4']) in window.open_tabs
+            assert window.tabs.count() == count_before
+            assert str(paths['f4']) not in window.open_tabs
+            assert '# edited' in paths['f4'].read_text(encoding='utf-8')
 
-            # a pinned CHILD element must survive its still-unpinned parent file being reused —
-            # pinning promotes the parent to pinned too, rather than losing the child along with it
+            # Pinning only the child keeps that child visible. Its unpinned parent remains merely
+            # a hidden backing model when another parent is opened.
             f5_alpha_item = find_section('f5_alpha')
             assert f5_alpha_item is not None
             window._on_tree_item_clicked(f5_alpha_item, 0)
             f5_alpha_page = window.tabs.currentWidget()
             window._pin_element_page(f5_alpha_page)
+            f5_tab = window.open_tabs[str(paths['f5'])]
             assert str(paths['f5']) in window.open_tabs
             window._open_file(str(paths['f6']))
-            assert str(paths['f5']) in window.open_tabs  # parent promoted to pinned, not closed
-            assert window.tabs.indexOf(f5_alpha_page) != -1  # pinned child untouched
+            assert str(paths['f5']) in window.open_tabs
+            assert not window.tabs.isTabVisible(window.tabs.indexOf(f5_tab))
+            assert window.tabs.indexOf(f5_alpha_page) != -1
 
             # unpinning a pinned tab closes it outright — the pin-button slot becomes a close
             # button instead of falling back to a plain "now reusable again" state
@@ -2621,6 +2668,9 @@ class KantSmokeTest(unittest.TestCase):
             assert new_node.tag_raw is not None and 'nuova_funzione' in new_node.tag_raw
 
             text = serialize_kant(tab.tree)
+            generated = text[text.index(new_node.category_raw):]
+            assert generated.index('[FN CATEGORY]') < generated.index('[FN]') < generated.index('[FN OPEN')
+            assert generated.index('[FN OPEN') < generated.index('def nuova_funzione') < generated.index('[FN CLOSED')
             assert 'def nuova_funzione():' in text
             reparsed = parse_kant(text)
             assert reparsed.body[-1].name == 'nuova_funzione'
@@ -2630,6 +2680,10 @@ class KantSmokeTest(unittest.TestCase):
             audit = audit_kant_headers(text)
             assert audit['errors'] == []
             assert not any('nuova_funzione' in w['message'] for w in audit['warnings'])
+            window._show_element_tab(tab, new_node.uid)
+            QApplication.processEvents()
+            leaf_page = window.tabs.currentWidget()
+            assert not any('Aggiungi un elemento' in button.text() for button in leaf_page.findChildren(type(window.add_file_btn)))
             window.close()
 
     def test_add_file_block_creates_and_opens_language_aware_file(self):

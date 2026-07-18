@@ -9,7 +9,7 @@ the individual menu actions below it stay wired too (right-click tree menu, comm
 import os
 import subprocess
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QTextEdit,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from kant import theme
+from kant.icons import draw_icon
 from kant.gitutil import find_git_root, git_status_map
 
 
@@ -54,13 +55,17 @@ class GitPanelDialog(QDialog):
         title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px; border:none;')
         header_row.addWidget(title)
         header_row.addStretch(1)
-        refresh_btn = QPushButton('⟳')
+        refresh_btn = QPushButton('')
+        refresh_btn.setIcon(draw_icon('redo', 14))
+        refresh_btn.setIconSize(QSize(14, 14))
         refresh_btn.setFixedSize(26, 24)
         refresh_btn.setToolTip('Aggiorna')
         refresh_btn.setStyleSheet(theme.BUTTON_STYLE)
         refresh_btn.clicked.connect(self.refresh)
         header_row.addWidget(refresh_btn)
-        close_btn = QPushButton('×')
+        close_btn = QPushButton('')
+        close_btn.setIcon(draw_icon('close', 14))
+        close_btn.setIconSize(QSize(14, 14))
         close_btn.setFixedSize(26, 24)
         close_btn.setToolTip('Chiudi il pannello Git')
         close_btn.setStyleSheet(theme.BUTTON_STYLE)

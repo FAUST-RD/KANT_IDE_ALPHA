@@ -31,6 +31,7 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 | Permission requests from Claude Code | `aipermissions.py` and `permission_mcp.py` | `ClaudePane` in `widgets.py` |
 | LSP transport/configuration | `lsp.py` | request and fallback handling in `mainwindow.py` |
 | Theme or top-level visual constants | `theme.py` | each widget's `apply_style` method |
+| SVG icon shapes and theme-aware icon color | `icons.py`: `draw_icon` | owning widget's `apply_style` method |
 | Modal forms | `dialogs.py` | caller in `mainwindow.py` |
 | Git status parsing | `gitutil.py` | Git actions in `gitops.py` |
 | Git diff/stage/commit/branch actions | `gitops.py`: `GitOpsMixin` | status parsing in `gitutil.py`; commit dialog in `dialogs.py` |
@@ -54,6 +55,7 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 - `kant/aipermissions.py` — authenticated localhost permission bridge owned by the IDE.
 - `kant/permission_mcp.py` — dependency-free stdio MCP process used by Claude Code.
 - `kant/theme.py` — live theme globals, styles, tag colors, limits, ignored directories.
+- `kant/icons.py` — central monochrome SVG icon set; defaults to gold in night mode.
 - `test_kant_smoke.py` — offscreen integration/regression checks, one `test_*` method per feature area.
 - `DESIGN.md` — invariants, data flow, and rationale; not a second file index.
 - `legacy/index.html` — legacy browser prototype, outside the Python runtime.
@@ -66,7 +68,7 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 
 ### Navigate a KANT section
 
-The project tree stores path, UID, and document order. `_on_tree_item_clicked` opens the file and resolves the node by UID; legacy files whose generated UID changed on reparse fall back to document order. The file and each selected KANT section use the same main coding tab bar; element tabs share their parent `FileTab` tree, undo state, and save lifecycle.
+The project tree stores path, UID, and document order. `_on_tree_item_clicked` opens the file and resolves the node by UID; legacy files whose generated UID changed on reparse fall back to document order. Files and elements share one visible unpinned preview slot; only pinning makes a tab persistent. While an element preview is visible, its parent `FileTab` may remain hidden as the single shared tree/undo/save owner.
 
 ### Build Incoming/Outgoing and MAPPA
 

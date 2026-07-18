@@ -180,6 +180,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.git_root = None
         self.git_status = {}
         self.view_mode = 'code'  # left project tree: 'code' = KANT-labeled, 'file' = plain filenames
+        self.compact_kant_view = False
         self.kant_map_path = None
         self._xref_cache = None  # project cross-reference graph, rebuilt lazily after invalidation
         self._xref_generation = 0
@@ -289,7 +290,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _confirm_close — asks before quitting; its own method (not inlined) so tests can stub
     # just this decision without touching _ide_yes_no's other, unrelated uses elsewhere in the app
     def _confirm_close(self):
-        return self._ide_yes_no('Chiudi KANT IDE', 'Sei sicuro di voler chiudere KANT IDE?', accent=True)
+        return self._ide_yes_no('Chiudi KANT IDE', 'Sei sicuro di voler chiudere KANT IDE?', danger=True)
 
     def closeEvent(self, event):
         if not self._confirm_close():
@@ -439,13 +440,36 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _position_claude_tab(self):
         if not hasattr(self, 'claude_tab_btn'):
             return
-        # sits at the AI pane's own inner-left edge (splitter.widget(0)'s width), not a fixed
-        # shell coordinate — collapsed, that edge coincides with the shell's right edge (same spot
-        # as before); expanded, it tracks wherever the splitter divider actually is instead of
-        # floating past it, out over the pane's own content
-        x = self.splitter.widget(0).width() - self.claude_tab_btn.width()
+        # centered ON the splitter boundary (half the button's own width on each side), not flush
+        # against it — a tall narrow pill straddling the seam between the coding board and the AI
+        # pane, "metà dentro e metà fuori". Collapsed, that seam coincides with the shell's own right
+        # edge, so half the pill visibly hangs past the last real content — reading as a handle
+        # pointing at wherever the (now zero-width) pane would reopen; expanded, both halves sit over
+        # real content on either side, no particular "pointing outward" — see _style_claude_tab_button
+        x = self.splitter.widget(0).width() - self.claude_tab_btn.width() // 2
         self.claude_tab_btn.move(x, (self.shell.height() - self.claude_tab_btn.height()) // 2)
         self.claude_tab_btn.raise_()
+
+    # [FN CATEGORY] _style_claude_tab_button — the pane-collapsed state is the one that should read
+    # as "grab me" — accent-colored pill, full border since it's now floating free over the coding
+    # board rather than flush against a real pane edge. Expanded is deliberately understated: it's
+    # sitting right on top of live content on both sides, not something that needs to shout.
+    # [FN] _style_claude_tab_button — accent pill when collapsed, subdued pill when expanded
+    # [FN OPEN] _style_claude_tab_button
+    def _style_claude_tab_button(self, collapsed):
+        if collapsed:
+            self.claude_tab_btn.setStyleSheet(
+                f'QPushButton {{ background:{theme.ACCENT}; color:#111827; '
+                f'border:1px solid {theme.ACCENT}; border-radius:8px; font-weight:700; }} '
+                f'QPushButton:hover {{ background:{theme.ACCENT}; }}'
+            )
+        else:
+            self.claude_tab_btn.setStyleSheet(
+                f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
+                f'border:1px solid {theme.BORDER}; border-radius:8px; font-weight:700; }} '
+                f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
+            )
+    # [FN CLOSED] _style_claude_tab_button
 
     def _position_map_tab(self):
         if not hasattr(self, 'map_tab_btn'):
@@ -469,21 +493,25 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN CATEGORY] _style_map_tab_button — the "sticking out of the edge" look flips with which
     # edge the tab is actually on: rounded top / flat bottom when it sticks up from the shell's
     # bottom edge, rounded bottom / flat top when it sticks down from the map dialog's top edge.
+    # at_top (MAPPA closed) is also the "fully minimized" state — same accent-pill/subdued-pill
+    # split _style_claude_tab_button uses, so both drawer tabs read the same "grab me" language when
+    # their panel is put away, and both go quiet once the panel is actually showing.
     # [FN] _style_map_tab_button — rounds whichever corners face away from the edge it's stuck to
     # [FN OPEN] _style_map_tab_button
     def _style_map_tab_button(self, at_top):
+        radius = self.map_tab_btn.height() // 2
         if at_top:
             self.map_tab_btn.setStyleSheet(
-                f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
-                f'border:1px solid {theme.BORDER}; border-top:none; '
-                f'border-bottom-left-radius:8px; border-bottom-right-radius:8px; font-weight:700; }} '
-                f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
+                f'QPushButton {{ background:{theme.ACCENT}; color:#111827; '
+                f'border:1px solid {theme.ACCENT}; border-top:none; '
+                f'border-bottom-left-radius:{radius}px; border-bottom-right-radius:{radius}px; font-weight:700; }} '
+                f'QPushButton:hover {{ background:{theme.ACCENT}; }}'
             )
         else:
             self.map_tab_btn.setStyleSheet(
                 f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
                 f'border:1px solid {theme.BORDER}; border-bottom:none; '
-                f'border-top-left-radius:8px; border-top-right-radius:8px; font-weight:700; }} '
+                f'border-top-left-radius:{radius}px; border-top-right-radius:{radius}px; font-weight:700; }} '
                 f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
             )
     # [FN CLOSED] _style_map_tab_button
@@ -536,7 +564,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         set_theme(self.night_mode)
         self._apply_theme()
 
-    # [FN CATEGORY] _tree_stylesheet — the ONE place the KANT tree's own QSS is built, called from
+    # [FN CATEGORY] _tree_stylesheet — the ONE place the project tree's QSS is built, called from
     # both initial construction and _apply_theme's refresh pass. Those two used to duplicate this
     # string independently and had drifted apart (padding:6px 4px boxed-look vs. a later padding:
     # 14px 10px flat-look; a hardcoded #eef4ff selection color vs. a night-aware one) — real dead
@@ -546,10 +574,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN OPEN] _tree_stylesheet
     def _tree_stylesheet(self):
         selected_bg = '#1e293b' if self.night_mode else '#fdf3d8'
+        padding = '2px' if self.view_mode == 'code' and self.compact_kant_view else '6px 4px'
+        item_padding = '1px 2px' if self.view_mode == 'code' and self.compact_kant_view else '0px'
         return (
             f'QTreeWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:8px; padding:6px 4px; }} '
-            f'QTreeWidget::item {{ padding:0px; }} '
+            f'border-radius:8px; padding:{padding}; }} '
+            f'QTreeWidget::item {{ padding:{item_padding}; }} '
             f'QTreeWidget::item:selected {{ background:{selected_bg}; color:{theme.ACCENT}; border-radius:4px; }}'
         )
     # [FN CLOSED] _tree_stylesheet
@@ -585,9 +615,29 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._style_find_bar()
             self._style_status_bar()
             self._update_kant_map_label()
+            self.tabs.tabBar().setStyleSheet(
+                f'QTabBar::tab {{ background:{theme.PANEL}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+                f'padding:6px 8px; }} QTabBar::tab:selected {{ background:{theme.CODE_BG}; '
+                f'border-bottom:2px solid {theme.ACCENT}; }}'
+            )
+            for key, btn in self.action_toolbar_buttons.items():
+                btn.setIcon(draw_icon(key, btn.iconSize().width()))
+            for btn in self.terminal_sidebar_group.buttons():
+                btn.setIcon(draw_icon(btn.property('kantIcon'), btn.iconSize().width()))
+            map_open = self.map_dialog is not None and self.map_dialog.isVisible()
+            self.map_tab_btn.setIcon(draw_icon('arrow-down' if map_open else 'arrow-up', 12))
+            self.claude_tab_btn.setIcon(draw_icon(
+                'arrow-left' if self.splitter.sizes()[1] == 0 else 'arrow-right', 12,
+            ))
             for tab in self.open_tabs.values():
                 tab.apply_style()
                 self._render_view(tab, tab.filter_uid)
+            for page in self._element_pages.values():
+                self._update_element_tab_title(page)
+            for btn in self.tabs.tabBar().findChildren(QToolButton):
+                kind = btn.property('kantIcon')
+                if kind:
+                    btn.setIcon(draw_icon(kind, 14))
             if hasattr(self.active_page, '_element_key'):
                 self._render_element_page(self.active_page)
             if self.active_tab is not None:
@@ -897,6 +947,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # the map is open closes it back down. Parented directly to the shell (not the stack) so
         # it stays put and clickable regardless of which page/tab is showing underneath.
         self.map_tab_btn = QPushButton(' MAPPA', self.shell)
+        self.map_tab_btn.setProperty('kantIcon', 'arrow-up')
         self.map_tab_btn.setIcon(draw_icon('arrow-up', 12))
         self.map_tab_btn.setIconSize(QSize(12, 12))
         self.map_tab_btn.setFixedSize(96, 22)
@@ -910,6 +961,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # Starts pointing right (arrow-right) to match the pane's default-expanded state.
         self._claude_pane_width = None
         self.claude_tab_btn = QPushButton('', self.shell)
+        self.claude_tab_btn.setProperty('kantIcon', 'arrow-right')
         self.claude_tab_btn.setIcon(draw_icon('arrow-right', 12))
         self.claude_tab_btn.setIconSize(QSize(12, 12))
         self.claude_tab_btn.setFixedSize(16, 60)
@@ -932,15 +984,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
         # Each element view is another page in the same tab bar, backed by the file's one FileTab.
         self._element_pages = {}
-        # the one unpinned "preview" element page (VS Code-style): clicking a new KANT element
-        # retargets this same tab slot instead of adding a new one, until the user pins it — see
-        # _show_element_tab/_retarget_element_page/_pin_element_page
+        # File and element previews share one visible slot. These two references identify its
+        # current type; when a child owns the slot its FileTab parent remains hidden as its model.
         self._preview_page = None
-        # same VS Code-style preview slot, one level up: the one unpinned whole-FILE tab. A FileTab
-        # can't be retargeted in place the way an element page can (its tree/undo stack/dirty state/
-        # disk_fingerprint are all tied to one path from construction on), so "reuse" here means
-        # close the old preview tab and open the new file in its place, rather than an in-place
-        # content swap — see _open_file/_set_preview_file_tab/_pin_file_tab
         self._preview_file_tab = None
 
         view_panel = QWidget()
@@ -1084,11 +1130,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         cursor = edit.textCursor()
         self.cursor_pos_label.setText(f'  Riga {cursor.blockNumber() + 1}, Col {cursor.columnNumber() + 1}  ')
 
-    # [FN CATEGORY] _build_view_mode_bar — two mutually-exclusive toggle buttons controlling how the
-    # LEFT project tree is built: "Codice" labels files/sections by their KANT tag (the convention
-    # view), "File" is a classic PyCharm-style plain file/folder browser by real name. The center
-    # code view always shows the open file's KANT structure regardless of this setting.
-    # [FN] _build_view_mode_bar — builds the Codice/File toggle row
+    # [FN CATEGORY] _build_view_mode_bar — three mutually-exclusive source/grouping modes plus one
+    # independent compact-render toggle for KANT; the compact renderer keeps the same tree/items.
+    # [FN] _build_view_mode_bar — builds the KANT/File/Groups row and compact toggle
     # [FN OPEN] _build_view_mode_bar
     def _build_view_mode_bar(self):
         bar = QWidget()
@@ -1097,24 +1141,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
 
-        def add_label(text):
-            lbl = QLabel(text)
-            lbl.setFont(QFont('Consolas', theme.CODE_FONT_PT - 2, QFont.DemiBold))
-            lbl.setStyleSheet(f'color:{theme.DIM}; padding:0 4px;')
-            layout.addWidget(lbl)
-
-        def add_gap():
-            layout.addSpacing(18)
-
-        self.code_view_btn = QPushButton('Codice')
+        self.code_view_btn = QPushButton('KANT')
         self.code_view_btn.setCheckable(True)
         self.code_view_btn.setChecked(True)
-        self.code_view_btn.setToolTip('Mostra il file attivo come sezioni KANT modificabili (vista predefinita)')
+        self.code_view_btn.setToolTip('Mostra la struttura concettuale del progetto come elementi KANT')
         self.code_view_btn.clicked.connect(lambda: self._set_view_mode('code'))
 
         self.file_view_btn = QPushButton('File')
         self.file_view_btn.setCheckable(True)
-        self.file_view_btn.setToolTip('Mostra il file attivo come testo grezzo, senza la struttura a sezioni KANT')
+        self.file_view_btn.setToolTip('Mostra cartelle e file del progetto senza la struttura concettuale KANT')
         self.file_view_btn.clicked.connect(lambda: self._set_view_mode('file'))
 
         self.groups_view_btn = QPushButton('Gruppi')
@@ -1131,11 +1166,21 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.view_mode_group.addButton(self.file_view_btn)
         self.view_mode_group.addButton(self.groups_view_btn)
 
-        add_label('Vista')
         layout.addWidget(self.code_view_btn)
         layout.addWidget(self.file_view_btn)
+        layout.addSpacing(14)
         layout.addWidget(self.groups_view_btn)
         layout.addStretch(1)
+        self.compact_kant_btn = QToolButton()
+        self.compact_kant_btn.setProperty('kantIcon', 'grid')
+        self.compact_kant_btn.setIcon(draw_icon('grid', 16))
+        self.compact_kant_btn.setIconSize(QSize(16, 16))
+        self.compact_kant_btn.setFixedSize(32, 30)
+        self.compact_kant_btn.setCheckable(True)
+        self.compact_kant_btn.setChecked(self.compact_kant_view)
+        self.compact_kant_btn.setCursor(Qt.PointingHandCursor)
+        self.compact_kant_btn.toggled.connect(self._set_compact_kant_view)
+        layout.addWidget(self.compact_kant_btn)
         self._style_view_mode_bar()
         self._update_action_buttons()
         return bar
@@ -1149,6 +1194,28 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         for btn in self.view_mode_bar.findChildren(QPushButton):
             highlight = btn in (self.code_view_btn, self.file_view_btn, self.groups_view_btn)
             btn.setStyleSheet(checked_style if highlight else theme.BUTTON_STYLE)
+        self.compact_kant_btn.setEnabled(self.view_mode == 'code')
+        self.compact_kant_btn.setToolTip(
+            'Torna alla vista KANT a blocchi' if self.compact_kant_btn.isChecked()
+            else 'Mostra la struttura KANT come albero compatto con menu espandibili'
+        )
+        self.compact_kant_btn.setIcon(draw_icon('grid', 16, '#111827' if self.compact_kant_btn.isChecked() else None))
+        self.compact_kant_btn.setStyleSheet(
+            theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton').replace('padding:7px 13px;', 'padding:4px;')
+            + f'QToolButton:checked {{ background:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
+        )
+
+    # [FN CATEGORY] _set_compact_kant_view — switches only the KANT tree renderer, preserving the
+    # same navigation items and expansion behavior.
+    # [FN] _set_compact_kant_view — toggles compact KANT rows and rebuilds the tree
+    # [FN OPEN] _set_compact_kant_view
+    def _set_compact_kant_view(self, compact):
+        self.compact_kant_view = compact
+        self._style_view_mode_bar()
+        if self.view_mode == 'code':
+            self.tree.setStyleSheet(self._tree_stylesheet())
+            self._rebuild_tree()
+    # [FN CLOSED] _set_compact_kant_view
 
     # [FN CATEGORY] _build_ai_context_hint — a hidden (never shown in the chat bubble) instruction
     # scoping the AI's changes to whatever the coding panel is currently showing: the isolated
@@ -1342,6 +1409,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.addWidget(self.find_input, 1)
 
         prev_btn = QPushButton('')
+        prev_btn.setProperty('kantIcon', 'arrow-up')
         prev_btn.setIcon(draw_icon('arrow-up', 14))
         prev_btn.setIconSize(QSize(14, 14))
         prev_btn.setFixedWidth(32)
@@ -1350,6 +1418,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.addWidget(prev_btn)
 
         next_btn = QPushButton('')
+        next_btn.setProperty('kantIcon', 'arrow-down')
         next_btn.setIcon(draw_icon('arrow-down', 14))
         next_btn.setIconSize(QSize(14, 14))
         next_btn.setFixedWidth(32)
@@ -1361,7 +1430,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.find_status.setStyleSheet(f'color:{theme.DIM};')
         layout.addWidget(self.find_status)
 
-        close_btn = QPushButton('×')
+        close_btn = QPushButton('')
+        close_btn.setProperty('kantIcon', 'close')
+        close_btn.setIcon(draw_icon('close', 14))
+        close_btn.setIconSize(QSize(14, 14))
         close_btn.setFixedWidth(32)
         close_btn.setToolTip('Chiudi la barra di ricerca (Esc)')
         close_btn.clicked.connect(self._hide_find_bar)
@@ -1384,6 +1456,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         icon_button_style = theme.BUTTON_STYLE.replace('padding:7px 13px;', 'padding:4px;')
         for btn in self.find_bar.findChildren(QPushButton):
             btn.setStyleSheet(icon_button_style if not btn.text() else theme.BUTTON_STYLE)
+            kind = btn.property('kantIcon')
+            if kind:
+                btn.setIcon(draw_icon(kind, 14))
 
     def _show_find_bar(self):
         self.find_bar.setVisible(True)
@@ -1671,6 +1746,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if mode == self.view_mode:
             return
         self.view_mode = mode
+        self._style_view_mode_bar()
+        self.tree.setStyleSheet(self._tree_stylesheet())
         self._rebuild_tree()
     # [FN CLOSED] _set_view_mode
 
@@ -1724,7 +1801,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         top_bar_layout = QHBoxLayout(self.info_popup_top_bar)
         top_bar_layout.setContentsMargins(6, 2, 6, 2)
         top_bar_layout.addStretch(1)
-        self.info_popup_close_btn = QPushButton('×')
+        self.info_popup_close_btn = QPushButton('')
+        self.info_popup_close_btn.setIcon(draw_icon('close', 14))
+        self.info_popup_close_btn.setIconSize(QSize(14, 14))
         self.info_popup_close_btn.setCursor(Qt.PointingHandCursor)
         self.info_popup_close_btn.setToolTip('Chiudi questo pannello')
         self.info_popup_close_btn.clicked.connect(self._close_info_popup)
@@ -1794,14 +1873,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # top of the map dialog) — handled by _style_map_tab_button, called from _position_map_tab
         # since it already knows which edge, and runs whenever the tab is (re)shown or moved
         self._position_map_tab()
-        # same idea, rotated a quarter turn: rounded left corners only, flat right — sticks out of
-        # the window's right edge instead of its bottom edge
-        self.claude_tab_btn.setStyleSheet(
-            f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
-            f'border:1px solid {theme.BORDER}; border-right:none; '
-            f'border-top-left-radius:8px; border-bottom-left-radius:8px; font-weight:700; }} '
-            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
-        )
+        sizes = self.splitter.sizes() if hasattr(self, 'splitter') else []
+        self._style_claude_tab_button(len(sizes) > 1 and sizes[1] == 0)
         self.terminal_sidebar.setStyleSheet(f'background:{theme.PANEL}; border-right:1px solid {theme.BORDER};')
         for btn in self.terminal_sidebar_group.buttons():
             btn.setStyleSheet(
@@ -1810,10 +1883,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 f'QToolButton:checked {{ background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; }}'
             )
         self.errors_view.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:6px;')
+        self.kant_errors_view.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:6px;')
         if self.map_dialog is not None:
             self.map_dialog.apply_style()
 
-    # [FN CATEGORY] _build_terminal_dock — a narrow left sidebar (3 icon buttons, exclusive like a
+    # [FN CATEGORY] _build_terminal_dock — a narrow left sidebar (4 icon buttons, exclusive like a
     # vertical tab bar) switches a QStackedWidget between the real shell (self.terminal), a second
     # TerminalPane running an interactive Python REPL, and a live list of the active file's
     # diagnostics — so the bottom panel isn't only ever the shell. The Python REPL process starts
@@ -1826,11 +1900,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.errors_view = QTreeWidget()
         self.errors_view.setHeaderHidden(True)
         self.errors_view.itemClicked.connect(self._open_result_item)
+        self.kant_errors_view = QTreeWidget()
+        self.kant_errors_view.setHeaderHidden(True)
+        self.kant_errors_view.itemClicked.connect(self._open_result_item)
 
         self.terminal_stack = QStackedWidget()
         self.terminal_stack.addWidget(self.terminal)
         self.terminal_stack.addWidget(self.python_terminal)
         self.terminal_stack.addWidget(self.errors_view)
+        self.terminal_stack.addWidget(self.kant_errors_view)
 
         sidebar = QWidget()
         sidebar.setFixedWidth(36)
@@ -1840,10 +1918,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.terminal_sidebar_group = QButtonGroup(sidebar)
         self.terminal_sidebar_group.setExclusive(True)
         for index, (icon_name, tooltip) in enumerate((
-            ('terminal', 'Terminale'), ('repl', 'Terminale Python'), ('warning', 'Errori nel file aperto'),
+            ('terminal', 'Terminale'), ('repl', 'Terminale Python'),
+            ('warning', 'Errori nel file aperto'), ('kant', 'Errori convenzione KANT'),
         )):
             btn = QToolButton()
             btn.setCheckable(True)
+            btn.setProperty('kantIcon', icon_name)
             btn.setIcon(draw_icon(icon_name, 22))
             btn.setIconSize(QSize(22, 22))
             btn.setFixedSize(32, 32)
@@ -1908,6 +1988,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.map_dialog.activateWindow()
         self.map_tab_btn.setParent(self.map_dialog)
         self.map_tab_btn.setText(' MAPPA')
+        self.map_tab_btn.setProperty('kantIcon', 'arrow-down')
         self.map_tab_btn.setIcon(draw_icon('arrow-down', 12))
         self.map_tab_btn.show()
         self._position_map_tab()
@@ -1919,6 +2000,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.map_dialog.hide()
             self.map_tab_btn.setParent(self.shell)
             self.map_tab_btn.setText(' MAPPA')
+            self.map_tab_btn.setProperty('kantIcon', 'arrow-up')
             self.map_tab_btn.setIcon(draw_icon('arrow-up', 12))
             self.map_tab_btn.show()
             self._position_map_tab()
@@ -1940,18 +2022,21 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._claude_pane_width = sizes[1]
             self.splitter.setSizes([sizes[0] + sizes[1], 0])
             self.claude_tab_btn.setIcon(draw_icon('arrow-left', 12))
+            self.claude_tab_btn.setProperty('kantIcon', 'arrow-left')
+            self._style_claude_tab_button(True)
         else:
             restore = self._claude_pane_width or 360
             total = sum(sizes)
             self.splitter.setSizes([max(200, total - restore), restore])
             self.claude_tab_btn.setIcon(draw_icon('arrow-right', 12))
+            self.claude_tab_btn.setProperty('kantIcon', 'arrow-right')
+            self._style_claude_tab_button(False)
         self._position_claude_tab()
     # [FN CLOSED] _toggle_claude_pane
 
-    # [FN CATEGORY] _navigate_to_element — jumps the editor to a cross-reference element by its key
-    # ('<rel_path>::<uid>'): opens the file if needed, shows the full file view, then scrolls the
-    # section into view. Shared by the map's double-click and the Incoming/Outgoing list rows.
-    # [FN] _navigate_to_element — opens and reveals an xref element in the editor
+    # [FN CATEGORY] _navigate_to_element — resolves an xref key with legacy order fallback, then
+    # routes through the same element-preview slot used by direct tree clicks.
+    # [FN] _navigate_to_element — opens an xref element in the editor preview
     # [FN OPEN] _navigate_to_element
     def _navigate_to_element(self, key):
         if not key or '::' not in key or not self.project_root_path:
@@ -1975,8 +2060,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 node = nodes[target_order]
         if node is None:
             return
-        self._render_view(tab)
-        self._reveal_section(tab, node.uid)
+        self._show_element_tab(tab, node.uid)
         self._select_tree_section(path, node.uid)
     # [FN CLOSED] _navigate_to_element
 
@@ -2109,6 +2193,27 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 item.setForeground(QColor(theme.TAG_COLORS.get(el.tag, theme.TEXT)))
                 item.setToolTip(el.category_desc or 'Doppio clic per aprire')
                 view.addItem(item)
+                color = theme.TAG_COLORS.get(el.tag, theme.TEXT)
+                label = QLabel(
+                    f'<span style="color:{theme.DIM}">{arrow}</span> '
+                    f'{_tag_header_html(el.tag, el.name, el.desc, bold_name=True)} '
+                    f'<span style="color:{theme.DIM}">· {html_escape(el.file)}</span>'
+                )
+                label.setFont(QFont('Consolas', theme.TREE_FONT_PT))
+                label.setStyleSheet(
+                    f'color:{theme.TEXT}; background:transparent; padding:4px 8px; '
+                    f'border-bottom:2px solid {color};'
+                )
+                label.setAttribute(Qt.WA_TransparentForMouseEvents)
+                # label.sizeHint() alone under-reports the row's real needed height: it's computed
+                # on an unparented, unconstrained-width label (rich-text metrics aren't final until
+                # actually laid out), and it has no idea about QListWidget::item's OWN padding (5px
+                # top+bottom, set in _style_io_tabs) — that padding was eating into, not adding to,
+                # too-tight a box, squashing every row's icon/text/underline together
+                hint = label.sizeHint()
+                hint.setHeight(max(hint.height(), 22) + 10)
+                item.setSizeHint(hint)
+                view.setItemWidget(item, label)
 
         fill(self.incoming_view, incoming, '←')   # ← comes from
         fill(self.outgoing_view, outgoing, '→')   # → goes to
@@ -2213,6 +2318,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._set_project_chrome_visible(False)
         self.map_tab_btn.setParent(self.shell)
         self.map_tab_btn.setText(' MAPPA')
+        self.map_tab_btn.setProperty('kantIcon', 'arrow-up')
         self.map_tab_btn.setIcon(draw_icon('arrow-up', 12))
         self.map_tab_btn.hide()
         self.claude_tab_btn.hide()
@@ -2404,10 +2510,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.terminal.write_info('\n' + result + '\n')
 
     def _show_validation_results(self, errors, visual_errors):
-        if not hasattr(self, 'results_view'):
+        if not hasattr(self, 'kant_errors_view'):
             return
-        self.results_view.clear()
-        root = QTreeWidgetItem(self.results_view, [f'Verifica KANT: {"OK" if not errors else str(len(errors)) + " errore/i"}'])
+        self.kant_errors_view.clear()
+        root = QTreeWidgetItem(self.kant_errors_view, [f'Verifica KANT: {"OK" if not errors else str(len(errors)) + " errore/i"}'])
         for path, rel, line, message in visual_errors:
             item = QTreeWidgetItem(root, [f'{rel}:{line}: {message}'])
             item.setData(0, ROLE_KIND, 'validation-result')
@@ -2420,7 +2526,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if not errors:
             QTreeWidgetItem(root, ['Nessun errore'])
         root.setExpanded(True)
-        self._toggle_info_popup(self.results_view, force_open=bool(errors))
+        if errors:
+            self._switch_terminal_tab(3)
+            self.terminal_sidebar_group.button(3).setChecked(True)
 
     # [FN CATEGORY] _launch_kant_code_map — hands off to Claude Code itself rather than trying to
     # replicate its judgment: deciding what deserves a tag and writing a sensible description isn't
@@ -2496,22 +2604,27 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             f' <span style="color:{theme.WARN}; font-weight:700">[{html_escape(git_status)}]</span>'
             if git_status else ''
         )
+        compact = self.view_mode == 'code' and self.compact_kant_view
         # rich-text spans ignore QLabel.setFont proportionally, so the size needs to be explicit
         # here rather than inherited — one point larger than the label's own TREE_FONT_PT
         detail_html = (
             f'<br><span style="color:{theme.DIM}; font-size:{theme.TREE_FONT_PT + 1}pt">{html_escape(detail)}</span>'
-            if detail else ''
+            if detail and not compact else ''
         )
+        # compact/list mode drops the full tag-colored pill background (too heavy for a dense list),
+        # but the color itself is the whole point of the tag badge — keep it as a thin colored
+        # underline instead of losing it outright
+        underline = f'border-bottom:2px solid {color};' if compact else ''
         lbl = _TreeItemLabel(
             self.tree, item,
-            f'<span style="color:{color}; background-color:{bg}; font-weight:700; '
-            f'padding:0px 4px; border-radius:4px">[{tag}]</span> '
+            f'<span style="color:{color}; background-color:{"transparent" if compact else bg}; font-weight:700; '
+            f'padding:0px {0 if compact else 4}px; border-radius:4px; {underline}">[{tag}]</span> '
             f'<span style="font-weight:{weight}">{html_escape(text)}</span>{git_html}{detail_html}'
         )
-        lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
+        lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT - 1 if compact else theme.TREE_FONT_PT))
         lbl.setMargin(0)
-        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:0px 4px;')
-        lbl.setWordWrap(True)  # long labels wrap instead of overflowing the column
+        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:0px {1 if compact else 4}px;')
+        lbl.setWordWrap(not compact)
         lbl.setCursor(Qt.PointingHandCursor)
         return lbl
 
@@ -2678,42 +2791,51 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._show_element_tab(tab, node.uid if node is not None else uid)
     # [FN CLOSED] _on_tree_item_double_clicked
 
-    # [FN CATEGORY] _show_element_tab — VS Code-style preview reuse: clicking a KANT element that
-    # isn't already open retargets the one unpinned "preview" tab (if any) in place instead of
-    # piling up a new tab per click. Pinning a tab (the pin button in place of its ×) takes it out
-    # of the reusable slot, so the next new element opens a fresh tab that is itself the new preview
-    # — repeating indefinitely, exactly like the file/uid dedupe case already handled below. Editing
-    # the preview tab's content pins it too (see the dirty check below) — otherwise clicking a
-    # different element while mid-edit silently swaps the view out from under the user with no
-    # warning, same failure VS Code's own "promote preview to permanent on edit" rule prevents.
-    # [FN] _show_element_tab — opens an element beside its parent in the main coding tab bar
+    # [FN CATEGORY] _show_element_tab — an unpinned child replaces its unpinned parent visually;
+    # the hidden FileTab still owns the shared source/undo/save model. A pinned parent remains.
+    # [FN] _show_element_tab — opens an element in the shared file/element preview slot
     # [FN OPEN] _show_element_tab
     def _show_element_tab(self, tab, uid):
         key = (tab.path, uid)
         existing = self._element_pages.get(key)
         if existing is not None:
+            if self._preview_page is not None and self._preview_page is not existing:
+                self._release_preview()
+            if self._preview_file_tab is not None:
+                if self._preview_file_tab is tab:
+                    index = self.tabs.indexOf(tab)
+                    if index != -1:
+                        self.tabs.setTabVisible(index, False)
+                    self._preview_file_tab = None
+                else:
+                    self._release_preview()
             self.tabs.setCurrentWidget(existing)
             self._set_ai_context_page(existing)
             return
-        if self._preview_page is not None:
-            if self._preview_page._file_tab.dirty:
-                self._pin_element_page(self._preview_page)
-            else:
-                self._retarget_element_page(self._preview_page, tab, uid)
-                return
-        page, layout = self._build_element_page()
-        if uid is None:
-            node = next((item for item in tab.tree.body if isinstance(item, Node)), None)
-        else:
-            node = self._find_node_by_uid(tab.tree, uid)
+        node = (
+            next((item for item in tab.tree.body if isinstance(item, Node)), None) if uid is None
+            else self._find_node_by_uid(tab.tree, uid)
+        )
         if node is None:
-            page.deleteLater()
             return
+        if self._preview_file_tab is not None:
+            if self._preview_file_tab is tab:
+                index = self.tabs.indexOf(tab)
+                if index != -1:
+                    self.tabs.setTabVisible(index, False)
+                self._preview_file_tab = None
+            else:
+                self._release_preview()
+        if self._preview_page is not None:
+            self._retarget_element_page(self._preview_page, tab, uid)
+            return
+        page, layout = self._build_element_page()
         page._element_key = key
         page._file_tab = tab
         page._view_layout = layout
         page._pinned = False
-        index = self.tabs.addTab(page, '')
+        parent_index = self.tabs.indexOf(tab)
+        index = self.tabs.insertTab(parent_index + 1, page, '') if parent_index != -1 else self.tabs.addTab(page, '')
         page._tab_label = _TabLabel(self.tabs, page)
         self.tabs.setTabToolTip(index, tab.path)
         self._element_pages[key] = page
@@ -2737,6 +2859,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         )
         if node is None:
             return
+        old_tab = page._file_tab
         old_key = getattr(page, '_element_key', None)
         if old_key is not None:
             self._element_pages.pop(old_key, None)
@@ -2749,7 +2872,48 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._update_element_tab_title(page)
         self.tabs.setCurrentWidget(page)
         self._set_ai_context_page(page)
+        if old_tab is not tab:
+            self._close_hidden_backing_if_unused(old_tab)
     # [FN CLOSED] _retarget_element_page
+
+    def _release_preview(self):
+        """Remove the one visible unpinned preview; pinned tabs are never referenced here."""
+        insert_index = None
+        if self._preview_page is not None:
+            page = self._preview_page
+            insert_index = self.tabs.indexOf(page)
+            self._close_element_tab(page)
+        if self._preview_file_tab is not None:
+            tab = self._preview_file_tab
+            index = self.tabs.indexOf(tab)
+            has_pinned_child = any(
+                page._pinned and page._file_tab is tab for page in self._element_pages.values()
+            )
+            if has_pinned_child:
+                if index != -1:
+                    self.tabs.setTabVisible(index, False)
+                self._preview_file_tab = None
+            elif index != -1:
+                insert_index = index
+                if not self._close_tab(index):
+                    insert_index = None
+        return insert_index
+
+    # [FN CATEGORY] _tab_action_button — pin and close controls share the same SVG/theme behavior
+    # for file and element tabs, so their construction stays in one place.
+    # [FN] _tab_action_button — builds a themed icon button for a tab corner
+    # [FN OPEN] _tab_action_button
+    def _tab_action_button(self, kind, tooltip, callback):
+        button = QToolButton()
+        button.setProperty('kantIcon', kind)
+        button.setIcon(draw_icon(kind, 14))
+        button.setIconSize(QSize(14, 14))
+        button.setAutoRaise(True)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setToolTip(tooltip)
+        button.clicked.connect(callback)
+        return button
+    # [FN CLOSED] _tab_action_button
 
     # [FN CATEGORY] _set_preview_page — swaps the new preview page's tab-bar × (QTabBar.RightSide)
     # for a pin button; pinning swaps it again for a plain close button (not Qt's native fallback —
@@ -2760,12 +2924,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN OPEN] _set_preview_page
     def _set_preview_page(self, page):
         self._preview_page = page
-        pin_btn = QToolButton()
-        pin_btn.setText('📌')
-        pin_btn.setAutoRaise(True)
-        pin_btn.setCursor(Qt.PointingHandCursor)
-        pin_btn.setToolTip('Blocca questa scheda (impedisce che venga sostituita da un nuovo elemento)')
-        pin_btn.clicked.connect(lambda: self._pin_element_page(page))
+        pin_btn = self._tab_action_button(
+            'pin', 'Blocca questa scheda (impedisce che venga sostituita da un nuovo elemento)',
+            lambda: self._pin_element_page(page),
+        )
         index = self.tabs.indexOf(page)
         self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, pin_btn)
         # setTabButton alone can leave the widget internally hidden with no matching re-show — the
@@ -2784,12 +2946,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         index = self.tabs.indexOf(page)
         if index == -1:
             return
-        close_btn = QToolButton()
-        close_btn.setText('×')
-        close_btn.setAutoRaise(True)
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.setToolTip('Chiudi questa scheda')
-        close_btn.clicked.connect(lambda: self._close_element_tab(page))
+        close_btn = self._tab_action_button('close', 'Chiudi questa scheda', lambda: self._close_element_tab(page))
         bar = self.tabs.tabBar()
         old_btn = bar.tabButton(index, QTabBar.RightSide)
         bar.setTabButton(index, QTabBar.RightSide, close_btn)
@@ -2804,12 +2961,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN OPEN] _set_preview_file_tab
     def _set_preview_file_tab(self, tab):
         self._preview_file_tab = tab
-        pin_btn = QToolButton()
-        pin_btn.setText('📌')
-        pin_btn.setAutoRaise(True)
-        pin_btn.setCursor(Qt.PointingHandCursor)
-        pin_btn.setToolTip('Blocca questa scheda (impedisce che venga sostituita aprendo un altro file)')
-        pin_btn.clicked.connect(lambda: self._pin_file_tab(tab))
+        pin_btn = self._tab_action_button(
+            'pin', 'Blocca questa scheda (impedisce che venga sostituita aprendo un altro file)',
+            lambda: self._pin_file_tab(tab),
+        )
         index = self.tabs.indexOf(tab)
         self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, pin_btn)
         pin_btn.show()  # same setTabButton re-show workaround as _set_preview_page
@@ -2818,17 +2973,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _pin_file_tab(self, tab):
         if tab is None:
             return
+        tab._pinned = True
         if self._preview_file_tab is tab:
             self._preview_file_tab = None
         index = self.tabs.indexOf(tab)
         if index == -1:
             return
-        close_btn = QToolButton()
-        close_btn.setText('×')
-        close_btn.setAutoRaise(True)
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.setToolTip('Chiudi questa scheda')
-        close_btn.clicked.connect(lambda: self._close_tab(self.tabs.indexOf(tab)))
+        self.tabs.setTabVisible(index, True)
+        close_btn = self._tab_action_button(
+            'close', 'Chiudi questa scheda', lambda: self._close_tab(self.tabs.indexOf(tab)),
+        )
         bar = self.tabs.tabBar()
         old_btn = bar.tabButton(index, QTabBar.RightSide)
         bar.setTabButton(index, QTabBar.RightSide, close_btn)
@@ -2841,6 +2995,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         while layout.count():
             item = layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
         tab = page._file_tab
         node = self._find_node_by_uid(tab.tree, page._element_key[1])
@@ -2856,14 +3011,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if tab.dirty:
             html += f' <span style="color:{theme.ACCENT}">●</span>'
         page._tab_label.setText(html)
+        page._tab_label.setStyleSheet(f'color:{theme.TEXT}; background:transparent;')
         page._tab_label.adjustSize()
         index = self.tabs.indexOf(page)
         self.tabs.tabBar().setTabButton(index, QTabBar.LeftSide, page._tab_label)
         page._tab_label.show()
 
-    def _close_element_tab(self, page):
+    def _close_element_tab(self, page, cleanup_backing=True):
         if page is None:
             return
+        tab = page._file_tab
         self._element_pages.pop(getattr(page, '_element_key', None), None)
         if self._preview_page is page:
             self._preview_page = None
@@ -2873,11 +3030,21 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if index != -1:
             self.tabs.removeTab(index)
         page.deleteLater()
+        if cleanup_backing:
+            self._close_hidden_backing_if_unused(tab)
+
+    def _close_hidden_backing_if_unused(self, tab):
+        index = self.tabs.indexOf(tab)
+        if (
+            index != -1 and not self.tabs.isTabVisible(index)
+            and not any(page._file_tab is tab for page in self._element_pages.values())
+        ):
+            self._close_tab(index)
 
     def _close_element_tabs_for(self, tab):
         for page in list(self._element_pages.values()):
             if page._file_tab is tab:
-                self._close_element_tab(page)
+                self._close_element_tab(page, cleanup_backing=False)
 
     # ---- tabs (AI-NAV: active-tab ownership and close/flush lifecycle) ---
 
@@ -3019,6 +3186,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # against the button's sizeHint at registration time, not on later in-place text changes,
         # so re-registering after every text update is what keeps the tab wide enough for it
         tab._tab_label.setText(html)
+        tab._tab_label.setStyleSheet(f'color:{theme.TEXT}; background:transparent;')
         tab._tab_label.adjustSize()
         bar.setTabButton(idx, QTabBar.LeftSide, tab._tab_label)
         # re-registering the SAME widget instance at a position it already occupies makes Qt hide
@@ -3053,6 +3221,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _open_file(self, path):
         existing = self.open_tabs.get(path)
         if existing is not None:
+            if existing is not self._preview_file_tab:
+                index = self.tabs.indexOf(existing)
+                if index != -1:
+                    self.tabs.setTabVisible(index, True)
+                self._release_preview()
+                if not getattr(existing, '_pinned', False):
+                    self._set_preview_file_tab(existing)
             self.tabs.setCurrentWidget(existing)
             self._set_ai_context_page(existing)
             return True
@@ -3073,28 +3248,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._ide_message('Marcatori KANT non validi', f'{os.path.basename(path)}: {e}\nApro il file come testo grezzo.')
             tree = Node(tag='ROOT', name='', open_raw=None, body=[Run(lines=text.split('\n'))])
 
-        # reuse the preview file-tab slot in place (same tab index) instead of piling up a new
-        # permanent tab per file click — a dirty preview is pinned first, same rule _show_element_tab
-        # already applies to element tabs, so mid-edit content is never silently closed. A pinned
-        # CHILD element tab counts the same as dirty content: closing the file tab would force-close
-        # every element tab under it too (_close_tab -> _close_element_tabs_for has no pin exception,
-        # since an explicit "close this file" really should take its element views with it) — but here
-        # the file itself was never asked to close, the user just clicked a different file, so a
-        # pinned child must promote its still-unpinned parent to pinned rather than silently losing it.
-        insert_index = None
-        if self._preview_file_tab is not None:
-            has_pinned_child = any(
-                page._pinned and page._file_tab is self._preview_file_tab
-                for page in self._element_pages.values()
-            )
-            if self._preview_file_tab.dirty or has_pinned_child:
-                self._pin_file_tab(self._preview_file_tab)
-            else:
-                insert_index = self.tabs.indexOf(self._preview_file_tab)
-                if not self._close_tab(insert_index):
-                    insert_index = None
+        # Replace the one unpinned preview regardless of whether it is a file or element. Closing a
+        # dirty FileTab flushes its pending save; only an explicit pin makes a visible tab survive.
+        insert_index = self._release_preview()
 
         tab = FileTab(path, tree, detect_line_ending(path))
+        tab._pinned = False
         tab.dirtyChanged.connect(lambda t=tab: self._on_tab_dirty_changed(t))
         tab.saveFailed.connect(lambda msg, t=tab: self._on_tab_save_failed(t, msg))
         tab.saveConflict.connect(lambda t=tab: self._on_tab_save_conflict(t))
@@ -4048,6 +4207,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             item = tab.view_layout.takeAt(0)
             w = item.widget()
             if w:
+                w.hide()
                 w.deleteLater()
         tab.section_widgets.clear()
         tab.collapsibles.clear()
@@ -4090,13 +4250,22 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _add_add_element_block — appends the "add a new element" card to a file's outline
     # [FN OPEN] _add_add_element_block
     def _add_add_element_block(self, tab):
+        # a plain top margin used to be the only thing separating this from the last element's own
+        # widget — when that element was a leaf (no border/background of its own around it, e.g. a
+        # bare FN/CST at the top level), the card read as if it belonged to that leaf instead of to
+        # the file as a whole. A full-width divider line makes the file-level scope unambiguous
+        # regardless of what precedes it.
+        divider = QFrame()
+        divider.setFrameShape(QFrame.HLine)
+        divider.setStyleSheet(f'background:{theme.BORDER}; max-height:1px; border:none; margin-top:14px; margin-bottom:6px;')
+        tab.view_layout.addWidget(divider)
         block = QPushButton('+  Aggiungi un elemento')
         block.setCursor(Qt.PointingHandCursor)
         block.setToolTip('Crea un nuovo modulo, classe, funzione o altro elemento in questo file')
         block.setMinimumHeight(56)
         block.setStyleSheet(
             f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.DIM}; '
-            f'border-radius:10px; font-size:{theme.CODE_FONT_PT + 2}pt; font-weight:600; margin-top:8px; }} '
+            f'border-radius:10px; font-size:{theme.CODE_FONT_PT + 2}pt; font-weight:600; }} '
             f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
         )
         block.clicked.connect(lambda: self._prompt_add_element(tab))
@@ -4216,6 +4385,23 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             if found is not None:
                 return found
         return None
+
+    # [FN CATEGORY] _find_node_containing_line — the innermost element whose marker span
+    # ([open_line, closed_line], from parse_kant) contains a given source line number. Used to
+    # resolve a validation error's raw line number (which counts every line in the file, markers
+    # included) to the actual KANT element it belongs to, since _goto_line's block-counting walk
+    # only sees each CodeEdit's own Run body — it has no idea the CATEGORY/tagline/OPEN/CLOSED lines
+    # between elements exist, so it drifts off the real position for anything past the first element.
+    # [FN] _find_node_containing_line — innermost Node whose open/closed span contains `line`
+    # [FN OPEN] _find_node_containing_line
+    def _find_node_containing_line(self, node, line):
+        for item in node.body:
+            if not isinstance(item, Node) or item.open_line is None or item.closed_line is None:
+                continue
+            if item.open_line <= line <= item.closed_line:
+                return self._find_node_containing_line(item, line) or item
+        return None
+    # [FN CLOSED] _find_node_containing_line
 
     def _build_node_widgets(self, tab, node, layout, depth):
         i = 0

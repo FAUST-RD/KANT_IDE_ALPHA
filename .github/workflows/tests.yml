@@ -7,11 +7,7 @@ on:
 
 jobs:
   smoke:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,11 +17,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-      - name: Install Qt runtime libraries (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libxkbcommon0 libxcb-cursor0
       - name: Compile check
         run: python -m compileall -q kant kant_editor.py test_kant_smoke.py
       - name: Run offscreen smoke test

@@ -95,7 +95,7 @@ The same KANT structure supports multiple views of the codebase:
 
 ### Outline
 
-The **Codice** tree shows conceptual elements and their hierarchy. Switch to **File** whenever the physical folder layout is the more useful perspective.
+The **KANT** tree shows conceptual elements and their hierarchy. Its four-square button switches between the descriptive block layout and a compact expandable tree. Switch to **File** whenever the physical folder layout is the more useful perspective.
 
 ### Focus
 
@@ -122,7 +122,7 @@ Chat messages can carry file attachments — any document or image, not limited 
 - **Documents** (PDF, DOCX, PPTX, XLSX, HTML) are converted to plain Markdown via [MarkItDown](https://github.com/microsoft/markitdown) when it's installed and the document actually has extractable text — a scanned/image-only PDF is left untouched. Install with `pip install "markitdown[all]"` to enable it; the editor works the same without it, just attaching the original file.
 - **Images** can optionally be downscaled and re-encoded as JPEG at reduced quality — a lossy, opt-in "risparmio token" toggle next to the attach button, off by default.
 
-KANT IDE also includes Git actions, a terminal, lightweight syntax checks, optional language-server integration, Python debugging, and day/night themes.
+KANT IDE also includes Git actions, shell and Python terminals, separate source/KANT error lists, lightweight syntax checks, optional language-server integration, Python debugging, and day/night themes with theme-aware SVG icons.
 
 ## Quick start
 
@@ -148,7 +148,7 @@ Language-server features activate only when a compatible server is already avail
 1. Launch `kant_editor.py` and open a project folder.
 2. Open any source file; untagged files remain editable as normal.
 3. Add matching `OPEN` and `CLOSED` markers around one useful function or class.
-4. Select **Codice** and open that section directly from the project tree.
+4. Select **KANT** and open that section directly from the project tree.
 5. Add a short `[TAG]` description and `CATEGORY` context.
 6. Use **INCOMING**, **OUTGOING**, and **MAPPA** to move from local code to system-level understanding.
 

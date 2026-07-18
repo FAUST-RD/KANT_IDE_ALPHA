@@ -1455,6 +1455,26 @@ class _PromptEdit(QPlainTextEdit):
 # [FN CLOSED] _PromptEdit
 
 
+# [FN CATEGORY] _ScanlineWidget — a very faint repeating horizontal-line texture painted over the
+# widget's own background, evoking old CRT scanlines. Direct QPainter drawing rather than a QSS
+# background-image: PySide6's QSS engine doesn't alpha-composite a semi-transparent background-image
+# over a background-color at all (confirmed empirically — a fully opaque tile renders, anything with
+# transparency silently doesn't), so a real paintEvent is the only reliable way to get a subtle
+# overlay instead of an all-or-nothing one. Day mode only; a CRT glow has no business in a dark room.
+# [FN] _ScanlineWidget — QWidget subclass that paints faint scanlines after its normal contents
+# [FN OPEN] _ScanlineWidget
+class _ScanlineWidget(QWidget):
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if theme.NIGHT:
+            return
+        painter = QPainter(self)
+        painter.setPen(QColor(0, 0, 0, 12))
+        for y in range(0, self.height(), 2):
+            painter.drawLine(0, y, self.width(), y)
+# [FN CLOSED] _ScanlineWidget
+
+
 class ClaudePane(QWidget):
     finished = Signal()
 
@@ -1527,11 +1547,15 @@ class ClaudePane(QWidget):
         self.model_select.setToolTip("Modello per l'agente selezionato")
         self.model_select.addItems(CLAUDE_MODELS)
         self.model_select.setCursor(Qt.PointingHandCursor)
+        self.model_select.setIconSize(QSize(18, 18))
+        self.model_select.setFixedWidth(44)
         header.addWidget(self.model_select)
         self.effort_select = QComboBox()
         self.effort_select.setToolTip("Reasoning effort per l'agente selezionato")
         self.effort_select.addItems(EFFORT_LEVELS['claude'])
         self.effort_select.setCursor(Qt.PointingHandCursor)
+        self.effort_select.setIconSize(QSize(18, 18))
+        self.effort_select.setFixedWidth(44)
         header.addWidget(self.effort_select)
         header.addStretch(1)
         self.auto_permissions = QCheckBox('Automatico')
@@ -1567,7 +1591,7 @@ class ClaudePane(QWidget):
         self.output = QScrollArea()
         self.output.setWidgetResizable(True)
         self.output.setFrameShape(QFrame.NoFrame)
-        self.chat = QWidget()
+        self.chat = _ScanlineWidget()
         self.chat_layout = QVBoxLayout(self.chat)
         self.chat_layout.setContentsMargins(6, 10, 6, 10)
         self.chat_layout.setSpacing(10)
@@ -1609,9 +1633,11 @@ class ClaudePane(QWidget):
         )
         # Return sends; Ctrl+Return inserts a newline instead (see _PromptEdit)
         self.prompt.send_requested.connect(self._send)
-        self.prompt.setPlaceholderText('Prompt per claude -p... (Invio per inviare, Ctrl+Invio per andare a capo)')
+        self.prompt.setPlaceholderText('Chiedi, modifica o analizza il codice… (Invio invia · Ctrl+Invio va a capo)')
         composer = QHBoxLayout()
-        self.attach_btn = QPushButton('📎')
+        self.attach_btn = QPushButton('')
+        self.attach_btn.setIcon(draw_icon('attach', 18))
+        self.attach_btn.setIconSize(QSize(18, 18))
         self.attach_btn.setFixedSize(36, 42)
         self.attach_btn.setCursor(Qt.PointingHandCursor)
         self.attach_btn.setToolTip('Allega documenti o immagini da far leggere a Claude/Codex')
@@ -1629,6 +1655,8 @@ class ClaudePane(QWidget):
         layout.addLayout(composer)
 
         self.agent_select.currentIndexChanged.connect(self._agent_changed)
+        self.model_select.currentTextChanged.connect(lambda _text: self._refresh_selector_icons())
+        self.effort_select.currentTextChanged.connect(lambda _text: self._refresh_selector_icons())
         if not shutil.which('claude') and shutil.which('codex'):
             self.set_agent('codex')
         else:
@@ -1637,7 +1665,7 @@ class ClaudePane(QWidget):
 
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-left:1px solid {theme.BORDER};')
-        self.title.setStyleSheet(f'color:{theme.WARN}; letter-spacing:2px;')
+        self.title.setStyleSheet(f'color:{theme.ACCENT}; letter-spacing:2px;')
         self.controls_bar.setStyleSheet(
             f'#claudeControlsBar {{ background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; border-radius:9px; }}'
         )
@@ -1656,9 +1684,17 @@ class ClaudePane(QWidget):
             f'QComboBox::drop-down {{ border:none; width:16px; }}'
         )
         self.agent_select.setStyleSheet(combo_style)
-        self.model_select.setStyleSheet(combo_style)
-        self.effort_select.setStyleSheet(combo_style)
-        self.auto_permissions.setStyleSheet(f'color:{theme.WARN}; font-weight:600; spacing:6px;')
+        icon_combo_style = (
+            f'QComboBox {{ background:{theme.PANEL}; color:transparent; border:1px solid {theme.BORDER}; '
+            f'border-radius:8px; padding:4px 15px 4px 5px; }} '
+            f'QComboBox:hover {{ border-color:{theme.ACCENT}; }} '
+            f'QComboBox::drop-down {{ border:none; width:14px; }} '
+            f'QComboBox QAbstractItemView {{ background:{theme.PANEL}; color:{theme.TEXT}; '
+            f'border:1px solid {theme.BORDER}; selection-background-color:{theme.CODE_BG}; }}'
+        )
+        self.model_select.setStyleSheet(icon_combo_style)
+        self.effort_select.setStyleSheet(icon_combo_style)
+        self.auto_permissions.setStyleSheet(f'color:{theme.ACCENT}; font-weight:600; spacing:6px;')
         self.global_mode_btn.setStyleSheet(
             theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
         )
@@ -1670,8 +1706,12 @@ class ClaudePane(QWidget):
             f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
         )
         self._refresh_attachment_chips()
+        self.global_mode_btn.setIcon(draw_icon('globe', 14))
+        self.attach_btn.setIcon(draw_icon('attach', 18))
+        self.send_btn.setIcon(draw_icon('arrow-right', 14, '#111827'))
+        self._refresh_selector_icons()
         self.send_btn.setStyleSheet(
-            f'QPushButton {{ background:{theme.WARN}; color:#ffffff; border:none; border-radius:9px; '
+            f'QPushButton {{ background:{theme.ACCENT}; color:#111827; border:none; border-radius:9px; '
             f'padding:7px 15px; font-weight:700; }} '
             f'QPushButton:hover {{ background:{theme.ACCENT}; }} '
             f'QPushButton:pressed {{ background:{theme.TEXT}; }} '
@@ -1690,8 +1730,7 @@ class ClaudePane(QWidget):
 
     def _agent_changed(self):
         is_codex = self._agent() == 'codex'
-        base_prompt = 'Prompt per codex exec...' if is_codex else 'Prompt per claude -p...'
-        self.prompt.setPlaceholderText(f'{base_prompt} (Invio per inviare, Ctrl+Invio per andare a capo)')
+        self.prompt.setPlaceholderText('Chiedi, modifica o analizza il codice… (Invio invia · Ctrl+Invio va a capo)')
         self.auto_permissions.setEnabled(self._agent() == 'claude')
         current = self.model_select.currentText().strip()
         models = CODEX_MODELS if is_codex else CLAUDE_MODELS
@@ -1709,6 +1748,39 @@ class ClaudePane(QWidget):
             self.effort_select.setCurrentText(current_effort)
         else:
             self.effort_select.setCurrentIndex(0)  # e.g. xhigh/max don't carry over to codex
+        self._refresh_selector_icons()
+
+    # [CST] _EFFORT_COLORS — a low-to-high color ramp so the effort combo's face (it always shows
+    # its currently selected item's icon) reads at a glance without opening the dropdown or reading
+    # the tooltip: calm green at the low end, through gold/orange, to red at max, with the two
+    # unusual "ultra" presets in a visually distinct purple rather than continuing the ramp.
+    # [FN] _effort_color — theme color for one effort-level string, DIM (neutral) for the default
+    # [FN OPEN] _effort_color
+    def _effort_color(self, level):
+        return {
+            'low': theme.OK, 'medium': theme.ACCENT, 'high': theme.HOT,
+            'xhigh': theme.DANGER, 'max': theme.DANGER,
+            'ultracode': theme.WARN, 'ultra': theme.WARN,
+        }.get(level, theme.DIM)
+    # [FN CLOSED] _effort_color
+
+    # [FN CATEGORY] _refresh_selector_icons — model and effort remain native, fully clickable combo
+    # boxes, but their compact face is an SVG; the full selected value stays in the tooltip/menu.
+    # Effort additionally gets a per-item colored icon (_effort_color) instead of one fixed color for
+    # every level — the combo's closed face always shows its current item's own icon, so this alone
+    # makes the selected effort level readable by color without opening the dropdown.
+    # [FN] _refresh_selector_icons — refreshes AI selector icons and selected-value tooltips
+    # [FN OPEN] _refresh_selector_icons
+    def _refresh_selector_icons(self):
+        model_icon = draw_icon('model', 18)
+        for index in range(self.model_select.count()):
+            self.model_select.setItemIcon(index, model_icon)
+        self.model_select.setToolTip(f'Modello: {self.model_select.currentText()}')
+        for index in range(self.effort_select.count()):
+            level = self.effort_select.itemText(index).strip()
+            self.effort_select.setItemIcon(index, draw_icon('effort', 18, self._effort_color(level)))
+        self.effort_select.setToolTip(f'Effort: {self.effort_select.currentText()}')
+    # [FN CLOSED] _refresh_selector_icons
 
     def _automatic_permissions_changed(self, enabled):
         if enabled:
@@ -1972,7 +2044,9 @@ class ClaudePane(QWidget):
                 shrink_mark.setToolTip('Allegato ridotto prima dell\'invio (documento convertito o immagine compressa)')
                 shrink_mark.setStyleSheet(f'color:{theme.ACCENT}; border:none; font-weight:700;')
                 chip_layout.addWidget(shrink_mark)
-            remove_btn = QPushButton('×')
+            remove_btn = QPushButton('')
+            remove_btn.setIcon(draw_icon('close', 12))
+            remove_btn.setIconSize(QSize(12, 12))
             remove_btn.setFixedSize(18, 18)
             remove_btn.setCursor(Qt.PointingHandCursor)
             remove_btn.setToolTip('Rimuovi questo allegato')
@@ -3030,6 +3104,7 @@ class TitleBar(QWidget):
 
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
+        self.back_btn.setIcon(draw_icon('home', 16))
         self.theme_menu_action.setText('Giorno' if self.window.night_mode else 'Notte')
         # flat text entries (no button chrome/border) — a real menu bar, not a row of buttons
         self.menu_bar.setStyleSheet(

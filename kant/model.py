@@ -448,7 +448,7 @@ def build_new_element_node(tag, name, desc, language):
         tag=tag, name=name,
         open_raw=marker(f'[{tag} OPEN #{uid}] {name}'),
         closed_raw=marker(f'[{tag} CLOSED #{uid}] {name}'),
-        category_raw=marker(f'[{tag} CATEGORY] {header}') if desc else None,
+        category_raw=marker(f'[{tag} CATEGORY] {header}'),
         tag_raw=marker(f'[{tag}] {header}'),
         desc=desc, category_desc=desc or None, uid=uid,
         body=[Run(lines=code.split('\n'))] if code.strip() else [],

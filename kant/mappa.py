@@ -13,6 +13,7 @@ import math
 import os
 import re
 import time
+from html import escape as html_escape
 
 from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QSettings, QSize, Signal, QTimer
 from PySide6.QtGui import (
@@ -28,6 +29,22 @@ from kant.groupings import remap_member_key
 from kant.icons import draw_icon
 from kant.model import Node
 from kant.xref import XrefElement
+
+
+# [FN CATEGORY] _kant_mentions_html — MAPPA flow popups reuse the same tag palette and monospace
+# visual cue as the KANT tree instead of flattening references into unstyled prose.
+# [FN] _kant_mentions_html — colors and underlines KANT tag mentions in popup text
+# [FN OPEN] _kant_mentions_html
+def _kant_mentions_html(text):
+    html = html_escape(text).replace('\n', '<br>')
+    for tag, color in theme.TAG_COLORS.items():
+        html = html.replace(
+            f'[{tag}]',
+            f'<span style="color:{color}; font-family:Consolas; font-weight:700; '
+            f'text-decoration:underline">[{tag}]</span>',
+        )
+    return html
+# [FN CLOSED] _kant_mentions_html
 
 
 # [FN] _position_settings_key — the QSettings key MAPPA's node coordinates are stored under for a
@@ -769,11 +786,12 @@ class XrefMapView(QGraphicsView):
                 tooltip = f'{el.file}\n{el.category_desc or el.desc or el.name}'
                 rect.setToolTip(tooltip)
                 label_font = QFont('Consolas', round(font_pt))
+                label_font.setUnderline(True)
                 available_width = max(10, int(width) - 16)  # 8px margin each side
                 elided = QFontMetrics(label_font).elidedText(f'{prefix}[{el.tag}] {el.desc}', Qt.ElideRight, available_width)
                 label = QGraphicsSimpleTextItem(elided, rect)
                 label.setFont(label_font)
-                label.setBrush(QColor(theme.TEXT))
+                label.setBrush(QColor(theme.TAG_COLORS.get(el.tag, theme.TEXT)))
                 label.setPos(8, (height - label.boundingRect().height()) / 2)
                 label.setData(0, el.key)
                 label.setToolTip(tooltip)
@@ -1162,6 +1180,7 @@ class EdgeFlowPopup(QFrame):
         self.outgoing = QLabel()
         for label in (self.incoming, self.outgoing):
             label.setWordWrap(True)
+            label.setTextFormat(Qt.RichText)
             label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.title)
         layout.addWidget(self.state)
@@ -1192,10 +1211,11 @@ class EdgeFlowPopup(QFrame):
 
     def set_flow(self, title, incoming, outgoing, pinned):
         self._pinned = pinned
-        self.title.setText(title)
-        self.state.setText('📌 Fissato · clicca di nuovo l’arco per chiudere' if pinned else 'Hover · clicca l’arco per fissare')
-        self.incoming.setText('INCOMING\n' + ('\n'.join(f'← {item}' for item in incoming) if incoming else '← nessuno'))
-        self.outgoing.setText('OUTGOING\n' + ('\n'.join(f'→ {item}' for item in outgoing) if outgoing else '→ nessuno'))
+        self.title.setText(_kant_mentions_html(title))
+        self.title.setTextFormat(Qt.RichText)
+        self.state.setText('Fissato · clicca di nuovo l’arco per chiudere' if pinned else 'Hover · clicca l’arco per fissare')
+        self.incoming.setText(_kant_mentions_html('INCOMING\n' + ('\n'.join(f'← {item}' for item in incoming) if incoming else '← nessuno')))
+        self.outgoing.setText(_kant_mentions_html('OUTGOING\n' + ('\n'.join(f'→ {item}' for item in outgoing) if outgoing else '→ nessuno')))
         self.apply_style()
         self.adjustSize()
 
@@ -1493,6 +1513,13 @@ class XrefMapDialog(QDialog):
         )
         for b in (self.isolate_btn, self.heatmap_btn, self.direction_btn, self.expand_all_btn, self.collapse_all_btn, self.relayout_btn):
             b.setStyleSheet(theme.BUTTON_STYLE)
+        for button, kind in (
+            (self.drill_back_btn, 'arrow-left'), (self.expand_all_btn, 'expand'),
+            (self.collapse_all_btn, 'collapse'), (self.relayout_btn, 'undo'),
+            (self.isolate_btn, 'target'), (self.heatmap_btn, 'flame'),
+            (self.direction_btn, 'swap'), (self.containment_btn, 'nest'),
+        ):
+            button.setIcon(draw_icon(kind, 14))
         for tag, btn in self.tag_buttons.items():
             color = theme.TAG_COLORS.get(tag, theme.DIM)
             bg = theme.TAG_BACKGROUNDS.get(tag, theme.PANEL)
@@ -1573,7 +1600,12 @@ class XrefMapDialog(QDialog):
         self.file_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.file_combo.blockSignals(False)
         self._focus_file = self.file_combo.currentData()
-        self._refresh(fit=new_project or not self.view._node_items)
+        # a same-project refresh (e.g. a newly detected element after an xref rebuild) should settle
+        # into place like every other filter/isolate trigger already does (relayout_to's animated
+        # transition), not snap instantly via set_data — that path is reserved for a genuinely new
+        # project or the graph's very first render, where there's nothing on screen yet to animate from
+        has_nodes = bool(self.view._node_items)
+        self._refresh(fit=new_project or not has_nodes, relayout=has_nodes and not new_project)
     # [FN CLOSED] set_graph
 
     def _load_positions(self):

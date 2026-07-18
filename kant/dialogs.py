@@ -1,7 +1,7 @@
 """Small themed modal dialogs shared by the main window."""
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -9,8 +9,10 @@ from PySide6.QtWidgets import (
 )
 
 from kant import theme
+from kant.icons import draw_icon
 from kant.model import (
-    ELEMENT_LANGUAGES, ELEMENT_TAG_LABELS, element_skeleton, FILE_KIND_LABELS, build_new_file_content,
+    ELEMENT_LANGUAGES, ELEMENT_TAG_LABELS, Node, build_new_element_node, serialize_kant,
+    FILE_KIND_LABELS, build_new_file_content,
 )
 
 
@@ -35,13 +37,18 @@ class _PaletteInput(QLineEdit):
 
 
 class IdeDialogsMixin:
-    def _dialog(self, title, message, width=460, accent=False):
+    def _dialog(self, title, message, width=460, accent=False, danger=False):
         dialog = QDialog(self)
         dialog.setModal(True)
         dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         dialog.setMinimumWidth(width)
+        # danger=True gets a thicker, colored border on top of the heading color below — a stronger
+        # visual break from every other _ide_choice/_ide_yes_no caller's plain 1px BORDER, since a
+        # heading-color change alone was easy to miss for a genuinely consequential prompt (quitting
+        # the IDE with the app-close confirmation specifically, on request)
+        border = f'2px solid {theme.DANGER}' if danger else f'1px solid {theme.BORDER}'
         dialog.setStyleSheet(
-            f'QDialog {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; }} '
+            f'QDialog {{ background:{theme.PANEL}; border:{border}; }} '
             f'QLabel {{ color:{theme.TEXT}; }}'
         )
         layout = QVBoxLayout(dialog)
@@ -51,9 +58,9 @@ class IdeDialogsMixin:
         heading.setFont(QFont('Consolas', theme.TREE_FONT_PT + 2, QFont.DemiBold))
         # WARN (a distinct purple) is the default "this is a decision point" heading color shared
         # by every _ide_choice/_ide_yes_no caller (discard changes, git init, ...); accent=True is
-        # an opt-in for the few that should read as on-brand rather than as a warning — the app-close
-        # confirmation (_confirm_close) specifically, on request, not every confirmation dialog
-        heading.setStyleSheet(f'color:{theme.ACCENT if accent else theme.WARN};')
+        # an opt-in for the few that should read as on-brand rather than as a warning; danger=True
+        # is the strongest of the three, red, for a prompt that should be unmistakable at a glance
+        heading.setStyleSheet(f'color:{theme.DANGER if danger else (theme.ACCENT if accent else theme.WARN)};')
         layout.addWidget(heading)
         prompt = QLabel(message)
         prompt.setWordWrap(True)
@@ -103,7 +110,9 @@ class IdeDialogsMixin:
         title_label.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px; border:none;')
         header_row.addWidget(title_label)
         header_row.addStretch(1)
-        close_btn = QPushButton('×')
+        close_btn = QPushButton('')
+        close_btn.setIcon(draw_icon('close', 14))
+        close_btn.setIconSize(QSize(14, 14))
         close_btn.setFixedSize(26, 24)
         close_btn.setToolTip(close_tooltip)
         close_btn.setStyleSheet(theme.BUTTON_STYLE)
@@ -114,14 +123,20 @@ class IdeDialogsMixin:
         return dialog, outer, QVBoxLayout()
     # [FN CLOSED] _internal_window
 
-    def _ide_choice(self, title, message, choices, accent=False):
+    def _ide_choice(self, title, message, choices, accent=False, danger=False):
         """choices: (label, value) pairs, or (label, value, tooltip) triples for a consequential
         choice where the label alone doesn't make what happens obvious."""
-        dialog, layout = self._dialog(title, message, accent=accent)
+        dialog, layout = self._dialog(title, message, accent=accent, danger=danger)
         layout.setSpacing(14)
         result = {'value': None}
         row = QHBoxLayout()
         row.addStretch(1)
+        danger_style = (
+            f'QPushButton {{ background:{theme.PANEL}; color:{theme.DANGER}; border:1px solid {theme.DANGER}; '
+            f'border-radius:8px; padding:7px 13px; font-weight:700; }} '
+            f'QPushButton:hover {{ background:{theme.DANGER}; color:#ffffff; }} '
+            f'QPushButton:pressed {{ background:{theme.DANGER}; color:#ffffff; }}'
+        )
 
         def choose(value):
             result['value'] = value
@@ -132,14 +147,16 @@ class IdeDialogsMixin:
             button = QPushButton(label)
             if tooltip:
                 button.setToolTip(tooltip[0])
-            button.setStyleSheet(theme.BUTTON_STYLE)
+            # only the affirmative/consequential choice gets the red treatment — a plain "No"/cancel
+            # option styled red as well would read as if declining were the dangerous move instead
+            button.setStyleSheet(danger_style if danger and value else theme.BUTTON_STYLE)
             button.clicked.connect(lambda _checked=False, selected=value: choose(selected))
             row.addWidget(button)
         layout.addLayout(row)
         return result['value'] if dialog.exec() == QDialog.Accepted else None
 
-    def _ide_yes_no(self, title, message, accent=False):
-        return self._ide_choice(title, message, [('No', False), ('Si', True)], accent=accent) is True
+    def _ide_yes_no(self, title, message, accent=False, danger=False):
+        return self._ide_choice(title, message, [('No', False), ('Si', True)], accent=accent, danger=danger) is True
 
     def _ide_message(self, title, message):
         self._ide_choice(title, message, [('OK', True)])
@@ -258,7 +275,7 @@ class IdeDialogsMixin:
         field_label('Anteprima:')
         preview = QTextEdit()
         preview.setReadOnly(True)
-        preview.setFixedHeight(110)
+        preview.setFixedHeight(165)
         preview.setFont(QFont('Consolas', theme.CODE_FONT_PT))
         preview.setStyleSheet(field_style)
         body.addWidget(preview)
@@ -267,12 +284,15 @@ class IdeDialogsMixin:
             tag = tag_box.currentData()
             language = lang_box.currentText()
             name = name_field.text().strip() or 'nome'
-            preview.setPlainText(element_skeleton(tag, name, language))
+            desc = desc_field.text().strip() or 'descrizione da completare'
+            preview.setPlainText(serialize_kant(Node(tag='ROOT', name='', open_raw=None, body=[
+                build_new_element_node(tag, name, desc, language),
+            ])))
+            ok.setEnabled(bool(name_field.text().strip() and desc_field.text().strip()))
 
         tag_box.currentIndexChanged.connect(refresh_preview)
         lang_box.currentIndexChanged.connect(refresh_preview)
         name_field.textChanged.connect(refresh_preview)
-        refresh_preview()
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -286,6 +306,8 @@ class IdeDialogsMixin:
             buttons.addWidget(button)
         cancel.clicked.connect(dialog.reject)
         ok.clicked.connect(dialog.accept)
+        desc_field.textChanged.connect(refresh_preview)
+        refresh_preview()
         body.addLayout(buttons)
         outer.addLayout(body)
 
@@ -293,9 +315,10 @@ class IdeDialogsMixin:
         if dialog.exec() != QDialog.Accepted:
             return None
         name = name_field.text().strip()
-        if not name:
+        desc = desc_field.text().strip()
+        if not name or not desc:
             return None
-        return tag_box.currentData(), name, desc_field.text().strip(), lang_box.currentText()
+        return tag_box.currentData(), name, desc, lang_box.currentText()
     # [FN CLOSED] _ide_new_element_form
 
     # [FN CATEGORY] _ide_new_file_form — the "+" button at the bottom of the project tree's file
