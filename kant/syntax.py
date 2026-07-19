@@ -150,6 +150,18 @@ def check_kant_markers(text):
 _HEADER_NAME_SEPARATORS = (' — ', ' - ', ' -- ', ': ')
 
 
+# shared by both the CATEGORY and tagline empty-description checks below: strip the element's own
+# name (already confirmed present by _header_name_part's caller) plus one separator, leaving just
+# the description part — "" if there wasn't one, i.e. the line is only "Name —" or bare "Name"
+def _strip_name_prefix(text, name):
+    remainder = text[len(name):].strip() if text.startswith(name) else text
+    for sep in _HEADER_NAME_SEPARATORS:
+        marker = sep.strip()
+        if remainder.startswith(marker):
+            return remainder[len(marker):].strip()
+    return remainder
+
+
 def _header_name_part(text):
     text = (text or '').strip()
     for sep in _HEADER_NAME_SEPARATORS:
@@ -226,6 +238,11 @@ def audit_kant_headers(text):
                         'line': item.category_line, 'tag': item.tag, 'name': item.name,
                         'message': f'nome in CATEGORY ("{_header_name_part(cat_text)}") incoerente con OPEN ("{item.name}")',
                     })
+                elif not _strip_name_prefix(cat_text, item.name):
+                    # CATEGORY has no length cap, but a placeholder like "Name —" with nothing
+                    # after the dash is still not a real "how it works" explanation — same class
+                    # of gap the tagline check below already catches
+                    warnings.append({'line': item.category_line, 'tag': item.tag, 'name': item.name, 'message': 'CATEGORY vuota'})
             else:
                 warnings.append({'line': item.open_line, 'tag': item.tag, 'name': item.name, 'message': 'CATEGORY mancante'})
             if item.tag_raw:
@@ -246,12 +263,7 @@ def audit_kant_headers(text):
                     # this point — strip that known prefix plus one separator to get the actual
                     # description, rather than _short_desc's generic search (which can't tell "name
                     # followed by a separator and nothing else" from "no separator present at all")
-                    remainder = tl_text[len(item.name):].strip() if tl_text.startswith(item.name) else tl_text
-                    for sep in _HEADER_NAME_SEPARATORS:
-                        if remainder.startswith(sep.strip()):
-                            remainder = remainder[len(sep.strip()):].strip()
-                            break
-                    desc = remainder
+                    desc = _strip_name_prefix(tl_text, item.name)
                     if not desc:
                         warnings.append({'line': item.tagline_line, 'tag': item.tag, 'name': item.name, 'message': 'tagline vuota'})
                     elif len(desc.split()) > 8:

@@ -40,7 +40,8 @@ from kant.model import (
     KantParseError, ELEMENT_LANGUAGES, build_new_element_node, build_new_file_content,
 )
 from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending, is_safe_child_name
-from kant.syntax import check_file_syntax, run_command_for_path, _quote_arg
+from kant.syntax import check_file_syntax, run_command_for_path, _quote_arg, audit_kant_headers
+from kant import skeleton
 from kant.xref import build_xref, _walk_nodes
 from kant.groupings import load_groupings, save_groupings, new_grouping, add_member
 from kant.lsp import LSP_SERVERS_BY_EXT, file_uri, path_from_file_uri, lsp_server_for_path, LspClient
@@ -685,6 +686,22 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             btn.clicked.connect(callback)
             layout.addWidget(btn)
             self.action_toolbar_buttons[key] = btn
+        layout.addStretch(1)
+        # centered between the two button groups (not grouped with either one) — a quick, one-file-
+        # scoped action, distinct from /kant-code-map's whole-project sweep
+        ai_fill_btn = QToolButton()
+        ai_fill_btn.setIcon(draw_icon('sparkle', 18))
+        ai_fill_btn.setIconSize(QSize(18, 18))
+        ai_fill_btn.setToolTip(
+            "Chiedi all'AI (agente/modello/effort attualmente selezionati nella plancia AI) di "
+            'compilare i campi CATEGORY e descrizione vuoti della convenzione KANT in questo file. '
+            'Tag, nesting, marker OPEN/CLOSED e #id restano quelli già calcolati deterministicamente '
+            "dall'IDE — l'AI scrive solo il testo."
+        )
+        ai_fill_btn.setFixedSize(32, 28)
+        ai_fill_btn.clicked.connect(self._ai_fill_kant_blanks)
+        layout.addWidget(ai_fill_btn)
+        self.action_toolbar_buttons['sparkle'] = ai_fill_btn
         layout.addStretch(1)
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
@@ -1377,6 +1394,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.action_toolbar_buttons['find'].setEnabled(has_tab)
         self.action_toolbar_buttons['run'].setEnabled(has_tab)
         self.action_toolbar_buttons['debug'].setEnabled(has_tab)
+        self.action_toolbar_buttons['sparkle'].setEnabled(has_tab)
         self.run_target_label.setText(self._run_target_text())
         self.title_bar.project_search_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.project_replace_menu_action.setEnabled(bool(self.project_root_path))
@@ -4200,6 +4218,69 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._switch_terminal_tab(0)
         self.terminal.run_debug_python(tab.path, lines, os.path.dirname(tab.path) or None, self._active_python())
     # [FN CLOSED] _debug_current_file
+
+    # [FN CATEGORY] _ai_fill_kant_blanks — the deterministic/AI split for KANT comments, applied to
+    # one file: tag, name, nesting, OPEN/CLOSED placement and #id are never left to the AI to decide
+    # — kant/skeleton.py works those out from the code's own structure (exact for Python via ast,
+    # heuristic-but-tested for other languages) and inserts them as an ordinary undoable edit on
+    # this tab, same as any other in-place change. audit_kant_headers (already the full-project
+    # validator's own auditor) then lists every element whose CATEGORY/tagline is still blank —
+    # freshly inserted ones and any older hand-added-but-undescribed ones alike — and that exact
+    # list is handed to whichever agent/model/effort is currently selected in the AI pane, with an
+    # explicit instruction to write text only, never structure. Refuses to proceed if the file's
+    # existing markers don't even parse — "Verifica KANT" is the right tool for that, not this one.
+    # [FN] _ai_fill_kant_blanks — inserts a deterministic KANT skeleton, then asks the AI to fill it
+    # [FN OPEN] _ai_fill_kant_blanks
+    def _ai_fill_kant_blanks(self):
+        tab = self.active_tab
+        if tab is None:
+            return
+        text = serialize_kant(tab.tree)
+        result = skeleton.apply_skeleton(text, tab.path)
+        if result is not None:
+            new_text, _inserted = result
+            try:
+                new_tree = parse_kant(new_text)
+            except KantParseError as e:
+                self._ide_message('KANT', f'Impossibile inserire lo scheletro dei marker: {e}')
+                return
+            tab.remember_undo_state()
+            tab.tree = new_tree
+            tab.mark_dirty()
+            self._render_view(tab, tab.filter_uid)
+            self._update_tab_title(tab)
+            text = new_text
+
+        audit = audit_kant_headers(text)
+        if audit['errors']:
+            self._ide_message(
+                'KANT', 'Questo file ha marker KANT non validi: esegui prima "Verifica KANT" dal menu File.',
+            )
+            return
+        blanks = [
+            w for w in audit['warnings']
+            if w['message'] in ('CATEGORY mancante', 'CATEGORY vuota', 'tagline mancante', 'tagline vuota')
+        ]
+        if not blanks:
+            self._ide_message('KANT', 'Nessun campo KANT vuoto da compilare in questo file.')
+            return
+
+        listing = '\n'.join(f'- riga {b["line"]}: [{b["tag"]}] {b["name"]} — {b["message"]}' for b in blanks)
+        prompt = (
+            f'Nel file {tab.path} questi elementi KANT hanno CATEGORY e/o la riga descrittiva '
+            f'ancora vuoti:\n{listing}\n\n'
+            'Per ciascuno, compila SOLO il testo mancante, in questo formato in due parti:\n'
+            "1. Riga descrittiva (subito sotto CATEGORY, l'unica riga con solo \"[TAG] Nome\"): "
+            'spiegazione di COSA fa quel pezzo di codice, max 8 parole.\n'
+            '2. Riga CATEGORY: spiegazione di COME funziona, non semplicemente cosa è.\n'
+            'Non aggiungere, spostare o rinominare marker OPEN/CLOSED, non cambiare tag, nesting o '
+            '#id, non toccare elementi che hanno già una descrizione.'
+        )
+        effort = self.claude_pane.effort_select.currentText().strip()
+        if effort == MODEL_DEFAULT:
+            effort = None
+        self.claude_pane.run_prompt(prompt, effort=effort)
+    # [FN CLOSED] _ai_fill_kant_blanks
 
     # [FN CATEGORY] _vim_dispatch — the single callback every CodeEdit's vim engine (kant/widgets.py)
     # routes structural/cross-widget actions through: moving to an adjacent element, jumping to the

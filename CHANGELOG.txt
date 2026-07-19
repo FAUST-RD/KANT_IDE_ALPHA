@@ -1,5 +1,11 @@
 KANT IDE changelog
 
+2026-07-19 (77)
+- New `kant/skeleton.py`: deterministic KANT marker generation. Tag, name, nesting, OPEN/CLOSED placement, and #id are no longer left for an AI to decide — they're extracted from the code itself (exact, via Python's own `ast` module; a tested brace/string-aware heuristic scanner for other languages) and inserted with the CATEGORY/tagline description left as an explicit blank for a human or AI to fill in. Skips constructs that already have a marker (any tag), so it's safe to run repeatedly on a partially-tagged project; refuses to touch a file whose existing markers don't even parse.
+- `audit_kant_headers` now also flags a CATEGORY that's present but empty ("CATEGORY vuota") — it already caught an empty tagline the same way, CATEGORY silently didn't.
+- New action-toolbar button (center of the row, sparkle icon): runs the deterministic skeleton pass on the current file, then asks whichever agent/model/effort is currently selected in the AI pane to fill in only the resulting blank CATEGORY/tagline text — never structure.
+- Rewrote both KANT-authoring skills (`kant-code-map`, `kant-comment-standard`) around this split: a deterministic Phase 1 (run the skeleton tool) the AI no longer improvises, and a narrowed Phase 2 (fill blanks only) with an explicit two-part framing — the tagline says what the code does, CATEGORY says how it works.
+
 2026-07-19 (76)
 - Fixed duplicated text in the Incoming/Outgoing panel rows: each row was both a QListWidgetItem constructed WITH its own visible text AND a separate styled QLabel drawn on top via setItemWidget (which doesn't clear the item's own text/foreground painting underneath it) — the item now carries no text of its own, only selection data; the label is the sole thing drawn.
 

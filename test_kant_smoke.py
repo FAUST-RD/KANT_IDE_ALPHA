@@ -52,6 +52,7 @@ from kant.workspace import (
 from kant.permission_mcp import handle_message
 from kant.groupings import load_groupings, new_grouping, save_groupings
 from kant.syntax import audit_kant_headers, check_kant_markers
+from kant import skeleton
 from kant.projectops import _canonical_map_text, build_kant_map, validate_kant_project
 
 
@@ -351,6 +352,53 @@ class KantSmokeTest(unittest.TestCase):
         assert set_agent_calls == ['claude'] and model_select_calls == ['claude-opus-4-8']
         assert launch_args[1][1]['effort'] == 'high'
 
+    def _fake_ai_fill_window(self, tab):
+        prompts, messages = [], []
+        window = MainWindow.__new__(MainWindow)
+        window.tabs = type('Tabs', (), {'currentWidget': lambda _self: tab})()
+        window._render_view = lambda _tab, _uid: None
+        window._update_tab_title = lambda _tab: None
+        window._ide_message = lambda title, message: messages.append((title, message))
+        window.claude_pane = type('Pane', (), {
+            'effort_select': type('Combo', (), {'currentText': lambda _self: MODEL_DEFAULT})(),
+            'run_prompt': lambda _self, prompt, effort=None: prompts.append((prompt, effort)),
+        })()
+        return window, prompts, messages
+
+    def test_ai_fill_kant_blanks_inserts_skeleton_and_prompts_the_current_agent(self):
+        src = 'def alpha():\n    pass\n'
+        tab = type('Tab', (), {
+            'path': 'mod.py', 'tree': parse_kant(src), 'filter_uid': None,
+            'remember_undo_state': lambda _self: None, 'mark_dirty': lambda _self: None,
+        })()
+        window, prompts, messages = self._fake_ai_fill_window(tab)
+        MainWindow._ai_fill_kant_blanks(window)
+        assert not messages
+        assert len(prompts) == 1
+        prompt, effort = prompts[0]
+        assert 'alpha' in prompt and '[FN]' in prompt and 'mod.py' in prompt
+        assert effort is None
+        # the skeleton insertion replaced the tab's tree with a marked-up one, in place
+        assert tab.tree.body and any(getattr(n, 'name', None) == 'alpha' for n in tab.tree.body if hasattr(n, 'name'))
+
+    def test_ai_fill_kant_blanks_reports_when_nothing_is_blank(self):
+        src = '\n'.join([
+            '# [FN CATEGORY] alpha — reads a value and doubles it',
+            '# [FN] alpha — doubles the input',
+            '# [FN OPEN] alpha',
+            'def alpha():',
+            '    pass',
+            '# [FN CLOSED] alpha',
+        ])
+        tab = type('Tab', (), {
+            'path': 'mod.py', 'tree': parse_kant(src), 'filter_uid': None,
+            'remember_undo_state': lambda _self: None, 'mark_dirty': lambda _self: None,
+        })()
+        window, prompts, messages = self._fake_ai_fill_window(tab)
+        MainWindow._ai_fill_kant_blanks(window)
+        assert not prompts
+        assert messages and 'Nessun campo KANT vuoto' in messages[0][1]
+
     def test_agent_command_building(self):
         automatic = _agent_command('codex', 'tagga', True)[1]
         assert '--full-auto' not in automatic
@@ -546,7 +594,14 @@ class KantSmokeTest(unittest.TestCase):
                 context_hint='Implicit context: shop/__init__.py::__all__. Read it yourself.',
             )
             args = _ProcessStub.captured[-1]
-            system_prompt = args[args.index('--append-system-prompt') + 1]
+            # a longer combined system prompt (hint + skill bodies) switches from the inline flag
+            # to a temp-file flag past run_prompt's own length threshold — a real, correct branch,
+            # not something this test should assume away; read whichever one was actually used
+            if '--append-system-prompt' in args:
+                system_prompt = args[args.index('--append-system-prompt') + 1]
+            else:
+                system_prompt_path = args[args.index('--append-system-prompt-file') + 1]
+                system_prompt = Path(system_prompt_path).read_text(encoding='utf-8')
             assert system_prompt.index('Implicit context') < system_prompt.index('KANT comment standard')
         finally:
             kant_widgets_module.QProcess = original_process_cls
@@ -3237,6 +3292,20 @@ class KantSmokeTest(unittest.TestCase):
         assert result2['errors'] == []
         assert any('tagline vuota' in w['message'] for w in result2['warnings'])
 
+        # CATEGORY has no length cap, but a present-yet-empty one ("Name —", nothing after the
+        # dash) still needs to be flagged as needing content — mirrors the tagline check above,
+        # which already covered this case while CATEGORY silently did not
+        empty_category = '\n'.join([
+            '# [FN CATEGORY] load_user —',
+            '# [FN] load_user - reads a user',
+            '# [FN OPEN #abc] load_user',
+            'def load_user(): pass',
+            '# [FN CLOSED #abc] load_user',
+        ])
+        result3 = audit_kant_headers(empty_category)
+        assert result3['errors'] == []
+        assert any('CATEGORY vuota' in w['message'] for w in result3['warnings'])
+
     def test_audit_kant_headers_warns_on_unknown_tag_without_erroring(self):
         # a tag outside the fixed 8-tag set is a warning, not a hard error — an existing legacy file
         # using a nonstandard tag must still open and validate without a new blocking failure
@@ -3244,6 +3313,113 @@ class KantSmokeTest(unittest.TestCase):
         result = audit_kant_headers(src)
         assert result['errors'] == []
         assert any('non appartiene' in w['message'] for w in result['warnings'])
+
+    def test_scan_python_exact_tag_nesting_and_cst_vs_var(self):
+        src = '\n'.join([
+            'NIGHT = False',
+            '',
+            'TAG_COLORS = {}',
+            '',
+            'def set_theme(night):',
+            '    global NIGHT',
+            '    NIGHT = night',
+            '',
+            'class Foo:',
+            '    def method_a(self):',
+            '        pass',
+            '',
+            'def test_something():',
+            '    assert True',
+        ])
+        elements = {(e.tag, e.name, e.depth): e for e in skeleton.scan_python(src, 'mod.py')}
+        assert ('VAR', 'NIGHT', 0) in elements  # reassigned via `global` in set_theme -> VAR
+        assert ('CST', 'TAG_COLORS', 0) in elements  # assigned once, never rebound -> CST
+        assert ('FN', 'set_theme', 0) in elements
+        assert ('CLS', 'Foo', 0) in elements
+        assert ('FN', 'method_a', 1) in elements  # nested inside Foo, depth 1
+        assert ('TST', 'test_something', 0) in elements  # test_ prefix -> TST, not FN
+
+    def test_scan_regex_handles_braces_inside_strings_and_comments(self):
+        src = '\n'.join([
+            'function alpha(a) {',
+            '  // a comment with a brace } in it',
+            '  const s = "a { fake brace";',
+            '  return a;',
+            '}',
+            '',
+            'class Beta {',
+            '  constructor() {}',
+            '}',
+        ])
+        elements = skeleton.scan_regex(src, 'JavaScript', 'app.js')
+        by_name = {e.name: e for e in elements}
+        assert by_name['alpha'].tag == 'FN' and by_name['alpha'].end_line == 5
+        assert by_name['Beta'].tag == 'CLS' and by_name['Beta'].end_line == 9
+
+    def test_insert_skeleton_keeps_nesting_valid_when_spans_share_an_end_line(self):
+        # Foo's own closing line is the same original line method_b's body ends on (no trailing
+        # blank line) -- a real regression this insertion order once got backwards, closing the
+        # outer class before its own still-open inner method
+        src = '\n'.join([
+            'class Foo:',
+            '    def method_a(self):',
+            '        pass',
+            '',
+            '    def method_b(self):',
+            '        pass',
+        ])
+        elements = skeleton.scan_python(src, 'mod.py')
+        new_text, count = skeleton.insert_skeleton(src, elements, 'Python')
+        assert count == len(elements)
+        tree = parse_kant(new_text)  # raises KantParseError on any crossed/mismatched span
+        audit = audit_kant_headers(new_text)
+        assert audit['errors'] == []
+        assert all(w['message'] in ('CATEGORY vuota', 'tagline vuota') for w in audit['warnings'])
+
+    def test_apply_skeleton_skips_already_marked_elements_and_is_idempotent(self):
+        src = '\n'.join([
+            '# [FN CATEGORY] alpha — already documented',
+            '# [FN] alpha — does the first thing',
+            '# [FN OPEN] alpha',
+            'def alpha():',
+            '    pass',
+            '# [FN CLOSED] alpha',
+            '',
+            'def beta():',
+            '    pass',
+        ])
+        result = skeleton.apply_skeleton(src, 'mod.py')
+        assert result is not None
+        new_text, count = result
+        assert count == 1  # only beta was unmarked
+        assert 'already documented' in new_text  # alpha's existing marker untouched
+        assert '[FN OPEN] beta' in new_text
+        parse_kant(new_text)  # round-trips cleanly
+        assert skeleton.apply_skeleton(new_text, 'mod.py') is None  # nothing left to insert
+
+    def test_apply_skeleton_refuses_when_existing_markers_are_broken(self):
+        broken = '# [FN OPEN] alpha\ndef alpha(): pass\n# [FN CLOSED] beta\n'
+        assert skeleton.unmarked_elements(broken, skeleton.scan_python(broken, 'mod.py')) is None
+
+    def test_apply_skeleton_to_project_walks_and_writes_every_file(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'a.py').write_text('def alpha():\n    pass\n', encoding='utf-8')
+            (root / 'b.py').write_text(
+                '# [FN CATEGORY] beta — already documented\n'
+                '# [FN] beta — does a thing\n'
+                '# [FN OPEN] beta\n'
+                'def beta():\n    pass\n'
+                '# [FN CLOSED] beta\n',
+                encoding='utf-8',
+            )
+            (root / 'broken.py').write_text('# [FN OPEN] x\ndef x(): pass\n# [FN CLOSED] y\n', encoding='utf-8')
+            (root / 'readme.txt').write_text('not code', encoding='utf-8')
+            changed, skipped = skeleton.apply_skeleton_to_project(str(root))
+            changed_files = dict(changed)
+            assert changed_files == {'a.py': 1}  # b.py already fully marked, readme.txt unsupported
+            assert skipped == ['broken.py']
+            assert '[FN OPEN] alpha' in (root / 'a.py').read_text(encoding='utf-8')
 
     def test_validate_kant_project_distinguishes_all_five_map_states(self):
         with _temp_dir() as tmp:

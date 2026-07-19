@@ -7,13 +7,74 @@ description: Analyze the repository and add/fix KANT tag comments in source code
 
 Usage: `/kant-code-map` — no arguments.
 
-When invoked, for the current project:
-1. Analyze the repository and add or correct KANT tag comments above every
-   tagged element in source code (see "Code comments" below).
-2. Do not create, edit, or hand-compose `KANT_<project-name>.md` yourself —
-   KANT IDE regenerates that file deterministically from the source markers
-   after your changes are reviewed and applied. Writing it yourself only
-   produces a version the IDE immediately overwrites.
+This command runs in two phases. **Phase 1 is not your job to improvise** —
+tag, name, nesting, OPEN/CLOSED placement, and `#id` are facts about the
+code, computed deterministically by `kant/skeleton.py`, never guessed at by
+reading the file. **Phase 2 is the only phase you actually write anything
+for**: filling in the two description lines a blank marker leaves behind.
+Never do Phase 2's job by re-deriving structure yourself, and never do
+Phase 1's job by hand-writing OPEN/CLOSED/CATEGORY-tag/#id — if either phase
+looks wrong, that's a bug in `kant/skeleton.py` to report, not something to
+silently work around by writing markers yourself.
+
+## Phase 1 — deterministic skeleton (run this, don't write it)
+
+Run this from the project root before touching any source file:
+
+```
+python -c "from kant.skeleton import apply_skeleton_to_project; changed, skipped = apply_skeleton_to_project('.'); print(f'{len(changed)} file aggiornati, {len(skipped)} saltati'); [print(f'  {f}: +{n} elementi') for f, n in changed]; [print(f'  SALTATO (marker non validi): {f}') for f in skipped]"
+```
+
+This inserts OPEN/CATEGORY/tagline/CLOSED markers for every still-unmarked
+module-level construct (class, function, constant, mutable global, test) in
+every recognized source file, with the CATEGORY and tagline description left
+as an explicit blank (`Name —`, nothing after the dash) — that shape is
+exactly what Phase 2 below finds and fills. Elements that already have a
+marker (any tag) are left untouched, so this is safe to run on a project
+that's already partially tagged. A file whose *existing* markers don't even
+parse is skipped, not guessed at — list any `SALTATO` files in your final
+summary as needing a manual look (or "Verifica KANT" in the IDE) instead of
+attempting to fix their nesting yourself.
+
+Python gets exact tag/name/nesting/span extraction (via the stdlib `ast`
+module — no guessing). Every other language uses a tested but heuristic
+brace/string-aware scanner, top-level constructs only — nested methods in
+non-Python files may still need a tag added by hand via the IDE's own
+"+ Aggiungi elemento" dialog, since reliably matching a method to its
+containing class by regex alone isn't something this can promise.
+
+## Phase 2 — fill the blanks (this is your actual job)
+
+List every element that still needs a description:
+
+```
+python -c "
+from kant.projectops import iter_project_text_files
+from kant.syntax import audit_kant_headers
+for path, text in iter_project_text_files('.'):
+    audit = audit_kant_headers(text)
+    for w in audit['warnings']:
+        if w['message'] in ('CATEGORY mancante', 'CATEGORY vuota', 'tagline mancante', 'tagline vuota'):
+            print(f'{path}:{w[\"line\"]}: [{w[\"tag\"]}] {w[\"name\"]} — {w[\"message\"]}')
+"
+```
+
+For each listed location, edit *only* its CATEGORY line and its tagline —
+never the OPEN/CLOSED lines, never the tag, never the `#id`, never anything
+about nesting or ordering. Two-part format, and they ask different
+questions:
+
+1. **Tagline** (the line with just `[TAG] Name — ...`, max 8 words):
+   what that piece of code does — `[FN] list_users — GET /users, paginated list`.
+2. **CATEGORY** (no length cap): how it works — the mechanism, not a
+   restatement of what it is. `[FN CATEGORY] list_users — paginates using
+   offset = (page-1) * MAX_PAGE_SIZE, capped server-side`, not `[FN CATEGORY]
+   list_users — a function that lists users`.
+
+Do not create, edit, or hand-compose `KANT_<project-name>.md` yourself —
+KANT IDE regenerates that file deterministically from the source markers
+after your changes are reviewed and applied. Writing it yourself only
+produces a version the IDE immediately overwrites.
 
 ## KANT file structure (reference only — the IDE generates this, you don't)
 
@@ -50,85 +111,9 @@ Fixed tag set — do not add others:
 ## Rules
 
 - Only run on the exact `/kant-code-map` command — never as a side effect of another task, never from paraphrased natural language.
-- Cover all real code files; skip assets, binaries, deps (node_modules, venv, .git, dist, build).
+- Phase 1 first, always — never write a CATEGORY/tagline for an element that doesn't have OPEN/CLOSED yet; run the skeleton command instead of hand-adding the marker.
+- Phase 2 touches CATEGORY/tagline text only. Never OPEN/CLOSED, never the tag, never `#id`, never reorders or renames anything.
+- There is no INCOMING/OUTGOING line to write. Who calls/uses an element and what it calls/uses is computed deterministically from the code by KANT IDE's cross-reference system, not hand-written here. Never add `[TAG INCOMING]`/`[TAG OUTGOING]` lines.
+- Cover all real code files; skip assets, binaries, deps (node_modules, venv, .git, dist, build) — Phase 1's command already does this for you.
 - The source code is the single source of truth. The generated map always reflects it — never edit the map to "fix" a mismatch, fix or add the source markers instead.
-- Before finishing, re-check your source edits against the most-violated rules below: every tag comment matches its declaration's name; CATEGORY and the tag line agree with OPEN/CLOSED on tag and name; no `[TAG INCOMING]`/`[TAG OUTGOING]` lines were added.
-
-## Code comments
-
-Every tagged element is delimited by an opening marker and a closing marker,
-paired by tag + name. These markers are structural bookkeeping only — they
-never carry a description and never merge with the category line or the
-8-word tag line.
-
-**Opening** (immediately above the element), three lines in this fixed order:
-
-1. **Category line** — general explanation of how the element works:
-   `[TAG CATEGORY] Name — how it works`. No length cap.
-2. **Tag line** — matches the KANT file exactly:
-   `[TAG] Name — description, max 8 words`. This line is the grep anchor.
-3. **Open marker** — pure boundary start, no description: `[TAG OPEN] Name`
-
-**Closing** (immediately after the element's last line), one line:
-
-1. `[TAG CLOSED] Name`
-
-There is no INCOMING/OUTGOING line to write. Who calls/uses an element and
-what it calls/uses is computed deterministically from the code by KANT IDE's
-cross-reference system, not hand-written here — a stale or wrong data-flow
-comment is worse than none. Never add `[TAG INCOMING]`/`[TAG OUTGOING]`
-lines to new or edited code.
-
-Tag and name in OPEN and CLOSED must match, so the exact span of every
-element is recoverable by grep alone, even with nesting.
-
-**Nesting must be strictly well-formed**, like balanced brackets: an OPEN's
-matching CLOSED must appear before the CLOSED of whatever element contains
-it. Crossing spans are invalid and must be fixed, not left for a tool to
-guess at.
-
-RIGHT (properly nested):
-```
-[CLS OPEN] UserManager
-- [FN OPEN] login
-- [FN CLOSED] login
-[CLS CLOSED] UserManager
-```
-
-WRONG (crossing spans — the class closes before its own child does):
-```
-[CLS OPEN] UserManager
-- [FN OPEN] login
-[CLS CLOSED] UserManager
-- [FN CLOSED] login
-```
-
-Example (Python):
-```python
-# [FN CATEGORY] list_users — paginates using offset = (page-1) * MAX_PAGE_SIZE, capped server-side
-# [FN] list_users — GET /users, paginated list
-# [FN OPEN] list_users
-def list_users(page: int = 1):
-    offset = (page - 1) * MAX_PAGE_SIZE
-    return db.query(User).limit(MAX_PAGE_SIZE).offset(offset).all()
-# [FN CLOSED] list_users
-
-# [FN CATEGORY] create_user — validates payload, hashes password, persists row
-# [FN] create_user — POST /users, creates new user
-# [FN OPEN] create_user
-def create_user(payload: UserCreate):
-    ...
-# [FN CLOSED] create_user
-```
-
-Binding rules:
-
-- Every comment must include the element's name, matching the declaration
-  it delimits — unambiguous even out of context.
-- The tag line must be byte-identical to the corresponding entry the IDE
-  will generate in the KANT map (minus indentation), so grep on either one
-  finds the other.
-- Every OPEN must have exactly one CLOSED with the same tag and name;
-  an unmatched marker is invalid.
-- When renaming an element, rename it in all five places in the same edit:
-  declaration, category line, tag line, open marker, and closed marker.
+- Before finishing, confirm every location Phase 2 listed now has real text (not `Name —` still empty), and list any Phase-1 `SALTATO` files in your summary.
