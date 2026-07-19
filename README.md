@@ -89,6 +89,14 @@ class UserService:
 
 Marker lines can use the host language's normal comment syntax, including `#`, `//`, `--`, `;`, `/* ... */`, and `<!-- ... -->`. KANT IDE preserves marker text and all unedited source while turning marked regions into its navigable model.
 
+## Generating the convention
+
+Tag, name, nesting, `OPEN`/`CLOSED` placement, and `#stable-id` are never left for an AI to guess at — they are facts about the code, extracted deterministically (exactly, via Python's own `ast` module, for `.py` files; a tested heuristic scanner for other languages). An AI is only ever asked to write the two description lines a marker leaves blank, never the structure around them.
+
+- **Opening a project with no KANT structure yet** offers to run this deterministic pass first. Only afterward — and only if you want it — does it ask an AI to fill in the resulting blank descriptions, nothing else.
+- **The sparkle button** in the editor's action toolbar, next to Run/Debug, does the same for one open file at a time: insert whatever markers are missing, then ask whichever agent/model/effort is currently selected in the AI panel to fill in only the blanks it just created.
+- **`/kant-code-map`** runs the same deterministic pass across the whole project before an AI touches anything, then asks it to fill in every remaining blank description — never to decide tags or nesting itself.
+
 ## One structure, several ways of knowing
 
 The same KANT structure supports multiple views of the codebase:

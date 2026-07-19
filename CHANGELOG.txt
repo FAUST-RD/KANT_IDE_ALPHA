@@ -1,5 +1,10 @@
 KANT IDE changelog
 
+2026-07-19 (78)
+- Opening a project with no KANT structure yet now offers the deterministic skeleton pass first ("generate the marker skeleton — tag, nesting, #id, no AI?"); only afterward, and only if that ran, does it separately ask whether an AI should fill in the resulting blank descriptions — replacing the old single prompt that handed the whole job (structure and text both) to `/kant-code-map`.
+- New `_launch_kant_fill_blanks`/`_project_kant_blanks`: the project-wide sibling of the action-toolbar's per-file "fill blanks" button, used by the above flow and reusable anywhere a whole-project blanks listing is needed.
+- README: new "Generating the convention" section documenting the deterministic-skeleton-then-AI-fills split across all three entry points (project open, the sparkle button, `/kant-code-map`).
+
 2026-07-19 (77)
 - New `kant/skeleton.py`: deterministic KANT marker generation. Tag, name, nesting, OPEN/CLOSED placement, and #id are no longer left for an AI to decide — they're extracted from the code itself (exact, via Python's own `ast` module; a tested brace/string-aware heuristic scanner for other languages) and inserted with the CATEGORY/tagline description left as an explicit blank for a human or AI to fill in. Skips constructs that already have a marker (any tag), so it's safe to run repeatedly on a partially-tagged project; refuses to touch a file whose existing markers don't even parse.
 - `audit_kant_headers` now also flags a CATEGORY that's present but empty ("CATEGORY vuota") — it already caught an empty tagline the same way, CATEGORY silently didn't.

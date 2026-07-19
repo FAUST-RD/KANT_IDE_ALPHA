@@ -49,7 +49,7 @@ from kant.dialogs import IdeDialogsMixin
 from kant.gitops import GitOpsMixin
 from kant.projectops import (
     _canonical_map_text, build_kant_map, definition_locations, has_any_kant_tags, iter_kant_tagged_files,
-    reference_locations, scan_project_replace, search_project, validate_kant_project,
+    iter_project_text_files, reference_locations, scan_project_replace, search_project, validate_kant_project,
 )
 from kant.pyenv import (
     dependency_file, detect_venvs, has_module, interpreter_label, interpreter_version,
@@ -75,6 +75,23 @@ ROLE_KEY = Qt.UserRole + 7   # xref element key '<rel_path>::<uid>', on Incoming
 # document order (pre-order over tagged nodes, matching _nodes_in_order) of a 'section' tree item —
 # the reliable fallback when a legacy (no #id) file's uid doesn't survive _open_file's own reparse
 ROLE_ORDER = Qt.UserRole + 8
+
+
+# [FN] _kant_fill_prompt — the fill-blanks instruction body shared by the single-file button
+# (_ai_fill_kant_blanks) and the project-wide launcher (_launch_kant_fill_blanks) — same WHAT/HOW
+# framing and the same "structure is already correct, don't touch it" guardrail either way
+# [FN OPEN] _kant_fill_prompt
+def _kant_fill_prompt(intro, listing):
+    return (
+        f'{intro}\n{listing}\n\n'
+        'Per ciascuno, compila SOLO il testo mancante, in questo formato in due parti:\n'
+        "1. Riga descrittiva (subito sotto CATEGORY, l'unica riga con solo \"[TAG] Nome\"): "
+        'spiegazione di COSA fa quel pezzo di codice, max 8 parole.\n'
+        '2. Riga CATEGORY: spiegazione di COME funziona, non semplicemente cosa è.\n'
+        'Non aggiungere, spostare o rinominare marker OPEN/CLOSED, non cambiare tag, nesting o '
+        '#id, non toccare elementi che hanno già una descrizione.'
+    )
+# [FN CLOSED] _kant_fill_prompt
 
 
 # [FN CATEGORY] _TreeItemLabel — tree rows use setItemWidget with a rich-HTML QLabel instead of plain
@@ -2410,16 +2427,35 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 ):
                     self._sync_kant_map()
             else:
-                # no KANT convention anywhere yet — that requires actually reading the code and
-                # deciding what to tag, which only /kant-code-map (via Claude Code) can do
+                # no KANT convention anywhere yet — the deterministic skeleton pass (tag, name,
+                # nesting, #id from the code's own structure, no AI involved) always runs first;
+                # the AI is only asked afterward, and only to fill in the descriptions the
+                # skeleton pass leaves blank, never to invent the structure itself
                 if self._ide_yes_no(
                     'Convenzione KANT',
                     'Questo progetto non usa ancora la convenzione KANT.\n'
-                    'Lanciare /kant-code-map per taggare il codice e generare la mappa?',
+                    'Generare adesso lo scheletro dei marker (tag, nesting, #id) in modo '
+                    'deterministico, senza AI?',
                 ):
-                    choice = self._choose_ai_agent()
-                    if choice:
-                        self._launch_kant_code_map(choice['agent'], choice['model'], choice['effort'])
+                    changed, skipped = skeleton.apply_skeleton_to_project(path)
+                    self._rebuild_tree()
+                    total = sum(count for _rel, count in changed)
+                    summary = f'{len(changed)} file aggiornati, {total} elementi taggati.'
+                    if skipped:
+                        summary += (
+                            f'\n{len(skipped)} file saltati (marker già presenti non validi): '
+                            + ', '.join(skipped)
+                        )
+                    self._ide_message('Scheletro KANT', summary)
+                    self._sync_kant_map()
+                    if changed and self._ide_yes_no(
+                        'Convenzione KANT',
+                        "Vuoi che l'AI compili adesso le descrizioni (categoria e riga breve) "
+                        'rimaste vuote?',
+                    ):
+                        choice = self._choose_ai_agent()
+                        if choice:
+                            self._launch_kant_fill_blanks(choice['agent'], choice['model'], choice['effort'])
         self._watch_project_tree()
         self.stack.setCurrentIndex(1)
         self._set_project_chrome_visible(True)
@@ -4266,21 +4302,51 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
 
         listing = '\n'.join(f'- riga {b["line"]}: [{b["tag"]}] {b["name"]} — {b["message"]}' for b in blanks)
-        prompt = (
-            f'Nel file {tab.path} questi elementi KANT hanno CATEGORY e/o la riga descrittiva '
-            f'ancora vuoti:\n{listing}\n\n'
-            'Per ciascuno, compila SOLO il testo mancante, in questo formato in due parti:\n'
-            "1. Riga descrittiva (subito sotto CATEGORY, l'unica riga con solo \"[TAG] Nome\"): "
-            'spiegazione di COSA fa quel pezzo di codice, max 8 parole.\n'
-            '2. Riga CATEGORY: spiegazione di COME funziona, non semplicemente cosa è.\n'
-            'Non aggiungere, spostare o rinominare marker OPEN/CLOSED, non cambiare tag, nesting o '
-            '#id, non toccare elementi che hanno già una descrizione.'
-        )
+        prompt = _kant_fill_prompt(f'Nel file {tab.path} questi elementi KANT hanno CATEGORY e/o la riga descrittiva ancora vuoti:', listing)
         effort = self.claude_pane.effort_select.currentText().strip()
         if effort == MODEL_DEFAULT:
             effort = None
         self.claude_pane.run_prompt(prompt, effort=effort)
     # [FN CLOSED] _ai_fill_kant_blanks
+
+    # [FN] _project_kant_blanks — every element with a blank CATEGORY/tagline across the whole
+    # project (same audit_kant_headers check _ai_fill_kant_blanks uses per file), plus any file
+    # whose existing markers don't parse — the caller decides whether/how to surface those
+    # [FN OPEN] _project_kant_blanks
+    def _project_kant_blanks(self, root):
+        lines, broken = [], []
+        for path, text in iter_project_text_files(root):
+            rel = os.path.relpath(path, root)
+            audit = audit_kant_headers(text)
+            if audit['errors']:
+                broken.append(rel)
+                continue
+            for w in audit['warnings']:
+                if w['message'] in ('CATEGORY mancante', 'CATEGORY vuota', 'tagline mancante', 'tagline vuota'):
+                    lines.append(f'- {rel}:{w["line"]}: [{w["tag"]}] {w["name"]} — {w["message"]}')
+        return lines, broken
+    # [FN CLOSED] _project_kant_blanks
+
+    # [FN CATEGORY] _launch_kant_fill_blanks — the project-wide sibling of _ai_fill_kant_blanks,
+    # used right after a fresh deterministic skeleton pass on project open: the skeleton tool has
+    # already decided every tag/name/nesting/#id, so this asks the AI for the one thing left —
+    # filling in the descriptions — instead of the old /kant-code-map prompt that asked it to
+    # figure out structure too.
+    # [FN] _launch_kant_fill_blanks — asks Claude/Codex to fill in every blank KANT description
+    # [FN OPEN] _launch_kant_fill_blanks
+    def _launch_kant_fill_blanks(self, agent, model=None, effort=None):
+        if model:
+            self.claude_pane.set_agent(agent)
+            self.claude_pane.model_select.setCurrentText(model)
+        lines, _broken = self._project_kant_blanks(self.project_root_path)
+        if not lines:
+            return
+        prompt = _kant_fill_prompt(
+            'In questo progetto questi elementi KANT hanno CATEGORY e/o la riga descrittiva ancora vuoti:',
+            '\n'.join(lines),
+        )
+        self.claude_pane.run_prompt(prompt, agent=agent, auto_permissions_once=True, effort=effort)
+    # [FN CLOSED] _launch_kant_fill_blanks
 
     # [FN CATEGORY] _vim_dispatch — the single callback every CodeEdit's vim engine (kant/widgets.py)
     # routes structural/cross-widget actions through: moving to an adjacent element, jumping to the

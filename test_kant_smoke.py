@@ -352,6 +352,62 @@ class KantSmokeTest(unittest.TestCase):
         assert set_agent_calls == ['claude'] and model_select_calls == ['claude-opus-4-8']
         assert launch_args[1][1]['effort'] == 'high'
 
+    def test_project_kant_blanks_lists_every_file_and_flags_broken_ones(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'a.py').write_text(
+                '# [FN CATEGORY] alpha —\n# [FN] alpha —\n# [FN OPEN] alpha\ndef alpha(): pass\n# [FN CLOSED] alpha\n',
+                encoding='utf-8',
+            )
+            (root / 'b.py').write_text(
+                '# [FN CATEGORY] beta — already documented\n# [FN] beta — does a thing\n'
+                '# [FN OPEN] beta\ndef beta(): pass\n# [FN CLOSED] beta\n',
+                encoding='utf-8',
+            )
+            (root / 'broken.py').write_text('# [FN OPEN] x\ndef x(): pass\n# [FN CLOSED] y\n', encoding='utf-8')
+            window = MainWindow.__new__(MainWindow)
+            lines, broken = MainWindow._project_kant_blanks(window, str(root))
+            assert any('a.py' in line and 'alpha' in line for line in lines)
+            assert not any('b.py' in line for line in lines)  # beta already has real text
+            assert broken == ['broken.py']
+
+    def test_launch_kant_fill_blanks_prompts_with_the_project_wide_listing(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'a.py').write_text(
+                '# [FN CATEGORY] alpha —\n# [FN] alpha —\n# [FN OPEN] alpha\ndef alpha(): pass\n# [FN CLOSED] alpha\n',
+                encoding='utf-8',
+            )
+            launch_args = []
+            window = MainWindow.__new__(MainWindow)
+            window.project_root_path = str(root)
+            window.claude_pane = type('Pane', (), {
+                'run_prompt': lambda _self, *args, **kwargs: launch_args.append((args, kwargs)),
+                'set_agent': lambda _self, agent: None,
+                'model_select': type('Combo', (), {'setCurrentText': lambda _self, text: None})(),
+            })()
+            MainWindow._launch_kant_fill_blanks(window, 'claude')
+            assert len(launch_args) == 1
+            prompt = launch_args[0][0][0]
+            assert 'alpha' in prompt and 'a.py' in prompt and 'COME funziona' in prompt
+
+    def test_launch_kant_fill_blanks_does_nothing_when_no_blanks_exist(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'a.py').write_text(
+                '# [FN CATEGORY] alpha — documented\n# [FN] alpha — does a thing\n'
+                '# [FN OPEN] alpha\ndef alpha(): pass\n# [FN CLOSED] alpha\n',
+                encoding='utf-8',
+            )
+            launch_args = []
+            window = MainWindow.__new__(MainWindow)
+            window.project_root_path = str(root)
+            window.claude_pane = type('Pane', (), {
+                'run_prompt': lambda _self, *args, **kwargs: launch_args.append((args, kwargs)),
+            })()
+            MainWindow._launch_kant_fill_blanks(window, 'claude')
+            assert not launch_args
+
     def _fake_ai_fill_window(self, tab):
         prompts, messages = [], []
         window = MainWindow.__new__(MainWindow)
