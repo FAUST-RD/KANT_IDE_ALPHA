@@ -1,5 +1,9 @@
 KANT IDE changelog
 
+2026-07-19 (79)
+- New `kant/toolchains.py`: real per-language toolchain scanners for the deterministic KANT skeleton pass, closing the "regex only" gap for non-Python languages. Go (`go/ast`), TypeScript/JavaScript (an already-installed `typescript` package), C# (Roslyn, referenced directly from the .NET SDK's own bundled compiler assemblies), Java (the JDK's Compiler Tree API), and C++ (`clang -ast-dump=json`) are each tried before falling back to the existing regex scanner — nothing here ever touches the network (no NuGet/npm/pip install at runtime, only what's already on disk). C#/TypeScript were verified end-to-end against a real local install; every scanner degrades to `None` (falls back to regex) on any missing tool or unexpected output, so a bug in an unverified one can't do worse than not having it.
+- README: "Generating the convention" now documents the toolchain-first, regex-fallback split per language.
+
 2026-07-19 (78)
 - Opening a project with no KANT structure yet now offers the deterministic skeleton pass first ("generate the marker skeleton — tag, nesting, #id, no AI?"); only afterward, and only if that ran, does it separately ask whether an AI should fill in the resulting blank descriptions — replacing the old single prompt that handed the whole job (structure and text both) to `/kant-code-map`.
 - New `_launch_kant_fill_blanks`/`_project_kant_blanks`: the project-wide sibling of the action-toolbar's per-file "fill blanks" button, used by the above flow and reusable anywhere a whole-project blanks listing is needed.

@@ -53,6 +53,7 @@ from kant.permission_mcp import handle_message
 from kant.groupings import load_groupings, new_grouping, save_groupings
 from kant.syntax import audit_kant_headers, check_kant_markers
 from kant import skeleton
+from kant import toolchains as kant_toolchains
 from kant.projectops import _canonical_map_text, build_kant_map, validate_kant_project
 
 
@@ -3476,6 +3477,109 @@ class KantSmokeTest(unittest.TestCase):
             assert changed_files == {'a.py': 1}  # b.py already fully marked, readme.txt unsupported
             assert skipped == ['broken.py']
             assert '[FN OPEN] alpha' in (root / 'a.py').read_text(encoding='utf-8')
+
+    def test_elements_from_json_drops_malformed_entries(self):
+        good = {'tag': 'FN', 'name': 'alpha', 'start_line': 1, 'end_line': 2, 'depth': 0}
+        missing_key = {'tag': 'FN', 'name': 'beta', 'start_line': 1}
+        wrong_type = {'tag': 'FN', 'name': 'gamma', 'start_line': 'nope', 'end_line': 2}
+        elements = kant_toolchains.elements_from_json([good, missing_key, wrong_type, 'not a dict'])
+        assert [e.name for e in elements] == ['alpha']
+
+    def test_clang_json_parser_handles_line_omission_and_skips_unknown_shapes(self):
+        # a hand-built stand-in for clang -ast-dump=json's shape: real clang omits "line" on a
+        # node when it's unchanged from the previously-dumped node, and pulls in declarations from
+        # #included system headers (marked with a "file" key on their loc) that must be skipped
+        fake_ast = {
+            'inner': [
+                {'kind': 'FunctionDecl', 'name': 'std_helper', 'loc': {'file': '/usr/include/stdio.h', 'line': 1}},
+                {
+                    'kind': 'FunctionDecl', 'name': 'alpha',
+                    'loc': {'line': 3}, 'range': {'begin': {'line': 3}, 'end': {'line': 5}},
+                },
+                {
+                    'kind': 'CXXRecordDecl', 'name': 'Widget', 'tagUsed': 'class',
+                    'loc': {'line': 7}, 'range': {'begin': {'line': 7}, 'end': {}},  # end omits "line" -> inherits 7
+                },
+                {'kind': 'SomeFutureNodeKind', 'name': 'mystery', 'loc': {'line': 9}},
+                {
+                    'kind': 'VarDecl', 'name': 'MAX', 'type': {'qualType': 'const int'},
+                    'loc': {'line': 10}, 'range': {'begin': {'line': 10}, 'end': {'line': 10}},
+                },
+                {
+                    'kind': 'NamespaceDecl', 'inner': [
+                        {
+                            'kind': 'FunctionDecl', 'name': 'nested_fn',
+                            'loc': {'line': 12}, 'range': {'begin': {'line': 12}, 'end': {'line': 12}},
+                        },
+                    ],
+                },
+            ],
+        }
+        elements = kant_toolchains._elements_from_clang_json(fake_ast)
+        by_name = {e.name: e for e in elements}
+        assert 'std_helper' not in by_name  # pulled from a system header, not this file
+        assert 'mystery' not in by_name  # unrecognized kind -> skipped, not guessed at
+        assert by_name['alpha'].tag == 'FN' and by_name['alpha'].start_line == 3 and by_name['alpha'].end_line == 5
+        assert by_name['Widget'].tag == 'CLS' and by_name['Widget'].end_line == 7  # inherited the omitted line
+        assert by_name['MAX'].tag == 'CST'
+        assert by_name['nested_fn'].tag == 'FN'  # namespace-level decls are still reached
+
+    def test_toolchain_scanners_return_none_gracefully_when_the_binary_is_missing(self):
+        original_which = kant_toolchains.shutil.which
+        kant_toolchains.shutil.which = lambda _cmd: None
+        try:
+            assert kant_toolchains.scan_go('package main', 'x.go') is None
+            assert kant_toolchains.scan_java('class X {}', 'X.java') is None
+            assert kant_toolchains.scan_cpp('void f() {}', 'x.cpp') is None
+            assert kant_toolchains.scan_csharp('class X {}', 'X.cs') is None
+            assert kant_toolchains.scan_typescript('const x = 1;', 'x.ts') is None
+        finally:
+            kant_toolchains.shutil.which = original_which
+
+    def test_scan_source_tries_toolchain_before_falling_back_to_regex(self):
+        original = dict(kant_toolchains.SCANNERS)
+        try:
+            kant_toolchains.SCANNERS['Go'] = lambda _text, _path: [
+                skeleton.SkeletonElement('FN', 'fromToolchain', 1, 1, 0),
+            ]
+            elements, method = skeleton.scan_source('func fromToolchain() {}', 'x.go')
+            assert method == 'toolchain' and elements[0].name == 'fromToolchain'
+
+            kant_toolchains.SCANNERS['Go'] = lambda _text, _path: None  # simulates "tool not found"
+            elements2, method2 = skeleton.scan_source('func fromRegex() {}', 'x.go')
+            assert method2 == 'regex' and elements2[0].name == 'fromRegex'
+        finally:
+            kant_toolchains.SCANNERS.clear()
+            kant_toolchains.SCANNERS.update(original)
+
+    def test_csharp_toolchain_scanner_real_dotnet_sdk_if_present(self):
+        info = kant_toolchains._dotnet_sdk_info()
+        if info is None:
+            self.skipTest('no local .NET SDK with a bundled Roslyn compiler found')
+        cs_src = '\n'.join([
+            'public class UserService', '{',
+            '    public const int MaxUsers = 100;',
+            '    public void LoadUser(int id) { }',
+            '}',
+        ])
+        elements = kant_toolchains.scan_csharp(cs_src, 'UserService.cs')
+        assert elements is not None
+        by_name = {e.name: e for e in elements}
+        assert by_name['UserService'].tag == 'CLS'
+        assert by_name['MaxUsers'].tag == 'CST'
+        assert by_name['LoadUser'].tag == 'FN' and by_name['LoadUser'].depth == 1
+
+    def test_typescript_toolchain_scanner_real_install_if_present(self):
+        ts_path = kant_toolchains._find_typescript(__file__)
+        if ts_path is None and shutil.which('npm') is None:
+            self.skipTest('no local typescript install and no npm to look for a global one')
+        ts_src = 'const MAX = 1;\nfunction loadUser(id) {\n  return id;\n}\n'
+        elements = kant_toolchains.scan_typescript(ts_src, os.path.join(os.path.dirname(__file__), 'probe.ts'))
+        if elements is None:
+            self.skipTest('no usable typescript install found for this project directory')
+        by_name = {e.name: e for e in elements}
+        assert by_name['MAX'].tag == 'CST'
+        assert by_name['loadUser'].tag == 'FN'
 
     def test_validate_kant_project_distinguishes_all_five_map_states(self):
         with _temp_dir() as tmp:

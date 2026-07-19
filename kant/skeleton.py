@@ -8,12 +8,15 @@ the dash) for a human or an AI to fill in afterward.
 
 Tag, name, nesting, span, and #id are never left to an AI to decide — they're facts about the code,
 extracted deterministically. Only the description is left blank. Python gets exact results via the
-stdlib ``ast`` module; every other language falls back to a brace/string-aware heuristic scanner
-(the same rigor ``kant/projectops.py``'s ``definition_locations`` already uses for symbol lookup,
-just applied to whole-file enumeration instead of one known name). ``EXTERNAL_SCANNERS`` is the
-extension point for a real per-language toolchain integration (Go's own ``go/ast``, a project's own
-``typescript`` compiler, Roslyn via ``dotnet``, ...) to slot in later without redesigning any of
-this — none are wired in yet, since none could be verified end-to-end in this environment.
+stdlib ``ast`` module. Go, TypeScript/JavaScript, C#, Java, and C++ each first try a real toolchain
+scanner (``kant/toolchains.py`` — the target language's own compiler: ``go/ast``, an installed
+``typescript`` package, Roslyn via the .NET SDK's own bundled assemblies, the JDK's Compiler Tree
+API, ``clang -ast-dump=json``), falling back to a brace/string-aware heuristic scanner below (the
+same rigor ``kant/projectops.py``'s ``definition_locations`` already uses for symbol lookup, just
+applied to whole-file enumeration instead of one known name) whenever the toolchain isn't
+installed or its output doesn't parse as expected. C#/TypeScript were verified end-to-end against
+a real local install; Go/Java/C++ were written with the same care but their toolchains weren't
+available to run in the environment this was built in — see kant/toolchains.py's own docstring.
 """
 import ast
 import os
@@ -22,6 +25,7 @@ from dataclasses import dataclass, field
 
 from kant.model import ELEMENT_LANGUAGES, Node, parse_kant, KantParseError
 from kant.fileio import write_file_atomic
+from kant import toolchains
 
 
 # extension -> ELEMENT_LANGUAGES display name, extended with a few real-world extensions
@@ -226,12 +230,20 @@ def _brace_span_end(lines, start_index):
     return None  # never closed — don't guess a span that might be wrong
 
 
-# [FN] scan_source — dispatches to the exact Python scanner or the regex fallback by extension
+# [FN CATEGORY] scan_source — dispatches by extension: Python always gets the exact ast-based
+# scanner; Go/TS/JS/C#/Java/C++ try their real toolchain scanner first (kant/toolchains.py) and
+# only fall back to the regex heuristic if that toolchain isn't installed or its output doesn't
+# come back as the expected shape — never on a language it doesn't recognize at all.
+# [FN] scan_source — dispatches to the exact scanner (ast or toolchain) or the regex fallback
 # [FN OPEN] scan_source
 def scan_source(text, file_path):
     language = language_for_path(file_path)
     if language == 'Python':
         return scan_python(text, file_path), 'ast'
+    if language in toolchains.SCANNERS:
+        result = toolchains.SCANNERS[language](text, file_path)
+        if result is not None:
+            return result, 'toolchain'
     if language in _BRACE_LANGUAGES:
         return scan_regex(text, language, file_path), 'regex'
     return [], 'unsupported'
