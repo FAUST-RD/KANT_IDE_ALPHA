@@ -267,3 +267,61 @@ def reference_locations(root, symbol, limit=200):
                 if len(matches) >= limit:
                     return matches
     return matches
+
+
+# [CST CATEGORY] _KANT_ERROR_KB — one entry per audit_kant_headers/parse_kant message shape this
+# project actually produces (kant/syntax.py's warnings/errors, kant/model.py's KantParseError
+# text). Matched by regex against the bare message (ROLE_TEXT — no "path:line:" prefix), in order,
+# first match wins. 'key' groups occurrences for the recurrence counter across whatever variable
+# text (tag/name) the message itself carries. 'fix' is None where no SAFE deterministic or AI
+# action exists — a wrong or destructive auto-fix would be worse than making the user read the
+# explanation and edit it themselves (renaming markers, deciding whether to delete an orphaned
+# one, resolving a duplicate #id by hand).
+# [CST] _KANT_ERROR_KB — regex -> (key, explanation, fix) for known KANT validation error shapes
+# [CST OPEN] _KANT_ERROR_KB
+_KANT_ERROR_KB = [
+    (re.compile(r'^manca KANT_.+ nella radice del progetto$|^KANT map non coerente'), 'mappa-non-sincronizzata',
+     "La mappa è un file generato: può essere ricostruita deterministicamente dai marker KANT del progetto.",
+     'sync-map'),
+    (re.compile(r'^CATEGORY mancante$'), 'category-mancante',
+     "Manca la riga [TAG CATEGORY] sopra il marker OPEN di questo elemento — deve spiegare COME "
+     "funziona (il meccanismo), non ripetere cosa fa in altre parole.", 'ai-fill'),
+    (re.compile(r'^CATEGORY vuota$'), 'category-vuota',
+     "La riga [TAG CATEGORY] c'è ma il testo dopo il trattino è vuoto — un placeholder mai "
+     "compilato.", 'ai-fill'),
+    (re.compile(r'^tagline mancante$'), 'tagline-mancante',
+     "Manca la riga descrittiva [TAG] Nome — descrizione, la riga breve (max 8 parole) che il "
+     "pannello KANT mostra come nome dell'elemento.", 'ai-fill'),
+    (re.compile(r'^tagline vuota$'), 'tagline-vuota',
+     "La riga descrittiva c'è ma il testo dopo il trattino è vuoto — un placeholder mai compilato.",
+     'ai-fill'),
+    (re.compile(r'^descrizione oltre le 8 parole'), 'tagline-lunga',
+     "La riga descrittiva supera il limite di 8 parole previsto dalla convenzione — è pensata "
+     "come un'etichetta breve, non una spiegazione (quella va nella riga CATEGORY, senza limite "
+     "di lunghezza). Va accorciata a mano: qual è la parte davvero essenziale?", None),
+    (re.compile(r'^intestazione \[.+\] pendente, non associata a un OPEN successivo$'), 'pendente',
+     "Questa riga ha la forma di un marker KANT ([TAG ...]) ma non è seguita da un vero OPEN — o è "
+     "un marker rimasto a metà (l'elemento a cui si riferiva è stato cancellato/spostato senza "
+     "toccare questa riga), oppure del testo normale che assomiglia per caso alla sintassi dei "
+     "marker. Se il file è una mappa KANT_*.md generata, questo non dovrebbe più succedere: la "
+     "mappa non viene più scansionata come sorgente.", None),
+    (re.compile(r'^UID duplicato #'), 'uid-duplicato',
+     "Lo stesso #id KANT compare in più punti del progetto — gli id devono essere unici a livello "
+     "di progetto (kant/model.py li assegna una sola volta e non li rigenera mai da solo). Va "
+     "risolto a mano: quale delle occorrenze è quella \"vera\"?", None),
+    (re.compile(r'incoerente con OPEN'), 'nome-incoerente',
+     "Il nome o il tag in questa riga (CATEGORY o descrittiva) non corrisponde a quello nel "
+     "marker OPEN dell'elemento — probabilmente è stato rinominato in un punto ma non negli altri "
+     "(CATEGORY, riga descrittiva e OPEN devono avere lo stesso nome).", 'repair-marker'),
+    (re.compile(r'does not match the open element|id does not match its OPEN'), 'closed-incoerente',
+     "Il marker CLOSED non corrisponde all'elemento attualmente aperto. Tag, nome e #id possono "
+     "essere riallineati senza modificare il codice contenuto.", 'repair-marker'),
+]
+# [CST CLOSED] _KANT_ERROR_KB
+
+
+def _kant_error_lookup(message):
+    for pattern, key, explanation, fix in _KANT_ERROR_KB:
+        if pattern.search(message):
+            return key, explanation, fix
+    return None, "Nessuna spiegazione registrata per questo tipo di errore.", None

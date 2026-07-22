@@ -4,7 +4,8 @@ AI navigation:
 - editor/terminal primitives: ``KantHighlighter`` through ``TerminalPane``;
 - agent process and review UI: ``ClaudePane`` (its ``offer_ai_review`` is the whole review UI now —
   the diff itself renders live in the coding board, see ``mainwindow.py``'s ``_enter_ai_review_mode``);
-- KANT section/tree chrome: section widgets, ``ProjectTree``, and ``TitleBar``;
+- KANT section/tree chrome: section widgets, ``ProjectTree``, ``TitleBar``, and the tree/tab row
+  labels (``_TreeItemLabel``, ``_TabLabel``, ``_KantTabBar``);
 - file state: ``FileTab``.
 
 The MAPPA subsystem (layout helpers, ``XrefMapView``, ``XrefMapDialog``) lives in ``mappa.py``.
@@ -32,8 +33,8 @@ from PySide6.QtCore import (
     QSize, Signal, QTimer,
 )
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
-    QPainterPathStroker, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
+    QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap,
+    QPolygonF, QPainterPathStroker, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
@@ -41,7 +42,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMenu, QMenuBar, QPlainTextEdit, QPushButton, QScrollArea,
     QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QStyle, QStyleOptionButton, QStyleOptionComboBox, QStylePainter,
-    QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
+    QTabBar, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
 from kant import theme
@@ -3531,3 +3532,70 @@ class FileTab(QWidget):
             self.autosave_timer.stop()
         return self.autosave()
 # [FN CLOSED] FileTab
+
+
+# [FN CATEGORY] _TreeItemLabel — tree rows use setItemWidget with a rich-HTML QLabel instead of plain
+# item text. The label is transparent to mouse input so the tree viewport receives the native
+# click and drag gesture directly.
+# [FN] _TreeItemLabel — rich tree-row label that leaves mouse handling to the tree
+# [FN OPEN] _TreeItemLabel
+class _TreeItemLabel(QLabel):
+    def __init__(self, _tree, _item, html):
+        super().__init__(html)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+# [FN CLOSED] _TreeItemLabel
+
+
+# [FN CATEGORY] _TabLabel — QTabBar.setTabButton() lets a rich-HTML QLabel replace a tab's plain
+# text, giving the tab strip the same colored/bold "[TAG] name" convention already used in the
+# tree and the coding panel. It selects its own tab on click, then forwards the same press (and
+# any move/release) on to the QTabBar itself — the label now covers the tab's whole visible area,
+# so without forwarding, QTabBar's own mouse handling never sees the press and its built-in
+# drag-to-reorder (tabs are setMovable(True)) stops working from the labeled region entirely.
+# [FN] _TabLabel — a tab-strip label that forwards its own clicks to select its tab
+# [FN OPEN] _TabLabel
+class _TabLabel(QLabel):
+    def __init__(self, tabs, tab):
+        super().__init__()
+        self.setTextFormat(Qt.RichText)
+        self._tabs = tabs
+        self._tab = tab
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._tabs.setCurrentWidget(self._tab)
+        self._forward_to_tab_bar(event)
+
+    def mouseMoveEvent(self, event):
+        self._forward_to_tab_bar(event)
+
+    def mouseReleaseEvent(self, event):
+        self._forward_to_tab_bar(event)
+
+    def _forward_to_tab_bar(self, event):
+        bar = self._tabs.tabBar()
+        pos = self.mapTo(bar, event.position().toPoint())
+        forwarded = QMouseEvent(
+            event.type(), QPointF(pos), event.globalPosition(),
+            event.button(), event.buttons(), event.modifiers(),
+        )
+        QApplication.sendEvent(bar, forwarded)
+        event.accept()
+# [FN CLOSED] _TabLabel
+
+
+# [FN CATEGORY] _KantTabBar — QTabBar's own tabSizeHint only accounts for a tab's text/icon, not a
+# button widget set via setTabButton — with the plain text cleared in favor of _TabLabel, tabs
+# were sizing themselves as if empty and clipping the rich label down to a sliver. This widens the
+# hint to fit the label's own sizeHint plus room for the close button.
+# [FN] _KantTabBar — a QTabBar that sizes tabs to fit their LeftSide button widget
+# [FN OPEN] _KantTabBar
+class _KantTabBar(QTabBar):
+    def tabSizeHint(self, index):
+        size = super().tabSizeHint(index)
+        label = self.tabButton(index, QTabBar.LeftSide)
+        if label is not None:
+            needed = label.sizeHint().width() + 40  # + close button and padding
+            size.setWidth(max(size.width(), needed))
+        return size
+# [FN CLOSED] _KantTabBar

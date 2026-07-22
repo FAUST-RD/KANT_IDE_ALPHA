@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 import kant_editor
 from kant import theme
 from kant import mainwindow as kant_mainwindow_module
+from kant import file_ops_panel as kant_file_ops_panel_module
 from kant import widgets as kant_widgets_module
 from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT, ROLE_LINE, ROLE_KEY
 from kant.lsp import file_uri, LspClient
@@ -2586,9 +2587,9 @@ class KantSmokeTest(unittest.TestCase):
             fmt_window._apply_local_text = lambda tab, text, message: applied.append((text, message))
             fmt_window._ide_message = lambda title, msg: applied.append(('MESSAGE', msg))
 
-            original_which = kant_mainwindow_module.shutil.which
-            original_has_module = kant_mainwindow_module.has_module
-            original_run = kant_mainwindow_module.subprocess.run
+            original_which = kant_file_ops_panel_module.shutil.which
+            original_has_module = kant_file_ops_panel_module.has_module
+            original_run = kant_file_ops_panel_module.subprocess.run
 
             def fake_which(name):
                 return '/usr/bin/black' if name == 'black' else None
@@ -2597,15 +2598,15 @@ class KantSmokeTest(unittest.TestCase):
                 assert args[:3] == [sys.executable, '-m', 'black']
                 return subprocess.CompletedProcess(args, 0, stdout=input.replace('x=1', 'x = 1'), stderr='')
 
-            kant_mainwindow_module.shutil.which = fake_which
-            kant_mainwindow_module.has_module = lambda _python, module: module == 'black'
-            kant_mainwindow_module.subprocess.run = fake_run
+            kant_file_ops_panel_module.shutil.which = fake_which
+            kant_file_ops_panel_module.has_module = lambda _python, module: module == 'black'
+            kant_file_ops_panel_module.subprocess.run = fake_run
             try:
                 MainWindow._format_with_external_tool(fmt_window)
             finally:
-                kant_mainwindow_module.shutil.which = original_which
-                kant_mainwindow_module.has_module = original_has_module
-                kant_mainwindow_module.subprocess.run = original_run
+                kant_file_ops_panel_module.shutil.which = original_which
+                kant_file_ops_panel_module.has_module = original_has_module
+                kant_file_ops_panel_module.subprocess.run = original_run
             assert len(applied) == 1
             assert 'x = 1' in applied[0][0]
 
