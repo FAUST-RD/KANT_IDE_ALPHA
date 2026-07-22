@@ -162,6 +162,10 @@ Language-server features activate only when a compatible server is already avail
 
 Start small. A project does not need to be fully tagged before KANT becomes useful.
 
+## Roadmap
+
+- Completely redesign and rebuild the debugging experience.
+
 ## Development
 
 - [`PROJECT_MAP.md`](PROJECT_MAP.md) shows where each feature lives and how the main flows connect.

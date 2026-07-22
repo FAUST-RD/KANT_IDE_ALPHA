@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 from kant import theme
 from kant.theme import set_theme
 from kant.icons import draw_icon
+from kant.i18n import install_ui_language, translate_text
 from kant.model import (
     Run, Node, parse_kant, serialize_kant, read_top_level_label, read_top_level_label_result,
     KantParseError, ELEMENT_LANGUAGES, build_new_element_node, build_new_file_content,
@@ -171,37 +172,14 @@ def _write_kant_fill_markdown(intro, listing):
 
 
 # [FN CATEGORY] _TreeItemLabel — tree rows use setItemWidget with a rich-HTML QLabel instead of plain
-# item text. It forwards the complete mouse gesture to the tree viewport: forwarding only clicks
-# made rows open correctly but swallowed move/release, so QTreeWidget could never start a drag.
-# [FN] _TreeItemLabel — forwards tree-row mouse gestures through its rich-text label
+# item text. The label is transparent to mouse input so the tree viewport receives the native
+# click and drag gesture directly.
+# [FN] _TreeItemLabel — rich tree-row label that leaves mouse handling to the tree
 # [FN OPEN] _TreeItemLabel
 class _TreeItemLabel(QLabel):
-    def __init__(self, tree, item, html):
+    def __init__(self, _tree, _item, html):
         super().__init__(html)
-        self._tree = tree
-        self._item = item
-
-    def mousePressEvent(self, event):
-        self._forward_to_tree(event)
-
-    def mouseMoveEvent(self, event):
-        self._forward_to_tree(event)
-
-    def mouseReleaseEvent(self, event):
-        self._forward_to_tree(event)
-
-    def mouseDoubleClickEvent(self, event):
-        self._forward_to_tree(event)
-
-    def _forward_to_tree(self, event):
-        viewport = self._tree.viewport()
-        pos = self.mapTo(viewport, event.position().toPoint())
-        forwarded = QMouseEvent(
-            event.type(), QPointF(pos), event.globalPosition(),
-            event.button(), event.buttons(), event.modifiers(),
-        )
-        QApplication.sendEvent(viewport, forwarded)
-        event.accept()
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
 # [FN CLOSED] _TreeItemLabel
 
 
@@ -285,6 +263,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.open_tabs = {}  # path -> FileTab, every currently open file
         self._ai_context_page = None  # last coding tab selected by the user
         self.settings = QSettings('KANT', 'KANT Editor')  # persists the dragged column width
+        self.ui_language = 'it' if str(self.settings.value('language', 'en')).lower().startswith('it') else 'en'
+        self._ui_language = install_ui_language(QApplication.instance(), self.ui_language)
         self._pure_ai_data = self._load_pure_ai_data()
         self._active_ai_conversation_id = None
         self._active_ai_conversation_path = None
@@ -394,6 +374,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._startup_splash.hide()
         self._check_crash_recovery()
         self._check_pending_ai_snapshot()
+        self._ui_language.apply(self)
 
     # [FN CATEGORY] _setup_shortcuts — window-wide keyboard shortcuts (work regardless of which
     # child widget has focus); Ctrl+F is handled separately by _build_find_bar's own Escape shortcut
@@ -796,6 +777,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             if self.active_tab is not None:
                 self._update_io_tabs(self._active_filter_uid())
         self._refresh_recent_folders()
+        self._ui_language.apply(self)
 
     # [FN CATEGORY] _build_action_toolbar — a persistent one-click icon row for the highest-
     # frequency actions (Save/Undo/Redo/Run/Find), in its own row below the title bar rather than
@@ -909,19 +891,19 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         if self._kant_quick_action_has_structure():
             btn.setIcon(draw_icon('sparkle', 18))
-            btn.setToolTip(
+            btn.setToolTip(self._tr(
                 "Chiedi all'AI (agente/modello/effort attualmente selezionati nella plancia AI) di "
                 'compilare i campi CATEGORY e descrizione vuoti della convenzione KANT in quello che '
                 "e' attualmente visualizzato nella plancia di coding (l'intero file, o solo "
                 "l'elemento isolato — anche una foglia). Tag, nesting, marker OPEN/CLOSED e #id "
                 "restano quelli già calcolati deterministicamente dall'IDE — l'AI scrive solo il testo."
-            )
+            ))
         else:
             btn.setIcon(draw_icon('nest', 18))
-            btn.setToolTip(
+            btn.setToolTip(self._tr(
                 'Genera la struttura KANT (tag, nesting, #id) in modo deterministico, senza AI, '
                 'per il file aperto nella plancia di coding.'
-            )
+            ))
     # [FN CLOSED] _style_kant_quick_button
 
     def _style_action_toolbar(self):
@@ -1089,8 +1071,18 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
     def _set_language(self, code):
         code = 'it' if str(code).lower().startswith('it') else 'en'
+        self.ui_language = code
         self.settings.setValue('language', code)
         self._apply_welcome_language()
+        self._ui_language.set_language(code)
+        self._ui_language.apply(self)
+        if hasattr(self, 'claude_pane'):
+            self.claude_pane.refresh_focus_label()
+        if self.map_dialog is not None:
+            self.map_dialog._refresh()
+
+    def _tr(self, text):
+        return translate_text(text, self.ui_language)
 
     def _apply_welcome_language(self):
         italian = str(self.settings.value('language', 'en')).lower().startswith('it')
@@ -1705,7 +1697,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN OPEN] _build_ai_focus_summary
     def _build_ai_focus_summary(self):
         if self.claude_pane.global_mode_btn.isChecked():
-            return 'intero progetto'
+            return 'intero progetto' if self.ui_language == 'it' else 'whole project'
         tab, uid = self._ai_context_target()
         if tab is None:
             return None
@@ -1771,8 +1763,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setAlignment(Qt.AlignTop)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(1)
+        layout.setContentsMargins(4, 0, 4, 4)
+        layout.setSpacing(4)
         scroll.setWidget(container)
         return scroll, layout
 
@@ -2225,15 +2217,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _update_tree_drop_handler(self):
         file_mode = self.view_mode == 'file'
         self.tree.file_drop_handler = self._handle_tree_file_drop if file_mode else None
-        self.tree.file_move_allowed = self._tree_file_move_allowed if file_mode else None
-        self.tree.file_move_handler = self._handle_tree_file_move if file_mode else None
         # KANT elements are only reorderable while the tree is actually showing KANT structure —
         # File/Gruppi mode rows aren't KANT elements at all (plain filenames / grouping members)
         code_mode = self.view_mode == 'code'
-        self.tree.setDragEnabled(code_mode or file_mode)
+        self.tree.setDragEnabled(code_mode)
         self.tree.setDragDropMode(
             QAbstractItemView.InternalMove if code_mode else
-            QAbstractItemView.DragDrop if file_mode else QAbstractItemView.NoDragDrop
+            QAbstractItemView.DropOnly if file_mode else QAbstractItemView.NoDragDrop
         )
         self.tree.reorder_allowed = self._kant_reorder_allowed if code_mode else None
         self.tree.reorder_handler = self._kant_reorder_apply if code_mode else None
@@ -2251,8 +2241,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         return target.parent() is dragged.parent()
     # [FN CLOSED] _kant_reorder_allowed
 
-    # [FN CATEGORY] _kant_reorder_apply — Qt has already moved the tree ITEMS by the time this
-    # runs (ProjectTree.dropEvent calls super().dropEvent() first); this reads the resulting sibling
+    # [FN CATEGORY] _kant_reorder_apply — ProjectTree has already moved the tree ITEMS by the time
+    # this runs; this reads the resulting sibling
     # order and reorders the matching Node entries in the real parsed tree to match, then saves.
     # Only the Node entries move — any Run (plain-text/comment) siblings interleaved between them
     # stay in their exact original slot, so a reorder's diff is just the moved marker blocks, not a
@@ -2295,31 +2285,6 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._render_view(tab, tab.filter_uid)
         self._rebuild_tree()
     # [FN CLOSED] _kant_reorder_apply
-
-    def _tree_file_move_allowed(self, dragged, target):
-        if target is None or target.data(0, ROLE_KIND) != 'dir':
-            return False
-        source = dragged.data(0, ROLE_PATH)
-        target_dir = target.data(0, ROLE_PATH)
-        if dragged.data(0, ROLE_KIND) not in {'plainfile', 'dir'} or not source or not target_dir:
-            return False
-        destination = os.path.join(target_dir, os.path.basename(source))
-        if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(destination)):
-            return False
-        if os.path.isdir(source):
-            try:
-                if os.path.commonpath([os.path.abspath(source), os.path.abspath(target_dir)]) == os.path.abspath(source):
-                    return False
-            except ValueError:
-                return False
-        return not os.path.exists(destination)
-
-    def _handle_tree_file_move(self, dragged, target):
-        if not self._tree_file_move_allowed(dragged, target):
-            return False
-        source = dragged.data(0, ROLE_PATH)
-        destination = os.path.join(target.data(0, ROLE_PATH), os.path.basename(source))
-        return self._move_tree_path(source, destination, os.path.isdir(source), 'Sposta')
 
     # [FN CATEGORY] _handle_tree_file_drop — copies each dropped OS path into the project (a
     # directory drop target if the drop landed on a folder row, its parent directory if it landed
@@ -2476,15 +2441,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # behavior swap between the AI-fill-blanks action and the plain deterministic-tagging
         # action — see _style_kant_quick_button/_kant_quick_action.
         ai_fill_btn = QToolButton()
+        ai_fill_btn.setText('AI KANT COMMENT')
+        ai_fill_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         ai_fill_btn.setIconSize(QSize(16, 16))
-        ai_fill_btn.setFixedSize(theme.ICON_BTN, theme.ICON_BTN)
+        ai_fill_btn.setFixedHeight(theme.CONTROL_H)
+        ai_fill_btn.setFont(QFont('Consolas', theme.TREE_FONT_PT - 2))
+        ai_fill_btn.setCursor(Qt.PointingHandCursor)
         ai_fill_btn.clicked.connect(self._kant_quick_action)
         label_layout.addWidget(ai_fill_btn)
         self.action_toolbar_buttons['sparkle'] = ai_fill_btn
-        self.kant_quick_action_label = QLabel('AI KANT COMMENT')
-        self.kant_quick_action_label.setFont(QFont('Consolas', theme.TREE_FONT_PT - 2))
-        self.kant_quick_action_label.setStyleSheet(f'color:{theme.DIM};')
-        label_layout.addWidget(self.kant_quick_action_label)
         # the filename itself lives here, not in the title bar — that slot shows the KANT identity
         # of whatever's isolated instead (see _update_filename_label)
         self.file_path_label = QLabel('')
@@ -2495,7 +2460,6 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.addWidget(label_bar)
 
         panel.setFixedHeight(42)
-        ai_fill_btn.setStyleSheet(theme.icon_button_style())
         self._style_kant_quick_button()
         return panel
 
@@ -2516,7 +2480,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         )
         self.info_popup.setStyleSheet(f'background:{theme.CODE_BG}; border-top:1px solid {theme.BORDER}; border-bottom:1px solid {theme.BORDER};')
         self.info_popup_top_bar.setStyleSheet(f'background:{theme.CODE_BG};')
-        self.kant_quick_action_label.setStyleSheet(f'color:{theme.DIM};')
+        self.action_toolbar_buttons['sparkle'].setStyleSheet(
+            f'QToolButton {{ background:transparent; color:{theme.DIM}; '
+            f'border:1px solid transparent; border-radius:{theme.RADIUS}px; '
+            f'padding:3px 9px; font-weight:700; }} '
+            f'QToolButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }} '
+            f'QToolButton:pressed {{ background:{theme.ACCENT}; color:#ffffff; }} '
+            f'QToolButton:disabled {{ background:transparent; color:{theme.TEXT_DISABLED}; '
+            f'border-color:{theme.BORDER_WEAK}; }}'
+        )
         self.file_path_label.setStyleSheet(f'color:{theme.DIM}; font-weight:700;')
         self.io_tabs.setStyleSheet(f'background:{theme.PANEL}; border-top:1px solid {theme.BORDER};')
         # underline-tab style, consistent with the file-tab bar and left-panel view-mode tabs —
@@ -2672,9 +2644,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # nor a separate OS window), kept as a single reused instance and raised if already open. Rebuilds
     # the graph from the (cache-backed) xref on every open so it reflects the current code, and wires
     # double-click-a-node back to _navigate_to_element so the map doubles as a jump-to launcher. The
-    # close-tab is reparented onto the dialog itself while it's open: the dialog is a separate
-    # top-level window that would otherwise render fully over the shell's own copy of the tab,
-    # making it unclickable until the map was closed some other way.
+    # Its toolbar exit button routes through _toggle_xref_window so closing still navigates to the
+    # selected element.
     # [FN] _open_xref_window — opens/raises the internal cross-reference map dialog. local=True
     # drills straight into the current element's containing parent (see _current_map_local_key);
     # local=False (GLOBAL) is the classic full-project view, explicitly exiting drill mode so a
@@ -2684,7 +2655,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if self.map_dialog is None:
             self.map_dialog = XrefMapDialog(self)
             self.map_dialog.nodeActivated.connect(self._navigate_to_element)
-            self.map_dialog.resized.connect(self._position_map_tab)
+            self.map_dialog.closeRequested.connect(self._toggle_xref_window)
         self.map_dialog.apply_style()
         project_name = os.path.basename(self.project_root_path) if self.project_root_path else ''
         # the very first open of a project whose xref graph hasn't finished its background build
@@ -2702,12 +2673,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._position_map_dialog()
         self.map_dialog.raise_()
         self.map_dialog.activateWindow()
-        self.map_tab_btn.setParent(self.map_dialog)
-        self.map_tab_btn.setText(' MAPPA')
-        self.map_tab_btn.setProperty('kantIcon', 'arrow-down')
-        self.map_tab_btn.setIcon(draw_icon('arrow-down', 12))
-        self.map_tab_btn.show()
-        self._position_map_tab()
+        self.map_tab_btn.hide()
     # [FN CLOSED] _open_xref_window
 
     def _toggle_xref_window(self):
@@ -2715,9 +2681,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             key = self.map_dialog.selected_key()
             self.map_dialog.hide()
             # back on the shell, but hidden — Mappa's entry point is the MAPPA button in the
-            # INCOMING/OUTGOING bar (see _build_io_tabs); map_tab_btn's only remaining job is to
-            # sit atop the dialog while it's open and act as its close control (the dialog is
-            # frameless and has no other close affordance)
+            # INCOMING/OUTGOING bar (see _build_io_tabs); the map's own toolbar closes it.
             self.map_tab_btn.setParent(self.shell)
             self.map_tab_btn.setText(' MAPPA')
             self.map_tab_btn.setProperty('kantIcon', 'arrow-up')
@@ -3443,7 +3407,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.recent_layout.addWidget(card)
 
     def _open_folder(self):
-        path = QFileDialog.getExistingDirectory(self, 'Apri cartella')
+        path = QFileDialog.getExistingDirectory(self, self._tr('Apri cartella'))
         if not path:
             return
         self._open_project_folder(path)
@@ -3593,6 +3557,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._watch_project_tree()
         self.stack.setCurrentIndex(1)
         self._set_project_chrome_visible(True)
+        if not self.pure_ai_mode and self.splitter.sizes()[1] == 0:
+            self._toggle_claude_pane()
         # map_tab_btn itself stays hidden until MAPPA is actually opened (it's now only the
         # in-dialog close handle) — the always-visible entry point is mappa_label_btn in the
         # INCOMING/OUTGOING bar, built already, no per-open show() needed
@@ -3950,10 +3916,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN CATEGORY] _ai_review_label_style — a pending AI review's per-file status colors that file's
     # tree row: green underline for a created file or a modification with only additions, red
     # underline for a modification with only deletions, strikethrough for a whole deleted file, and
-    # (a file with both additions and deletions) a hard 50/50 green/red split via a QSS
-    # qlineargradient background on the row itself — "divisione verticale al centro" was explicit in
-    # the request, and QSS gradients are the one place a literal vertical split is a one-line style
-    # rather than custom paint code.
+    # (a file with both additions and deletions) a delicate translucent 50/50 green/red split via a
+    # QSS qlineargradient background on the row itself.
     # [FN] _ai_review_label_style — returns (text_span_style, row_stylesheet) for one review status
     # [FN OPEN] _ai_review_label_style
     def _ai_review_label_style(self, ai_review, text_style, row_style):
@@ -3962,11 +3926,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if kind == 'deleted':
             return f'{text_style}; color:{theme.DANGER}; text-decoration:line-through;', row_style
         if kind == 'modified' and additions and deletions:
+            ok, danger = QColor(theme.OK), QColor(theme.DANGER)
+            ok_fill = f'rgba({ok.red()},{ok.green()},{ok.blue()},14%)'
+            danger_fill = f'rgba({danger.red()},{danger.green()},{danger.blue()},14%)'
             split = (
-                f'qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {theme.OK}, stop:0.499 {theme.OK}, '
-                f'stop:0.5 {theme.DANGER}, stop:1 {theme.DANGER})'
+                f'qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {ok_fill}, stop:0.499 {ok_fill}, '
+                f'stop:0.5 {danger_fill}, stop:1 {danger_fill})'
             )
-            return f'{text_style}; color:#ffffff;', f'{row_style} background:{split};'
+            return text_style, f'{row_style} background:{split};'
         accent = theme.DANGER if kind == 'modified' and not additions else theme.OK
         return f'{text_style}; color:{accent}; text-decoration:underline;', row_style
     # [FN CLOSED] _ai_review_label_style
@@ -5913,15 +5880,17 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._build_node_widgets(tab, tab.tree, tab.view_layout, 0)
             self._ensure_empty_file_is_editable(tab)
             self._add_add_element_block(tab)
-            return
-        node = self._find_node_by_uid(tab.tree, only_uid)
-        if node is None:
-            self._build_node_widgets(tab, tab.tree, tab.view_layout, 0)
-            self._ensure_empty_file_is_editable(tab)
-            self._add_add_element_block(tab)
-            return
-        wrapper = Node(tag='ROOT', name='', open_raw=None, body=[node])
-        self._build_node_widgets(tab, wrapper, tab.view_layout, 0)
+        else:
+            node = self._find_node_by_uid(tab.tree, only_uid)
+            if node is None:
+                self._build_node_widgets(tab, tab.tree, tab.view_layout, 0)
+                self._ensure_empty_file_is_editable(tab)
+                self._add_add_element_block(tab)
+            else:
+                wrapper = Node(tag='ROOT', name='', open_raw=None, body=[node])
+                self._build_node_widgets(tab, wrapper, tab.view_layout, 0)
+        if getattr(tab, '_ai_review_lines', None) is not None:
+            self._apply_ai_review_editor_markers(tab)
 
     # [FN CATEGORY] _enter_ai_review_mode — replaces the old separate review window: every non-
     # binary changed file gets opened and re-rendered as ONE merged, read-only block showing both
@@ -5983,7 +5952,6 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         tab.tree = Node(tag='ROOT', name='', open_raw=None, body=[Run(lines=merged)])
         tab._ai_review_lines = (added, deleted)
         self._render_view(tab, None)
-        self._apply_ai_review_editor_markers(tab)
     # [FN CLOSED] _show_ai_review_diff
 
     # [FN] _apply_ai_review_editor_markers — green/red underline extra-selections over the merged
@@ -6062,15 +6030,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # regardless of what precedes it.
         divider = QFrame()
         divider.setFrameShape(QFrame.HLine)
-        divider.setStyleSheet(f'background:{theme.BORDER}; max-height:1px; border:none; margin-top:14px; margin-bottom:6px;')
+        divider.setStyleSheet(f'background:{theme.BORDER}; max-height:1px; border:none; margin-top:10px; margin-bottom:4px;')
         tab.view_layout.addWidget(divider)
         block = QPushButton('+  Aggiungi un elemento')
         block.setCursor(Qt.PointingHandCursor)
         block.setToolTip('Crea un nuovo modulo, classe, funzione o altro elemento in questo file')
-        block.setMinimumHeight(56)
+        block.setFixedHeight(36)
         block.setStyleSheet(
-            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.DIM}; '
-            f'border-radius:{theme.RADIUS}px; font-size:{theme.CODING_FONT_PT + 2}pt; font-weight:600; }} '
+            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:1px dashed {theme.DIM}; '
+            f'border-radius:{theme.RADIUS}px; font-size:{theme.CODING_FONT_PT}pt; font-weight:600; }} '
             f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
         )
         block.clicked.connect(lambda: self._prompt_add_element(tab))
@@ -6402,7 +6370,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
     # [FN CATEGORY] _show_tree_context_menu — right-click menu on the project tree: new file/folder
     # always offered (targeting the right-clicked folder, its containing folder if a file, or the
-    # project root on empty space); rename/delete only for an actual file or folder under the cursor
+    # project root on empty space); files/folders can be renamed or trashed, while nested KANT
+    # elements can be removed from their source (with descendants) through their own explicit action
     # [FN] _show_tree_context_menu — builds and shows the tree's right-click menu
     # [FN OPEN] _show_tree_context_menu
     def _show_tree_context_menu(self, pos):
@@ -6421,7 +6390,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         restore_action = menu.addAction('Ripristina dal cestino...') if self._restore_candidates() else None
         if restore_action is not None:
             restore_action.setToolTip("Ripristina un file/cartella eliminato di recente dal cestino dell'IDE")
-        rename_action = delete_action = git_diff_action = git_stage_action = git_unstage_action = None
+        rename_action = delete_action = delete_kant_action = None
+        git_diff_action = git_stage_action = git_unstage_action = None
         run_test_action = reveal_action = None
         test_name = None
         if item is not None and kind in ('file', 'plainfile', 'invalidfile', 'dir'):
@@ -6432,6 +6402,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             delete_action.setToolTip('Sposta questo file o cartella nel cestino')
             reveal_action = menu.addAction('Visualizza in Esplora risorse')
             reveal_action.setToolTip('Apre Esplora risorse con questo file o cartella selezionato')
+        elif item is not None and kind == 'section':
+            menu.addSeparator()
+            delete_kant_action = menu.addAction('Elimina elemento KANT')
+            delete_kant_action.setToolTip('Elimina questo elemento KANT e tutto il codice contenuto')
         if item is not None and kind in ('file', 'plainfile') and self.git_root:
             menu.addSeparator()
             git_diff_action = menu.addAction('Git diff')
@@ -6489,6 +6463,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._rename_tree_item(item, kind)
         elif delete_action is not None and chosen is delete_action:
             self._delete_tree_item(item, kind)
+        elif delete_kant_action is not None and chosen is delete_kant_action:
+            self._delete_kant_element(item)
         elif reveal_action is not None and chosen is reveal_action:
             self._reveal_in_explorer(item.data(0, ROLE_PATH))
         elif git_diff_action is not None and chosen is git_diff_action:
@@ -6516,6 +6492,108 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 if self.view_mode == 'groups':
                     self._rebuild_tree()
     # [FN CLOSED] _show_tree_context_menu
+
+    # [FN CATEGORY] _delete_kant_element — removes one nested node from the shared in-memory file
+    # model, so the existing atomic save and file-level undo cover the operation exactly like an edit
+    # [FN] _delete_kant_element — confirms and deletes a KANT subtree selected in the project tree
+    # [FN OPEN] _delete_kant_element
+    def _delete_kant_element(self, item):
+        if item is None or item.data(0, ROLE_KIND) != 'section':
+            return
+        path = item.data(0, ROLE_PATH)
+        order = item.data(0, ROLE_ORDER)
+        if not path or not self._open_file(path):
+            return
+        tab = self.open_tabs.get(path)
+        if tab is None:
+            return
+
+        # Old files without persisted #ids are reparsed when opened, so retain the same stable
+        # document-order fallback used by navigation and the context-menu test runner.
+        node = self._find_node_by_uid(tab.tree, item.data(0, ROLE_UID))
+        if node is None and order is not None:
+            nodes = self._nodes_in_order(tab.tree)
+            if order < len(nodes):
+                node = nodes[order]
+        if node is None:
+            self._ide_message(
+                'Elimina elemento KANT',
+                self._tr("L'elemento non e piu presente nel file."),
+            )
+            return
+
+        label = node.desc or node.name or f'[{node.tag}]'
+        prompt = self._tr(
+            'Eliminare "{name}" e tutto il codice contenuto, inclusi gli elementi figli?\n\n'
+            'Puoi annullare con Ctrl+Z.'
+        ).format(name=label)
+        if not self._ide_yes_no('Elimina elemento KANT', prompt, danger=True):
+            return
+
+        deleted_uids = {node.uid} | {child.uid for child in _walk_nodes(node)}
+        before = serialize_kant(tab.tree)
+        was_dirty = tab.dirty
+        tab.remember_undo_state()
+
+        def remove_from(parent):
+            for index, child in enumerate(parent.body):
+                if child is node:
+                    del parent.body[index]
+                    return True
+                if isinstance(child, Node) and remove_from(child):
+                    return True
+            return False
+
+        if not remove_from(tab.tree):
+            return
+        tab.mark_dirty()
+        if not tab.save():
+            # Atomic saving leaves the disk untouched on failure; restore the matching live model too.
+            tab.tree = parse_kant(before)
+            tab.dirty = was_dirty
+            if was_dirty:
+                tab.autosave_timer.start(2000)
+            else:
+                tab.autosave_timer.stop()
+            tab.dirtyChanged.emit()
+            self._render_view(tab, tab.filter_uid)
+            self._ide_message(
+                'Elimina elemento KANT',
+                self._tr("Impossibile salvare la modifica: l'elemento non e stato eliminato."),
+            )
+            return
+
+        active_page = self.active_page
+        deleted_pages = [
+            page for (page_path, uid), page in list(self._element_pages.items())
+            if page_path == path and uid in deleted_uids
+        ]
+        deleted_preview_was_active = active_page in deleted_pages and active_page is self._preview_page
+        for page in deleted_pages:
+            self._close_element_tab(page, cleanup_backing=False)
+
+        if tab.filter_uid in deleted_uids:
+            tab.filter_uid = None
+        self._render_view(tab, tab.filter_uid)
+        for page in list(self._element_pages.values()):
+            if page._file_tab is tab:
+                self._render_element_page(page)
+                self._update_element_tab_title(page)
+
+        # A normal unpinned element preview hides its backing file. If that is the element just
+        # removed, surface the now-updated whole file in the same preview slot.
+        if deleted_preview_was_active:
+            index = self.tabs.indexOf(tab)
+            if index != -1:
+                self.tabs.setTabVisible(index, True)
+                self.tabs.setCurrentWidget(tab)
+                self._set_preview_file_tab(tab)
+
+        self._invalidate_xref()
+        self._rebuild_tree(refresh_git=False)
+        if self.active_tab is tab:
+            self._update_io_tabs(self._active_filter_uid())
+    # [FN CLOSED] _delete_kant_element
 
     # [FN CATEGORY] _section_test_name — resolves a tree item's KANT node the same way
     # _on_tree_item_clicked does (uid first, document-order fallback for legacy no-#id files) and

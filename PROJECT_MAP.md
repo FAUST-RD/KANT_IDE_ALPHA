@@ -27,7 +27,7 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 | Saved element groups and member recovery after edits | `groupings.py`: `reconcile_groupings` | Groups tree and menus in `mainwindow.py` |
 | MAPPA layout, filters, drill-down, graphics | `mappa.py`: `_force_layout_positions`, `XrefMapView`, `XrefMapDialog` | graph creation in `xref.py`; entry point (LOCAL/GLOBAL) in `mainwindow.py`'s `_build_io_tabs`/`_open_xref_window` |
 | Editor blocks, tabs, autosave, undo/redo | `widgets.py`: `CodeEdit`, section widgets, `FileTab` | rendering and callbacks in `mainwindow.py` |
-| Project tree drag/drop | `widgets.py`: `ProjectTree` routes role-agnostic callbacks | KANT reorder and File-view moves in `mainwindow.py`; safe path/tab/group migration in `workspace.py` `_move_tree_path` |
+| Project tree drag/drop | `widgets.py`: `ProjectTree` routes role-agnostic callbacks | KANT-only reorder and File-view external imports in `mainwindow.py` |
 | Project tree, active tabs, rendering, menus, Git/LSP routing | `mainwindow.py`: `MainWindow` | the service module called by the relevant method |
 | Snapshots, review/apply/rollback, file watching, create/rename/trash | `workspace.py` | live diff rendering in `mainwindow.py`: `_enter_ai_review_mode`/`_show_ai_review_diff`; review UI in `widgets.py`: `ClaudePane.offer_ai_review` |
 | Claude/Codex process and inline review UI | `widgets.py`: `ClaudePane.offer_ai_review`, `_agent_command` | the diff itself lives in the coding board/tree, not a review widget — see `mainwindow.py`'s `_enter_ai_review_mode` |
@@ -36,6 +36,7 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 | Permission requests from Claude Code | `aipermissions.py` and `permission_mcp.py` | `ClaudePane` in `widgets.py` |
 | LSP transport/configuration | `lsp.py` | request and fallback handling in `mainwindow.py` |
 | Theme or top-level visual constants | `theme.py` | each widget's `apply_style` method |
+| Interface language (English/Italian) | `i18n.py`: `IT_TO_EN`, `UiLanguage` | language selector in `mainwindow.py` |
 | SVG icon shapes and theme-aware icon color | `icons.py`: `draw_icon` | owning widget's `apply_style` method |
 | Modal forms | `dialogs.py` | caller in `mainwindow.py` |
 | Git status parsing | `gitutil.py` | Git actions in `gitops.py` |
@@ -64,6 +65,7 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 - `kant/aipermissions.py` — authenticated localhost permission bridge owned by the IDE.
 - `kant/permission_mcp.py` — dependency-free stdio MCP process used by Claude Code.
 - `kant/theme.py` — live theme globals, styles, tag colors, limits, ignored directories.
+- `kant/i18n.py` — reversible EN/IT UI strings and translation of current or newly shown Qt widgets.
 - `kant/icons.py` — central monochrome SVG icon set; defaults to gold in night mode.
 - `test_kant_smoke.py` — offscreen integration/regression checks, one `test_*` method per feature area.
 - `DESIGN.md` — invariants, data flow, and rationale; not a second file index.

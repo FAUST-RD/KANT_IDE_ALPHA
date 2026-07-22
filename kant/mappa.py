@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from kant import theme
 from kant.groupings import remap_member_key
 from kant.icons import draw_icon
+from kant.i18n import current_language, translate_text
 from kant.model import Node
 from kant.xref import XrefElement
 
@@ -1213,9 +1214,14 @@ class EdgeFlowPopup(QFrame):
         self._pinned = pinned
         self.title.setText(_kant_mentions_html(title))
         self.title.setTextFormat(Qt.RichText)
-        self.state.setText('Fissato · clicca di nuovo l’arco per chiudere' if pinned else 'Hover · clicca l’arco per fissare')
-        self.incoming.setText(_kant_mentions_html('INCOMING\n' + ('\n'.join(f'← {item}' for item in incoming) if incoming else '← nessuno')))
-        self.outgoing.setText(_kant_mentions_html('OUTGOING\n' + ('\n'.join(f'→ {item}' for item in outgoing) if outgoing else '→ nessuno')))
+        italian = current_language() == 'it'
+        self.state.setText(
+            ('Fissato · clicca di nuovo l’arco per chiudere' if pinned else 'Hover · clicca l’arco per fissare')
+            if italian else ('Pinned · click the edge again to close' if pinned else 'Hover · click an edge to pin')
+        )
+        none = 'nessuno' if italian else 'none'
+        self.incoming.setText(_kant_mentions_html('INCOMING\n' + ('\n'.join(f'← {item}' for item in incoming) if incoming else f'← {none}')))
+        self.outgoing.setText(_kant_mentions_html('OUTGOING\n' + ('\n'.join(f'→ {item}' for item in outgoing) if outgoing else f'→ {none}')))
         self.apply_style()
         self.adjustSize()
 
@@ -1301,7 +1307,8 @@ class XrefMapDialog(QDialog):
     TAG_ORDER = ('MOD', 'CFG', 'CLS', 'TYP', 'FN', 'CST', 'VAR', 'TST')
 
     nodeActivated = Signal(str)
-    resized = Signal()  # lets the main window keep the close-tab (reparented onto this dialog) positioned
+    closeRequested = Signal()
+    resized = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1313,13 +1320,12 @@ class XrefMapDialog(QDialog):
         # MOD edges include the aggregated module-to-module connections a collapsed file's node
         # carries (the sum of every underlying element's own in/out, via _display_elements' dkey
         # remap) — start those hidden so the map opens showing individual element-level references,
-        # not a wall of module-to-module summary arrows; the "Connessioni: MOD" toggle re-enables them.
-        self._active_edge_tags = set(self.TAG_ORDER) - {'MOD'}
+        # not a wall of module summaries or test traffic; their connection toggles re-enable them.
+        self._active_edge_tags = set(self.TAG_ORDER) - {'MOD', 'TST'}
         self._show_containment = True    # the neutral "belonging" connections, toggled alongside the tags
         self._rtl = False    # False = code flow reads left-to-right (default); True = right-to-left
         self._expanded = set()                          # files shown expanded; set_graph() fills this with every file on each open
         self._focus_file = None
-        self._isolate = False
         self._selected = None       # most-recently-pinned key — read by selected_key() for map-close navigation
         self._pinned_nodes = []     # full ordered multi-pin set (mirrors XrefMapView._pinned)
         self._positioned = False
@@ -1364,16 +1370,16 @@ class XrefMapDialog(QDialog):
         self.drill_title_card = QFrame(self)
         self.drill_title_card.setObjectName('drillTitleCard')
         drill_card_layout = QVBoxLayout(self.drill_title_card)
-        drill_card_layout.setContentsMargins(16, 10, 16, 12)
+        drill_card_layout.setContentsMargins(12, 8, 12, 9)
         drill_card_layout.setSpacing(2)
         self.drill_title_tag = QLabel('')
-        self.drill_title_tag.setFont(QFont('Consolas', 10, QFont.DemiBold))
+        self.drill_title_tag.setFont(QFont('Consolas', 9, QFont.DemiBold))
         self.drill_title_name = QLabel('')
-        self.drill_title_name.setFont(QFont('Consolas', 20, QFont.Bold))
+        self.drill_title_name.setFont(QFont('Consolas', 16, QFont.Bold))
         self.drill_title_name.setWordWrap(True)
         drill_card_layout.addWidget(self.drill_title_tag)
         drill_card_layout.addWidget(self.drill_title_name)
-        self.drill_title_card.setMaximumWidth(320)
+        self.drill_title_card.setMaximumWidth(280)
         self.drill_title_card.hide()
         self.resized.connect(self._position_drill_title_card)
 
@@ -1437,9 +1443,9 @@ class XrefMapDialog(QDialog):
         self.isolate_btn = QPushButton(' Isola selezionato')
         self.isolate_btn.setIcon(draw_icon('target', 14))
         self.isolate_btn.setIconSize(QSize(14, 14))
-        self.isolate_btn.setCheckable(True)
-        self.isolate_btn.setToolTip('Mostra solo il nodo selezionato e i suoi collegamenti diretti')
-        self.isolate_btn.toggled.connect(self._on_isolate)
+        self.isolate_btn.setEnabled(False)
+        self.isolate_btn.setToolTip("Apre la visualizzazione LOCAL dell'elemento selezionato")
+        self.isolate_btn.clicked.connect(self._open_selected_local)
         top.addWidget(self.isolate_btn)
 
         self.heatmap_btn = QPushButton(' Heatmap')
@@ -1461,18 +1467,13 @@ class XrefMapDialog(QDialog):
         top.addWidget(self.direction_btn)
 
         top.addStretch(1)
-        zoom_out = QPushButton('−')
-        zoom_in = QPushButton('+')
-        fit = QPushButton('Adatta')
-        zoom_out.setToolTip('Rimpicciolisci')
-        zoom_in.setToolTip('Ingrandisci')
-        fit.setToolTip('Adatta lo zoom per mostrare tutta la mappa')
-        zoom_out.clicked.connect(lambda: self.view.zoom(1 / 1.2))
-        zoom_in.clicked.connect(lambda: self.view.zoom(1.2))
-        fit.clicked.connect(self.view.fit)
-        for b in (zoom_out, zoom_in, fit):
-            b.setFixedHeight(28)
-            top.addWidget(b)
+        self.exit_btn = QPushButton(' Esci dalla MAPPA')
+        self.exit_btn.setIcon(draw_icon('close', 14))
+        self.exit_btn.setIconSize(QSize(14, 14))
+        self.exit_btn.setFixedHeight(28)
+        self.exit_btn.setToolTip('Chiude la MAPPA e torna alla plancia di coding')
+        self.exit_btn.clicked.connect(self.closeRequested.emit)
+        top.addWidget(self.exit_btn)
         rows.addLayout(top)
 
         tag_row = QHBoxLayout()
@@ -1556,13 +1557,14 @@ class XrefMapDialog(QDialog):
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
             f'border-radius:6px; padding:4px 8px;'
         )
-        for b in (self.isolate_btn, self.heatmap_btn, self.direction_btn, self.expand_all_btn, self.collapse_all_btn, self.relayout_btn):
+        for b in (self.isolate_btn, self.heatmap_btn, self.direction_btn, self.expand_all_btn, self.collapse_all_btn, self.relayout_btn, self.exit_btn):
             b.setStyleSheet(theme.BUTTON_STYLE)
         for button, kind in (
             (self.drill_back_btn, 'arrow-left'), (self.expand_all_btn, 'expand'),
             (self.collapse_all_btn, 'collapse'), (self.relayout_btn, 'undo'),
             (self.isolate_btn, 'target'), (self.heatmap_btn, 'flame'),
             (self.direction_btn, 'swap'), (self.containment_btn, 'nest'),
+            (self.exit_btn, 'close'),
         ):
             button.setIcon(draw_icon(kind, 14))
         for tag, btn in self.tag_buttons.items():
@@ -1640,6 +1642,7 @@ class XrefMapDialog(QDialog):
         self._positions = {key: value for key, value in self._positions.items() if key in elements}
         self._selected = None
         self._pinned_nodes = []
+        self.isolate_btn.setEnabled(False)
         self._project_name = project_name
         files = sorted({el.file for el in elements.values()})
         # every open starts fully expanded, regardless of how it was left last time
@@ -1821,7 +1824,7 @@ class XrefMapDialog(QDialog):
     # [FN CATEGORY] _display_elements — turns the full graph into the node/edge set actually drawn,
     # applying (1) the tag filter, (2) module collapse — every element of a collapsed file is remapped
     # onto that file's root node so cross-file references aggregate into module-to-module edges —
-    # then (3) the file-focus restriction and (4) isolate-selected. Synthesises fresh XrefElement
+        # then (3) the file-focus restriction. Synthesises fresh XrefElement
     # nodes (never mutating the originals) and tags each file-root with `.collapsed` so the view can
     # draw the ▸/▾ affordance. `.outgoing`/`.incoming` are deduped per target module (one arrow per
     # module pair); `.outgoing_detail`/`.incoming_detail` keep every underlying real element key
@@ -1889,14 +1892,6 @@ class XrefMapDialog(QDialog):
                 keep |= set(disp[k].incoming) | set(disp[k].outgoing)
             disp = {k: e for k, e in disp.items() if k in keep}
             self._prune_edges(disp)
-        if self._isolate and self._pinned_nodes:
-            keep = set()
-            for pinned_key in self._pinned_nodes:
-                if pinned_key in disp:
-                    keep |= {pinned_key} | set(disp[pinned_key].incoming) | set(disp[pinned_key].outgoing)
-            if keep:
-                disp = {k: e for k, e in disp.items() if k in keep}
-                self._prune_edges(disp)
         if self._show_containment:
             self._add_common_origin_anchors(disp)
         return disp
@@ -1979,10 +1974,12 @@ class XrefMapDialog(QDialog):
     def _position_drill_title_card(self):
         if not self.drill_title_card.isVisible():
             return
-        self.drill_title_card.adjustSize()
         view_geo = self.view.geometry()
-        x = view_geo.right() - self.drill_title_card.width() - 20
-        y = view_geo.top() + 20
+        inset = 32
+        self.drill_title_card.setMaximumWidth(min(280, max(1, view_geo.width() - inset * 2)))
+        self.drill_title_card.adjustSize()
+        x = max(view_geo.left() + inset, view_geo.right() - self.drill_title_card.width() - inset)
+        y = view_geo.top() + inset
         self.drill_title_card.move(x, y)
         self.drill_title_card.raise_()
 
@@ -2053,10 +2050,13 @@ class XrefMapDialog(QDialog):
             self.edge_popup.hide()
         self.view.set_pinned([k for k in self._pinned_nodes if k in self._display])
         modules = sum(1 for e in self._display.values() if e.collapsed is not None)
-        self.count_label.setText(
-            f'{len(self._display)} nodi · {len(self.view._edges)} collegamenti'
-            + (f' · {modules} moduli comprimibili' if modules else '')
-        )
+        if current_language() == 'it':
+            count = f'{len(self._display)} nodi · {len(self.view._edges)} collegamenti'
+            count += f' · {modules} moduli comprimibili' if modules else ''
+        else:
+            count = f'{len(self._display)} nodes · {len(self.view._edges)} links'
+            count += f' · {modules} collapsible modules' if modules else ''
+        self.count_label.setText(count)
         if fit:
             QTimer.singleShot(0, self.view.fit)
         else:
@@ -2087,7 +2087,7 @@ class XrefMapDialog(QDialog):
 
     def _on_direction_toggle(self, checked):
         self._rtl = checked
-        self.direction_btn.setText('Direzione: Dx → Sx' if checked else 'Direzione: Sx → Dx')
+        self.direction_btn.setText(translate_text('Direzione: Dx → Sx' if checked else 'Direzione: Sx → Dx'))
         self.view.set_direction(checked)
         self._refresh(relayout=True)
 
@@ -2095,13 +2095,15 @@ class XrefMapDialog(QDialog):
         self._focus_file = self.file_combo.currentData()
         self._refresh(relayout=True)
 
-    def _on_isolate(self, checked):
-        self._isolate = checked
-        self._refresh(relayout=True)
-        if checked and self._pinned_nodes:
-            # multiple nodes may be pinned; fit the whole isolated neighbourhood rather than
-            # re-centering (and re-pinning) on just one of them
-            self.view.fit()
+    def _open_selected_local(self):
+        if len(self._pinned_nodes) != 1:
+            return
+        key = self._pinned_nodes[0]
+        if not any(element.parent == key for element in self._elements.values()):
+            element = self._elements.get(key)
+            key = element.parent if element is not None else None
+        if key:
+            self._enter_drill_mode(key)
 
     def _on_heatmap_toggle(self, checked):
         self.view.recolor(checked)
@@ -2121,8 +2123,14 @@ class XrefMapDialog(QDialog):
         self._selected = keys[-1] if keys else None
         drillable = keys[0] if len(keys) == 1 and self._is_drillable(keys[0]) else None
         self.view.set_drillable(drillable)
-        if self._isolate:
-            self._refresh(relayout=True)
+        local_key = None
+        if len(keys) == 1:
+            key = keys[0]
+            if any(element.parent == key for element in self._elements.values()):
+                local_key = key
+            elif key in self._elements:
+                local_key = self._elements[key].parent
+        self.isolate_btn.setEnabled(bool(local_key))
     # [FN CLOSED] _on_nodes_pinned
 
     # [FN] _is_drillable — a real KANT tree parent has ≥2 direct children AND at least one child

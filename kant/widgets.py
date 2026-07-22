@@ -14,6 +14,7 @@ stay in ``workspace.py``; widgets expose signals/callbacks instead of importing 
 """
 import hashlib
 import locale
+import math
 import os
 import re
 import shutil
@@ -46,6 +47,7 @@ from PySide6.QtWidgets import (
 from kant import theme
 from kant.aipermissions import PermissionBridge, write_permission_config
 from kant.icons import draw_icon
+from kant.i18n import current_language, translate_text
 from kant.model import Node, parse_kant, serialize_kant, KantParseError
 from kant.fileio import file_fingerprint, write_file_atomic, safe_mkstemp
 from kant.syntax import KEYWORDS, TOKEN_RE
@@ -180,15 +182,15 @@ class CodeEdit(QPlainTextEdit):
         self.line_number_offset = max(0, int(line_number_offset))
         self.setPlainText(text)
         self.setFont(QFont('Consolas', theme.CODING_FONT_PT))
-        self.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.setFrameStyle(QFrame.NoFrame)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         # no border/radius of its own — a continuous coding surface, not one bordered card per
         # block; the CODE_BG/PANEL tonal difference against the section around it is separation
         # enough, per the redesign's "no nested cards" rule
-        self.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:4px;')
+        self.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:2px;')
         self.highlighter = KantHighlighter(self.document())
         # QSyntaxHighlighter's first pass is deferred to the next paint, which fires textChanged
         # with no real edit — forcing it now (signals blocked) keeps that pass from reaching the
@@ -204,11 +206,6 @@ class CodeEdit(QPlainTextEdit):
         self._update_line_number_area_width()
 
         self.textChanged.connect(self._auto_resize)
-        # the scrollbar-reservation part of _auto_resize's height depends on isVisible(), which
-        # only becomes accurate once Qt has recomputed the scrollable range for the current width —
-        # rangeChanged is exactly that recomputation, and fires independently of textChanged/resize
-        # (e.g. once real layout width is known after being placed in the section's QVBoxLayout)
-        self.horizontalScrollBar().rangeChanged.connect(lambda *_: QTimer.singleShot(0, self._auto_resize))
         self._auto_resize()
 
         # autocomplete-as-you-type: mainwindow sets completion_provider to a callable(edit) that
@@ -268,21 +265,14 @@ class CodeEdit(QPlainTextEdit):
         self.vim_action = None
 
     def _auto_resize(self):
-        # the rangeChanged connection above defers this call via QTimer.singleShot(0, ...) — if
-        # this CodeEdit's tab closes between scheduling and firing, the C++ side is already gone
-        # by the time this runs (a bound-method QTimer.singleShot callback isn't auto-disconnected
-        # on target deletion the way a direct signal/slot connection is), and touching any Qt
-        # method below raises "Internal C++ object already deleted" instead of silently no-oping
         if not shiboken6.isValid(self):
             return
-        lines = max(self.blockCount(), 1)
-        padding = 10
-        # only reserve the horizontal scrollbar's height when a line actually overflows the
-        # viewport and it will really show — with ScrollBarAsNeeded this was previously reserved
-        # unconditionally, adding ~14px of pure dead space under every single code block that never
-        # needs one (the overwhelming majority of KANT elements' short snippets)
-        scrollbar = self.horizontalScrollBar().sizeHint().height() if self.horizontalScrollBar().isVisible() else 0
-        self.setFixedHeight(lines * self.fontMetrics().lineSpacing() + padding + scrollbar)
+        content_height = 0.0
+        block = self.document().firstBlock()
+        while block.isValid():
+            content_height += self.blockBoundingRect(block).height()
+            block = block.next()
+        self.setFixedHeight(max(math.ceil(content_height), self.fontMetrics().lineSpacing()) + 10)
 
     # [FN CATEGORY] line_number_area_width — sizes the gutter to fit the largest absolute file line
     # shown by this block; line_number_offset is maintained by MainWindow from the full KANT tree
@@ -319,10 +309,8 @@ class CodeEdit(QPlainTextEdit):
         super().resizeEvent(event)
         cr = self.contentsRect()
         self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height()))
-        # the scrollbar-reservation part of _auto_resize's height depends on isVisible(), which
-        # Qt only finalizes once the widget has a real width — re-check now that it does, not just
-        # on textChanged (whose very first firing happens during __init__, before any real width)
-        self._auto_resize()
+        # Wrapped block heights only become final after Qt lays out the new viewport width.
+        QTimer.singleShot(0, self._auto_resize)
 
     def line_number_area_paint_event(self, event):
         painter = QPainter(self.line_number_area)
@@ -1302,7 +1290,7 @@ def _markdown_to_html(text):
             code_html = html_escape(segment.strip('\n')).replace('\n', '<br>')
             html_parts.append(
                 f'<pre style="background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; '
-                f'border-radius:6px; padding:8px; margin:4px 0;">{code_html}</pre>'
+                f'border-radius:6px; padding:8px; margin:4px 0; white-space:pre-wrap;">{code_html}</pre>'
             )
             continue
         escaped = html_escape(segment)
@@ -1380,7 +1368,7 @@ def _format_permission_input_html(tool_input):
                 f'<div><b>{html_escape(key)}:</b></div>'
                 f'<pre style="background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; '
                 f'border-radius:6px; padding:8px; margin:2px 0 8px 0; '
-                f'font-family:Consolas;">{code_html}</pre>'
+                f'font-family:Consolas; white-space:pre-wrap;">{code_html}</pre>'
             )
         else:
             parts.append(f'<div><b>{html_escape(str(key))}:</b> {html_escape(str(value))}</div>')
@@ -1545,6 +1533,14 @@ class _ElidedLabel(QLabel):
 # [FN CLOSED] _ElidedLabel
 
 
+# [FN] _WrappingLabel — rich chat text may prefer a wide line, but must always shrink and wrap
+class _WrappingLabel(QLabel):
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(0)
+        return hint
+
+
 # [FN CATEGORY] ScanlineOverlay — a very faint repeating horizontal-line texture (old CRT look)
 # painted over EVERYTHING underneath, app-wide, instead of picking one specific panel's background
 # color to match — a transparent, click-through, always-on-top sibling covering the whole shell, not
@@ -1590,9 +1586,8 @@ class IconOnlyCombo(QComboBox):
         self.initStyleOption(opt)
         opt.currentText = ''
         # CE_ComboBoxLabel (native icon+text painting) lays the icon out assuming text follows
-        # it — flush against the left edge of the edit-field sub-control, not centered — so with
-        # an icon-only combo it rendered clipped/off-center against the box's left border. Suppress
-        # the native icon too and draw it ourselves, centered in the actual edit-field rect. One
+        # it — flush against the left edge instead of centered — so suppress the native icon and
+        # draw it ourselves in the center of the complete button. One
         # plain QPainter for the whole method (not QStylePainter mixed with a manual drawPixmap —
         # that combination segfaulted) styled via QStyle.draw*(..., painter, widget) directly.
         opt.currentIcon = QIcon()
@@ -1606,7 +1601,7 @@ class IconOnlyCombo(QComboBox):
         # next repaint)
         icon = self.itemIcon(self.currentIndex())
         if not icon.isNull():
-            rect = style.subControlRect(QStyle.CC_ComboBox, opt, QStyle.SC_ComboBoxEditField, self)
+            rect = self.rect()
             size = self.iconSize()
             pixmap = icon.pixmap(size)
             x = rect.x() + (rect.width() - size.width()) // 2
@@ -1620,7 +1615,7 @@ class IconOnlyCombo(QComboBox):
 # starter/git-init checks) used to be a plain QCheckBox styled via theme.CHECKBOX_STYLE's
 # qradialgradient thumb trick — that gradient's coordinates are scaled against the CHECKBOX'S OWN
 # FULL bounding rect (indicator + label text), not the ::indicator sub-control's own small rect, a
-# real Qt stylesheet limitation. A short label ("Automatico") and a long one (the new-project
+# real Qt stylesheet limitation. A short label ("AUTO") and a long one (the new-project
 # dialog's checks) need different coordinate fractions to land the thumb correctly against the
 # same fixed-size indicator — no single shared QSS string can get both right, which is exactly why
 # the thumb barely moved between states. Hand-painting the indicator (track + thumb) directly
@@ -1639,6 +1634,7 @@ class ToggleSwitch(QCheckBox):
         # though paintEvent below draws the indicator itself, ignoring this stylesheet's own
         # border/background — only width/height are read for layout purposes)
         self.setStyleSheet(f'QCheckBox::indicator {{ width:{self.TRACK_W}px; height:{self.TRACK_H}px; }}')
+        self.setMinimumHeight(self.TRACK_H + 2)  # keep the 1px outline inside the widget on both edges
         self.setCursor(Qt.PointingHandCursor)
 
     def set_text_color(self, color, bold=False):
@@ -1654,8 +1650,7 @@ class ToggleSwitch(QCheckBox):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         checked = self.isChecked()
-        cy = indicator_rect.center().y()
-        track = QRectF(indicator_rect.x(), cy - self.TRACK_H / 2, self.TRACK_W, self.TRACK_H)
+        track = QRectF(indicator_rect).adjusted(0.5, 0.5, -0.5, -0.5)
         # unchecked fill was PANEL2 — nearly identical to PANEL, the background this control
         # actually sits on in every real usage (ClaudePane's controls bar, dialog bodies), so the
         # whole track all but vanished, leaving only a floating thumb with no visible pill around
@@ -1668,7 +1663,7 @@ class ToggleSwitch(QCheckBox):
         thumb_x = track.right() - thumb_d - 3 if checked else track.left() + 3
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor('#ffffff'))
-        painter.drawEllipse(QRectF(thumb_x, cy - thumb_d / 2, thumb_d, thumb_d))
+        painter.drawEllipse(QRectF(thumb_x, track.center().y() - thumb_d / 2, thumb_d, thumb_d))
         font = self.font()
         font.setBold(self._bold)
         painter.setFont(font)
@@ -1837,18 +1832,18 @@ class ClaudePane(QWidget):
         self.model_select.setToolTip("Modello per l'agente selezionato")
         self.model_select.addItems(CLAUDE_MODELS)
         self.model_select.setCursor(Qt.PointingHandCursor)
-        self.model_select.setIconSize(QSize(18, 18))
+        self.model_select.setIconSize(QSize(22, 22))
         self.model_select.setFixedWidth(44)
         header.addWidget(self.model_select)
         self.effort_select = IconOnlyCombo()
         self.effort_select.setToolTip("Reasoning effort per l'agente selezionato")
         self.effort_select.addItems(EFFORT_LEVELS['claude'])
         self.effort_select.setCursor(Qt.PointingHandCursor)
-        self.effort_select.setIconSize(QSize(18, 18))
+        self.effort_select.setIconSize(QSize(22, 22))
         self.effort_select.setFixedWidth(44)
         header.addWidget(self.effort_select)
         header.addStretch(1)
-        self.auto_permissions = ToggleSwitch('Automatico')
+        self.auto_permissions = ToggleSwitch('AUTO')
         self.auto_permissions.setToolTip('Approva i permessi Claude; le modifiche restano soggette alla revisione finale.')
         self.auto_permissions.toggled.connect(self._automatic_permissions_changed)
         header.addWidget(self.auto_permissions)
@@ -1885,6 +1880,7 @@ class ClaudePane(QWidget):
         self.output = QScrollArea()
         self.output.setWidgetResizable(True)
         self.output.setFrameShape(QFrame.NoFrame)
+        self.output.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.chat = QWidget()
         self.chat_layout = QVBoxLayout(self.chat)
         self.chat_layout.setContentsMargins(6, 10, 6, 10)
@@ -2006,9 +2002,10 @@ class ClaudePane(QWidget):
         # rule can't express, so it's set in code rather than the stylesheet string.
         icon_combo_style = (
             f'QComboBox {{ background:{theme.PANEL}; color:transparent; border:1px solid {theme.BORDER}; '
-            f'border-radius:{theme.RADIUS}px; padding:4px 15px 4px 5px; }} '
+            f'border-radius:{theme.RADIUS}px; padding:4px; }} '
             f'QComboBox:hover {{ border-color:{theme.ACCENT}; }} '
-            f'QComboBox::drop-down {{ border:none; width:14px; }} '
+            f'QComboBox::drop-down {{ border:none; width:0px; }} '
+            f'QComboBox::down-arrow {{ image:none; width:0px; height:0px; }} '
             f'QComboBox QAbstractItemView {{ background:{theme.PANEL}; color:{theme.TEXT}; '
             f'border:1px solid {theme.BORDER}; selection-background-color:{theme.PANEL2}; }}'
         )
@@ -2111,13 +2108,13 @@ class ClaudePane(QWidget):
     # [FN] _refresh_selector_icons — refreshes AI selector icons and selected-value tooltips
     # [FN OPEN] _refresh_selector_icons
     def _refresh_selector_icons(self):
-        model_icon = draw_icon('model', 18)
+        model_icon = draw_icon('model', 22)
         for index in range(self.model_select.count()):
             self.model_select.setItemIcon(index, model_icon)
-        self.model_select.setToolTip(f'Modello: {self.model_select.currentText()}')
+        self.model_select.setToolTip(f'{"Modello" if current_language() == "it" else "Model"}: {self.model_select.currentText()}')
         for index in range(self.effort_select.count()):
             level = self.effort_select.itemText(index).strip()
-            self.effort_select.setItemIcon(index, draw_icon('effort', 18, self._effort_color(level)))
+            self.effort_select.setItemIcon(index, draw_icon('effort', 22, self._effort_color(level)))
         self.effort_select.setToolTip(f'Effort: {self.effort_select.currentText()}')
     # [FN CLOSED] _refresh_selector_icons
 
@@ -2140,9 +2137,10 @@ class ClaudePane(QWidget):
         frame.setStyleSheet(f'QFrame {{ background:{theme.PANEL}; border:1px solid {theme.WARN}; border-radius:12px; }}')
         content = QVBoxLayout(frame)
         content.setContentsMargins(12, 9, 12, 10)
-        title = QLabel(f'Permesso richiesto: {tool_name}')
+        title = _WrappingLabel(f'{"Permesso richiesto" if current_language() == "it" else "Permission requested"}: {tool_name}')
+        title.setWordWrap(True)
         title.setStyleSheet(f'color:{theme.WARN}; font-weight:600; border:none;')
-        details = QLabel(_format_permission_input_html(request['input']))
+        details = _WrappingLabel(_format_permission_input_html(request['input']))
         details.setTextFormat(Qt.RichText)
         details.setTextInteractionFlags(Qt.TextSelectableByMouse)
         details.setWordWrap(True)
@@ -2193,7 +2191,7 @@ class ClaudePane(QWidget):
             'deny': 'Rifiutato', 'once': 'Consentito una volta',
             'session': 'Consentito per la sessione', 'auto': 'Consentito automaticamente',
         }
-        status.setText(labels[decision])
+        status.setText(translate_text(labels[decision]))
         status.setStyleSheet(f"color:{theme.OK if allow else theme.DANGER}; border:none;")
         for button in buttons:
             button.setEnabled(False)
@@ -2250,7 +2248,7 @@ class ClaudePane(QWidget):
         bubble.setContentsMargins(12, 8, 12, 9)
         bubble.setSpacing(3)
         name_label = QLabel(name or {'user': 'Tu', 'assistant': _agent_label(self.current_agent)}.get(role, 'Sistema'))
-        label = QLabel(_markdown_to_html(text.strip()))
+        label = _WrappingLabel(_markdown_to_html(text.strip()))
         label.setTextFormat(Qt.RichText)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         # TextSelectableByMouse alone doesn't change the hover cursor — without this the bubble
@@ -2399,8 +2397,8 @@ class ClaudePane(QWidget):
     # [FN OPEN] _attach_files
     def _attach_files(self):
         paths, _filter = QFileDialog.getOpenFileNames(
-            self, 'Allega file',
-            filter='Immagini e documenti (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.svg *.pdf *.txt *.md *.csv *.json);;Tutti i file (*)',
+            self, translate_text('Allega file'),
+            filter=translate_text('Immagini e documenti (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.svg *.pdf *.txt *.md *.csv *.json);;Tutti i file (*)'),
         )
         if not paths:
             return
@@ -2595,7 +2593,7 @@ class ClaudePane(QWidget):
         self.process.readyReadStandardError.connect(self._read_stderr)
         self.process.errorOccurred.connect(self._error)
         self.process.finished.connect(self._finished)
-        self.send_btn.setText('Stop')
+        self.send_btn.setText(translate_text('Stop'))
         self.send_btn.setEnabled(True)
         self._stream_text = ''
         self.process.start(executable, args)
@@ -2644,7 +2642,7 @@ class ClaudePane(QWidget):
         process, self.process = self.process, None
         if process is not None:
             process.deleteLater()
-        self.send_btn.setText('Invia')
+        self.send_btn.setText(translate_text('Invia'))
         self.send_btn.setEnabled(True)
         self.finished.emit()
 
@@ -2683,12 +2681,13 @@ class ClaudePane(QWidget):
         frame.setStyleSheet(f'QFrame {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:12px; }}')
         content = QVBoxLayout(frame)
         content.setContentsMargins(12, 9, 12, 10)
-        title = QLabel(f'Modifiche AI pronte per la revisione — {len(review)} file (+{total_add} −{total_del})')
+        title = _WrappingLabel(f'Modifiche AI pronte per la revisione — {len(review)} file (+{total_add} −{total_del})')
+        title.setWordWrap(True)
         title.setStyleSheet(f'color:{theme.TEXT}; font-weight:600; border:none;')
-        file_list = QLabel('\n'.join(f"{item['status']}: {item['path']}" for item in review)[:600])
+        file_list = _WrappingLabel('\n'.join(f"{item['status']}: {item['path']}" for item in review)[:600])
         file_list.setWordWrap(True)
         file_list.setStyleSheet(f'color:{theme.DIM}; border:none;')
-        hint = QLabel('La differenza è già visibile nella plancia e nel codice (verde = aggiunto, rosso = eliminato).')
+        hint = _WrappingLabel('La differenza è già visibile nella plancia e nel codice (verde = aggiunto, rosso = eliminato).')
         hint.setWordWrap(True)
         hint.setStyleSheet(f'color:{theme.DIM}; font-style:italic; border:none;')
         content.addWidget(title)
@@ -2805,8 +2804,8 @@ class CollapsibleSection(QWidget):
             f'border-left:3px solid {gutter}; }}'
         )
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(theme.SPACE_1, theme.SPACE_1, 2, theme.SPACE_1)
-        outer.setSpacing(1)
+        outer.setContentsMargins(theme.SPACE_1, 2 if show_header else 0, 2, 2)
+        outer.setSpacing(2)
 
         if show_header:
             self.toggle_btn = QToolButton()
@@ -2846,7 +2845,7 @@ class CollapsibleSection(QWidget):
         self.content = QWidget()
         self.content_layout = QVBoxLayout(self.content)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
-        self.content_layout.setSpacing(1)  # platform-default spacing here was the real source of gaps
+        self.content_layout.setSpacing(3)
         outer.addWidget(self.content)
 
     def _on_toggle(self):
@@ -2884,8 +2883,8 @@ class LeafSection(QWidget):
             f'#leafSection {{ background:transparent; border:0; }}'
         )
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0 if compact else 3, 1, 0, 1)
-        outer.setSpacing(1)
+        outer.setContentsMargins(0 if compact else 3, 0, 0, 2)
+        outer.setSpacing(2)
 
         if show_header:
             header_row, header = _build_header_row(self, node)
@@ -2906,7 +2905,7 @@ class LeafSection(QWidget):
         self.content = QWidget()
         self.content_layout = QVBoxLayout(self.content)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
-        self.content_layout.setSpacing(1)  # platform-default spacing here was the real source of gaps
+        self.content_layout.setSpacing(3)
         outer.addWidget(self.content)
 # [FN CLOSED] LeafSection
 
@@ -2925,35 +2924,36 @@ class ProjectTree(QTreeWidget):
         # view mode, or no project open), in which case drops are simply rejected rather than
         # silently doing nothing unexpected
         self.file_drop_handler = None
-        # Internal File-view moves use tree items rather than OS URL mime data. MainWindow owns
-        # path roles and filesystem policy, so this widget only routes validation + apply calls.
-        self.file_move_allowed = None
-        self.file_move_handler = None
         # internal item-reorder drag (KANT elements within the same file/parent) — kept fully
         # role-agnostic here (this class has no access to mainwindow.py's ROLE_KIND/ROLE_UID
         # constants without a circular import), so both the validity check and the actual sync-to-
         # file work are callbacks MainWindow supplies, same shape as file_drop_handler above.
         # reorder_allowed(dragged_item, target_item_or_None) -> bool
-        # reorder_handler(parent_item_or_None, ordered_child_items) — called after Qt's own native
-        # move already happened, with the new sibling order for MainWindow to apply to the source
+        # reorder_handler(parent_item_or_None, ordered_child_items) — called after this widget moves
+        # the row, with the new sibling order for MainWindow to apply to the source
         self.reorder_allowed = None
         self.reorder_handler = None
+        self._reorder_dragged = None
         self.setAcceptDrops(True)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._rewrap_labels()
 
-    def _reorder_drag_ok(self, event):
-        if event.source() is not self or self.reorder_handler is None:
-            return None
+    def startDrag(self, supported_actions):
+        if self.reorder_handler is None:
+            super().startDrag(supported_actions)
+            return
         dragged = self.currentItem()
-        if dragged is None:
-            return False
-        target = self.itemAt(event.position().toPoint())
-        if self.reorder_allowed is not None and not self.reorder_allowed(dragged, target):
-            return False
-        return True
+        if dragged is None or (self.reorder_allowed is not None and not self.reorder_allowed(dragged, dragged)):
+            return
+        self._reorder_dragged = dragged
+        self.viewport().setCursor(Qt.ClosedHandCursor)
+        try:
+            super().startDrag(Qt.MoveAction)
+        finally:
+            self._reorder_dragged = None
+            self.viewport().unsetCursor()
 
     @staticmethod
     def _move_reordered_item(dragged, target):
@@ -2969,59 +2969,40 @@ class ProjectTree(QTreeWidget):
         parent.insertChild(insert_index, dragged)
 
     def dragEnterEvent(self, event):
-        ok = self._reorder_drag_ok(event)
-        if ok:
-            event.acceptProposedAction()
+        if self.reorder_handler is not None and event.source() in (self, self.viewport()):
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
             return
-        if ok is None and event.source() is self and self.file_move_handler is not None:
-            event.acceptProposedAction()
-            return
-        if ok is None and self.file_drop_handler is not None and event.mimeData().hasUrls():
+        if self.file_drop_handler is not None and event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
-        ok = self._reorder_drag_ok(event)
-        if ok:
-            event.acceptProposedAction()
-            return
-        if ok is None and event.source() is self and self.file_move_handler is not None:
-            dragged = self.currentItem()
+        if self.reorder_handler is not None and event.source() in (self, self.viewport()):
             target = self.itemAt(event.position().toPoint())
-            if dragged is not None and self.file_move_allowed(dragged, target):
-                event.acceptProposedAction()
+            if (self._reorder_dragged is not None and self.reorder_allowed is not None
+                    and self.reorder_allowed(self._reorder_dragged, target)):
+                event.setDropAction(Qt.MoveAction)
+                event.accept()
             else:
                 event.ignore()
             return
-        if ok is None and self.file_drop_handler is not None and event.mimeData().hasUrls():
+        if self.file_drop_handler is not None and event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        ok = self._reorder_drag_ok(event)
-        if ok is not None:
-            if not ok:
+        if self.reorder_handler is not None and event.source() in (self, self.viewport()):
+            dragged = self._reorder_dragged
+            target = self.itemAt(event.position().toPoint())
+            if (dragged is None or target is dragged or self.reorder_allowed is None
+                    or not self.reorder_allowed(dragged, target)):
                 event.ignore()
                 return
-            dragged = self.currentItem()
             parent_item = dragged.parent()
-            target = self.itemAt(event.position().toPoint())
             self._move_reordered_item(dragged, target)
-            if parent_item is not None:
-                siblings = [parent_item.child(i) for i in range(parent_item.childCount())]
-            else:
-                siblings = [self.topLevelItem(i) for i in range(self.topLevelItemCount())]
+            siblings = [parent_item.child(i) for i in range(parent_item.childCount())]
             self.reorder_handler(parent_item, siblings)
-            event.acceptProposedAction()
-            return
-        if event.source() is self and self.file_move_handler is not None:
-            dragged = self.currentItem()
-            target = self.itemAt(event.position().toPoint())
-            if dragged is None or not self.file_move_allowed(dragged, target):
-                event.ignore()
-                return
-            if self.file_move_handler(dragged, target):
-                event.acceptProposedAction()
-            else:
-                event.ignore()
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
             return
         if self.file_drop_handler is None:
             return
@@ -3378,7 +3359,7 @@ class TitleBar(QWidget):
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
         self.back_btn.setIcon(draw_icon('home', 16))
-        self.theme_menu_action.setText('Giorno' if self.window.night_mode else 'Notte')
+        self.theme_menu_action.setText(translate_text('Giorno' if self.window.night_mode else 'Notte'))
         # flat text entries (no button chrome/border) — a real menu bar, not a row of buttons.
         # QMenu (the dropdown itself) gets its own rule too: unstyled, its items default to Qt's
         # native cramped single-line rows. Kept legible (readable padding, no items lost) but pared
@@ -3462,8 +3443,8 @@ class FileTab(QWidget):
         self.view_container = QWidget()
         self.view_layout = QVBoxLayout(self.view_container)
         self.view_layout.setAlignment(Qt.AlignTop)
-        self.view_layout.setContentsMargins(6, 4, 6, 4)
-        self.view_layout.setSpacing(1)
+        self.view_layout.setContentsMargins(4, 0, 4, 4)
+        self.view_layout.setSpacing(4)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(self.view_container)

@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, QCoreApplication, QEvent, QPointF, QProcess, QSet
 from PySide6.QtGui import QImage, QKeyEvent, QKeySequence, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
-    QApplication, QGraphicsItem, QLabel, QListWidget, QMenu, QMessageBox, QPushButton, QTabBar, QToolButton,
+    QAbstractItemView, QApplication, QGraphicsItem, QLabel, QListWidget, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QTabBar, QToolButton,
     QTreeWidget, QTreeWidgetItem, QWidget,
 )
 
@@ -254,15 +254,25 @@ class KantSmokeTest(unittest.TestCase):
         # wide enough to show a full model/effort name — the actual regression before was reportedly
         # about the OPEN dropdown, not the closed face, so this is the width that has to hold
         assert pane.model_select.width() == 44 and pane.effort_select.width() == 44
+        assert pane.model_select.iconSize().width() == 22 and pane.effort_select.iconSize().width() == 22
         assert 'color:transparent' in pane.model_select.styleSheet()
         assert 'color:transparent' in pane.effort_select.styleSheet()
+        assert 'width:0px' in pane.model_select.styleSheet()
         assert pane.model_select.view().minimumWidth() >= 150
         assert pane.effort_select.view().minimumWidth() >= 100
         assert not pane.model_select.itemIcon(0).isNull() and not pane.effort_select.itemIcon(0).isNull()
+        assert pane.auto_permissions.text() == 'AUTO'
+        assert pane.auto_permissions.minimumHeight() >= pane.auto_permissions.TRACK_H + 2
         # effort's icon is colored per level, not the same icon/color for every entry
         low_icon = pane.effort_select.itemIcon(pane.effort_select.findText('low')).pixmap(14, 14).toImage()
         max_icon = pane.effort_select.itemIcon(pane.effort_select.findText('max')).pixmap(14, 14).toImage()
         assert low_icon.pixelColor(7, 7) != max_icon.pixelColor(7, 7)
+        effort_image = pane.effort_select.itemIcon(0).pixmap(22, 22).toImage()
+        effort_rows = [
+            y for y in range(effort_image.height()) for x in range(effort_image.width())
+            if effort_image.pixelColor(x, y).alpha()
+        ]
+        assert max(effort_rows) - min(effort_rows) >= 17
         assert pane.attach_btn.text() == '' and not pane.attach_btn.icon().isNull()
         assert 'analizza il codice' in pane.prompt.placeholderText()
         # effort options sync per agent, same shape as the existing model selector
@@ -1066,20 +1076,24 @@ class KantSmokeTest(unittest.TestCase):
         hint_window.claude_pane = type('Pane', (), {'global_mode_btn': type('Btn', (), {'isChecked': lambda _self: False})()})()
         assert MainWindow._build_ai_context_hint(hint_window) is None  # no open tab -> nothing to scope to
 
-    def test_tree_label_click_forwarding(self):
+    def test_tree_label_leaves_native_mouse_handling_to_tree(self):
         window = MainWindow()
         assert not hasattr(window, 'results_label_btn')
-        # tree rows use a rich-HTML label via setItemWidget; it must forward its own clicks to the
-        # owning item directly (WA_TransparentForMouseEvents pass-through proved unreliable for this)
+        # Rich labels must not reconstruct mouse events: native viewport input owns both clicks and
+        # the complete press/move/release sequence needed to start a KANT drag.
         dummy_item = QTreeWidgetItem(window.tree)
         label_clicks, label_dclicks = [], []
         window.tree.itemClicked.connect(lambda it, col: label_clicks.append(it))
         window.tree.itemDoubleClicked.connect(lambda it, col: label_dclicks.append(it))
         tree_label = window._tree_label(dummy_item, 'MOD', 'short')
-        tree_label.resize(100, 20)
-        QTest.mouseClick(tree_label, Qt.LeftButton)
+        window.tree.setItemWidget(dummy_item, 0, tree_label)
+        assert tree_label.testAttribute(Qt.WA_TransparentForMouseEvents)
+        window.show()
+        self.app.processEvents()
+        pos = window.tree.visualItemRect(dummy_item).center()
+        QTest.mouseClick(window.tree.viewport(), Qt.LeftButton, Qt.NoModifier, pos)
         assert label_clicks == [dummy_item]
-        QTest.mouseDClick(tree_label, Qt.LeftButton)
+        QTest.mouseDClick(window.tree.viewport(), Qt.LeftButton, Qt.NoModifier, pos)
         assert label_dclicks == [dummy_item]
         assert window.title_bar.file_menu_btn.menu() is not None
         window.close()
@@ -1204,13 +1218,19 @@ class KantSmokeTest(unittest.TestCase):
 
             assert window._open_file(str(project / 'plain.py'))
             assert window.view_mode == 'file'  # untagged -> auto-switched
-            # the sparkle-slot button follows: plain deterministic tagging while in File mode
-            assert 'senza AI' in window.action_toolbar_buttons['sparkle'].toolTip()
+            # Icon and caption are one continuous control: the text is no longer a separate label.
+            quick_action = window.action_toolbar_buttons['sparkle']
+            assert quick_action.text() == 'AI KANT COMMENT'
+            assert quick_action.toolButtonStyle() == Qt.ToolButtonTextBesideIcon
+            assert quick_action.sizeHint().width() > theme.ICON_BTN
+            assert not hasattr(window, 'kant_quick_action_label')
+            # The same control follows the active mode: deterministic tagging while in File mode.
+            assert 'senza AI' in quick_action.toolTip() or 'without AI' in quick_action.toolTip()
 
             window._set_view_mode('code')
             assert window._open_file(str(project / 'tagged.py'))
             assert window.view_mode == 'code'  # already-tagged file -> left alone
-            assert "Chiedi all'AI" in window.action_toolbar_buttons['sparkle'].toolTip()
+            assert "Chiedi all'AI" in quick_action.toolTip() or 'Ask the AI' in quick_action.toolTip()
             window.close()
 
     def test_kant_menu_has_verify_tag_and_wipe_actions(self):
@@ -1238,9 +1258,25 @@ class KantSmokeTest(unittest.TestCase):
 
         assert window.welcome_language_btn.isVisible()
         assert window.welcome_language_btn.text() == 'English'
+        assert window.title_bar.save_menu_action.text() == 'Save'
+        assert window.title_bar.menu_bar.actions()[2].text() == 'Search'
+        assert window.add_file_btn.text() == '+  New file'
+        assert window.claude_pane.send_btn.text().strip() == 'Send'
+        assert 'without AI' in window.action_toolbar_buttons['sparkle'].toolTip()
+        late_panel = QWidget(window)
+        late_button = QPushButton('Annulla', late_panel)
+        late_panel.show()
+        QApplication.processEvents()
+        assert late_button.text() == 'Cancel'  # widgets created after startup are translated too
         assert window.welcome_open_btn.text() == 'Open folder…'
         window.welcome_language_actions['it'].trigger()
         assert window.welcome_language_btn.text() == 'Italiano'
+        assert window.title_bar.save_menu_action.text() == 'Salva'
+        assert window.title_bar.menu_bar.actions()[2].text() == 'Cerca'
+        assert window.add_file_btn.text() == '+  Nuovo file'
+        assert window.claude_pane.send_btn.text().strip() == 'Invia'
+        assert 'senza AI' in window.action_toolbar_buttons['sparkle'].toolTip()
+        assert late_button.text() == 'Annulla'
         assert window.welcome_open_btn.text() == 'Apri cartella…'
 
         start_mode = window.night_mode
@@ -1578,19 +1614,18 @@ class KantSmokeTest(unittest.TestCase):
             )
             assert dialog.width() == window_width_at_show
 
-            # the MAPPA tab sits centered on the dialog's own top edge while open (pointing down
-            # at the map content below it), not the shell's bottom edge (already the title/toolbar)
-            assert mappa_window.map_tab_btn.parent() is dialog
-            assert mappa_window.map_tab_btn.property('kantIcon') == 'arrow-down'
-            assert mappa_window.map_tab_btn.y() == 0
-            expected_x = (dialog.width() - mappa_window.map_tab_btn.width()) // 2
-            assert abs(mappa_window.map_tab_btn.x() - expected_x) <= 1
+            # MAPPA now closes from the right edge of its own toolbar; the old floating close tab
+            # stays hidden and the removed zoom controls do not leak back into the toolbar.
+            assert mappa_window.map_tab_btn.isHidden()
+            assert dialog.exit_btn.isVisible()
+            toolbar_texts = {button.text().strip() for button in dialog._toolbar.findChildren(QPushButton)}
+            assert not {'+', '−', 'Adatta'} & toolbar_texts
 
             # regression: the alignment used to be computed once (a _positioned flag in
             # XrefMapDialog.showEvent) and never redone — resizing the main window, closing MAPPA,
             # and reopening it kept the stale old geometry. Positioning now lives in MainWindow
             # (_position_map_dialog), called on every open, not just the first.
-            mappa_window._toggle_xref_window()  # close
+            QTest.mouseClick(dialog.exit_btn, Qt.LeftButton)  # close through the new in-map control
             app.processEvents()
             # closed, the tab goes back to the shell's own bottom edge instead
             assert mappa_window.map_tab_btn.parent() is mappa_window.shell
@@ -1660,6 +1695,21 @@ class KantSmokeTest(unittest.TestCase):
         shiboken6.delete(edit)
         assert not shiboken6.isValid(edit)
         edit._auto_resize()  # must not raise
+
+    def test_code_blocks_wrap_and_expand_without_internal_scrollbars(self):
+        edit = CodeEdit('value = "' + ('x' * 160) + '"\nsecond line')
+        edit.resize(180, 40)
+        edit.show()
+        self.app.processEvents()
+        edit._auto_resize()
+        self.app.processEvents()
+        assert edit.lineWrapMode() == QPlainTextEdit.WidgetWidth
+        assert edit.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+        assert edit.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+        assert edit.horizontalScrollBar().maximum() == 0
+        assert edit.verticalScrollBar().maximum() == 0
+        assert edit.height() > edit.blockCount() * edit.fontMetrics().lineSpacing()
+        edit.close()
 
     def test_undo_redo_and_mark_dirty(self):
         with _temp_dir() as tmp:
@@ -2193,6 +2243,8 @@ class KantSmokeTest(unittest.TestCase):
             # element-level references, not module-to-module summary arrows
             assert 'MOD' not in dialog._active_edge_tags
             assert dialog.edge_tag_buttons['MOD'].isChecked() is False
+            assert 'TST' not in dialog._active_edge_tags
+            assert dialog.edge_tag_buttons['TST'].isChecked() is False
             dialog.set_graph(graph, 'agg', str(root / 'agg-project'))
             dialog.show()
             app.processEvents()
@@ -2267,12 +2319,28 @@ class KantSmokeTest(unittest.TestCase):
             assert drill_dialog.drill_title_card.isVisible()
             assert drill_dialog.drill_title_tag.text() == '[CLS]'
             assert drill_dialog.drill_title_name.text() == 'classe'
+            view_geo = drill_dialog.view.geometry()
+            card_geo = drill_dialog.drill_title_card.geometry()
+            assert drill_dialog.drill_title_name.font().pointSize() == 16
+            assert drill_dialog.drill_title_card.maximumWidth() <= 280
+            assert card_geo.right() <= view_geo.right() - 31
+            assert card_geo.top() >= view_geo.top() + 32
             assert drill_dialog.drill_back_btn.isVisible()
             drill_dialog._exit_drill_mode()
             app.processEvents()
             assert set(drill_dialog._display) == {'cls', 'm1', 'm2', 'inner', 'deep', 'lone'}
             assert not drill_dialog.drill_back_btn.isVisible()
             assert not drill_dialog.drill_title_card.isVisible()
+            # "Isola selezionato" now enters LOCAL. A leaf resolves to its containing parent,
+            # matching the coding-board LOCAL entry point.
+            drill_dialog.view.set_pinned(['m2'])
+            drill_dialog._on_nodes_pinned(['m2'])
+            app.processEvents()
+            assert drill_dialog.isolate_btn.isEnabled()
+            QTest.mouseClick(drill_dialog.isolate_btn, Qt.LeftButton)
+            app.processEvents()
+            assert drill_dialog._drill_key == 'cls'
+            assert set(drill_dialog._display) == {'m1', 'm2', 'inner', 'deep'}
             drill_dialog.close()
             QSettings('KANT', 'KANT Editor').remove(drill_dialog._position_key)
 
@@ -2637,10 +2705,13 @@ class KantSmokeTest(unittest.TestCase):
         assert window.action_toolbar.isHidden()
 
         project_root = Path(_mkdtemp_safe())
+        window.splitter.setSizes([1000, 0])
         window._ide_yes_no = lambda *_args, **_kwargs: False  # decline the KANT-tagging prompts
         window._open_project_folder(str(project_root))
         assert all(action.isVisible() for action in project_menus)
         assert not window.action_toolbar.isHidden()
+        assert window.splitter.sizes()[1] > 0
+        assert window.claude_tab_btn.property('kantIcon') == 'arrow-right'
 
         window._go_back_to_welcome()
         assert all(not action.isVisible() for action in project_menus)
@@ -2793,13 +2864,20 @@ class KantSmokeTest(unittest.TestCase):
             merged_edit = review_tab.view_layout.itemAt(0).widget()
             assert isinstance(merged_edit, CodeEdit) and merged_edit.isReadOnly()
             assert len(merged_edit.extraSelections()) == len(added) + len(deleted)
+            window._render_view(review_tab)
+            merged_edit = review_tab.view_layout.itemAt(0).widget()
+            assert len(merged_edit.extraSelections()) == len(added) + len(deleted)
+            _text_style, row_style = window._ai_review_label_style(
+                {'kind': 'modified', 'additions': 1, 'deletions': 1}, '', ''
+            )
+            assert 'rgba(' in row_style and '14%' in row_style
             assert window.claude_pane.chat_layout.count() == chat_rows_before  # nothing posted yet
             review_outcomes = []
             window.claude_pane.offer_ai_review(review, lambda *args: review_outcomes.append(args))
             assert window.claude_pane.chat_layout.count() == chat_rows_before + 1  # one accept/cancel card
             accept_buttons = [
                 button for button in window.claude_pane.findChildren(QPushButton)
-                if button.text() in ('Accetta', 'Annulla')
+                if button.text() in ('Accetta', 'Annulla', 'Accept', 'Cancel')
             ]
             assert len(accept_buttons) == 2  # Accetta + Annulla — no third "Rivedi" button
             window.close()
@@ -3231,7 +3309,7 @@ class KantSmokeTest(unittest.TestCase):
 
             add_buttons = [
                 b for b in tab.view_container.findChildren(type(window.add_file_btn))
-                if 'Aggiungi' in b.text()
+                if 'Aggiungi' in b.text() or 'Add an element' in b.text()
             ]
             assert len(add_buttons) == 1
 
@@ -3298,7 +3376,10 @@ class KantSmokeTest(unittest.TestCase):
             window._show_element_tab(tab, new_node.uid)
             QApplication.processEvents()
             leaf_page = window.tabs.currentWidget()
-            assert not any('Aggiungi un elemento' in button.text() for button in leaf_page.findChildren(type(window.add_file_btn)))
+            assert not any(
+                'Aggiungi un elemento' in button.text() or 'Add an element' in button.text()
+                for button in leaf_page.findChildren(type(window.add_file_btn))
+            )
             window.close()
 
     def test_add_file_block_creates_and_opens_language_aware_file(self):
@@ -3459,6 +3540,24 @@ class KantSmokeTest(unittest.TestCase):
             assert 'parte 3' not in stream_label.text()
             pane._reset_process()  # simulates the process finishing right after a burst
             assert 'parte 1' in stream_label.text() and 'parte 3' in stream_label.text()
+        finally:
+            pane.deleteLater()
+
+    def test_ai_chat_wraps_to_available_width_without_horizontal_scroll(self):
+        pane = ClaudePane(os.getcwd())
+        try:
+            pane.resize(260, 600)
+            pane.show()
+            label = pane._add_message(
+                'https://example.test/' + 'segment' * 120 + '\n```python\n' + 'x' * 800 + '\n```',
+                'assistant',
+            )
+            for _ in range(3):
+                self.app.processEvents()
+            assert pane.output.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+            assert pane.output.horizontalScrollBar().maximum() == 0
+            assert label.minimumSizeHint().width() == 0
+            assert label.parentWidget().width() <= pane.output.viewport().width()
         finally:
             pane.deleteLater()
 
@@ -3672,61 +3771,17 @@ class KantSmokeTest(unittest.TestCase):
             assert os.path.basename(window.active_tab.path) == target_rel
             window.close()
 
-    def test_file_view_drag_moves_file_into_folder_and_retargets_open_tab(self):
+    def test_file_view_has_external_drop_but_no_internal_drag(self):
         with _temp_dir() as tmp:
             project = Path(tmp)
-            source = project / 'source.py'
-            source.write_text('# [FN OPEN] source\npass\n# [FN CLOSED] source\n', encoding='utf-8')
-            destination_dir = project / 'package'
-            destination_dir.mkdir()
-
             window = MainWindow()
             window.project_root_path = str(project)
-            window.git_root = None
-            window.git_status = {}
             window.view_mode = 'file'
             window._update_tree_drop_handler()
-            window._rebuild_tree(refresh_git=False)
-
-            root_item = window.tree.invisibleRootItem()
-            folder_item = next(
-                root_item.child(i) for i in range(root_item.childCount())
-                if root_item.child(i).data(0, ROLE_PATH) == str(destination_dir)
-            )
-            file_item = next(
-                root_item.child(i) for i in range(root_item.childCount())
-                if root_item.child(i).data(0, ROLE_PATH) == str(source)
-            )
-            assert window.tree.dragEnabled()
-            assert window.tree.file_move_handler is not None
-            assert window._open_file(str(source))
-            window.show()
-            self.app.processEvents()
-            window.tree.setCurrentItem(file_item)
-
-            class _DropEvent:
-                accepted = False
-
-                def source(self):
-                    return window.tree
-
-                def position(self):
-                    return QPointF(window.tree.visualItemRect(folder_item).center())
-
-                def acceptProposedAction(self):
-                    self.accepted = True
-
-                def ignore(self):
-                    self.accepted = False
-
-            event = _DropEvent()
-            window.tree.dropEvent(event)
-
-            moved = destination_dir / source.name
-            assert event.accepted
-            assert moved.is_file() and not source.exists()
-            assert str(moved) in window.open_tabs and str(source) not in window.open_tabs
-            assert window.active_tab.path == str(moved)
+            assert not window.tree.dragEnabled()
+            assert window.tree.dragDropMode() == QAbstractItemView.DropOnly
+            assert window.tree.file_drop_handler is not None
+            assert window.tree.reorder_handler is None
             window.close()
 
     def test_kant_tree_drop_reorders_sibling_blocks_in_source(self):
@@ -3753,27 +3808,35 @@ class KantSmokeTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
             first, _second, third = (file_item.child(i) for i in range(3))
+            assert window.tree.dragEnabled()
+            assert window.tree.itemWidget(first, 0).testAttribute(Qt.WA_TransparentForMouseEvents)
             window.tree.setCurrentItem(first)
+            target = window.tree.visualItemRect(third).center()
 
-            class _DropEvent:
+            class InternalDrop:
                 accepted = False
+                action = None
 
                 def source(self):
                     return window.tree
 
                 def position(self):
-                    return QPointF(window.tree.visualItemRect(third).center())
+                    return QPointF(target)
 
-                def acceptProposedAction(self):
+                def setDropAction(self, action):
+                    self.action = action
+
+                def accept(self):
                     self.accepted = True
 
                 def ignore(self):
                     self.accepted = False
 
-            event = _DropEvent()
+            event = InternalDrop()
+            window.tree._reorder_dragged = first
             window.tree.dropEvent(event)
-
-            assert event.accepted
+            window.tree._reorder_dragged = None
+            assert event.accepted and event.action == Qt.MoveAction
             saved = parse_kant(source.read_text(encoding='utf-8'))
             module = next(node for node in saved.body if isinstance(node, Node))
             assert [node.name for node in module.body if isinstance(node, Node)] == ['second', 'third', 'first']
@@ -4674,6 +4737,62 @@ class KantSmokeTest(unittest.TestCase):
             groupings = load_groupings(str(root))
             assert len(groupings) == 1
             assert set(groupings[0].members) == {auth_key, server_key}
+            window.close()
+
+    def test_context_menu_deletes_kant_subtree_and_keeps_file_undo(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            source = root / 'service.py'
+            source.write_text('\n'.join([
+                '# [MOD OPEN] service.py',
+                '# [FN OPEN] keep', 'def keep(): pass', '# [FN CLOSED] keep',
+                '# [CLS OPEN] obsolete', 'class Obsolete:',
+                '# [FN OPEN] nested', 'def nested(): pass', '# [FN CLOSED] nested',
+                '# [CLS CLOSED] obsolete',
+                '# [MOD CLOSED] service.py',
+            ]), encoding='utf-8')
+
+            window = MainWindow()
+            window.project_root_path = str(root)
+            window.git_root = None
+            window.git_status = {}
+            window._build_project_tree(window.tree.invisibleRootItem(), str(root))
+            file_item = window.tree.topLevelItem(0)
+            file_item.setExpanded(True)
+            obsolete_item = file_item.child(1)
+            assert obsolete_item.data(0, ROLE_KIND) == 'section'
+
+            confirmation = {}
+            window._ide_yes_no = lambda title, message, **_kwargs: (
+                confirmation.update(title=title, message=message) or True
+            )
+            original_init = QMenu.__init__
+
+            def patched_init(menu_self, *args, **kwargs):
+                original_init(menu_self, *args, **kwargs)
+                menu_self.exec = lambda *_a, **_k: next(
+                    action for action in menu_self.actions() if action.text() == 'Elimina elemento KANT'
+                )
+
+            QMenu.__init__ = patched_init
+            try:
+                window._show_tree_context_menu(window.tree.visualItemRect(obsolete_item).center())
+            finally:
+                QMenu.__init__ = original_init
+
+            saved = source.read_text(encoding='utf-8')
+            assert 'def keep()' in saved
+            assert 'Obsolete' not in saved and 'nested' not in saved
+            assert confirmation['title'] == 'Elimina elemento KANT'
+            assert 'Ctrl+Z' in confirmation['message']
+
+            tab = window.open_tabs[str(source)]
+            assert tab.undo_stack
+            window.tabs.setCurrentWidget(tab)
+            window._undo_file()
+            assert tab.save()
+            restored = source.read_text(encoding='utf-8')
+            assert 'class Obsolete:' in restored and 'def nested()' in restored
             window.close()
 
     def test_new_project_creates_folder_with_starter_module_and_opens(self):

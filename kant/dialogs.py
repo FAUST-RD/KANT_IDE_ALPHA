@@ -55,7 +55,7 @@ class IdeDialogsMixin:
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(12)
-        heading = QLabel(title)
+        heading = QLabel(self._tr(title))
         heading.setFont(QFont('Consolas', theme.TREE_FONT_PT + 2, QFont.DemiBold))
         # WARN (a distinct purple) is the default "this is a decision point" heading color shared
         # by every _ide_choice/_ide_yes_no caller (discard changes, git init, ...); accent=True is
@@ -63,7 +63,7 @@ class IdeDialogsMixin:
         # is the strongest of the three, red, for a prompt that should be unmistakable at a glance
         heading.setStyleSheet(f'color:{theme.DANGER if danger else (theme.ACCENT if accent else theme.WARN)};')
         layout.addWidget(heading)
-        prompt = QLabel(message)
+        prompt = QLabel(self._tr(message))
         prompt.setWordWrap(True)
         layout.addWidget(prompt)
         return dialog, layout
@@ -106,7 +106,7 @@ class IdeDialogsMixin:
         header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
         header_row = QHBoxLayout(header)
         header_row.setContentsMargins(14, 0, 8, 0)
-        title_label = QLabel(title)
+        title_label = QLabel(self._tr(title))
         title_label.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
         title_label.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px; border:none;')
         header_row.addWidget(title_label)
@@ -115,7 +115,7 @@ class IdeDialogsMixin:
         close_btn.setIcon(draw_icon('close', 14))
         close_btn.setIconSize(QSize(14, 14))
         close_btn.setFixedSize(26, 24)
-        close_btn.setToolTip(close_tooltip)
+        close_btn.setToolTip(self._tr(close_tooltip))
         close_btn.setStyleSheet(theme.BUTTON_STYLE)
         close_btn.clicked.connect(dialog.reject)
         header_row.addWidget(close_btn)
@@ -145,9 +145,9 @@ class IdeDialogsMixin:
 
         for choice in choices:
             label, value, *tooltip = choice
-            button = QPushButton(label)
+            button = QPushButton(self._tr(label))
             if tooltip:
-                button.setToolTip(tooltip[0])
+                button.setToolTip(self._tr(tooltip[0]))
             # only the affirmative/consequential choice gets the red treatment — a plain "No"/cancel
             # option styled red as well would read as if declining were the dangerous move instead
             button.setStyleSheet(danger_style if danger and value else theme.BUTTON_STYLE)
@@ -745,7 +745,7 @@ class IdeDialogsMixin:
         browse_btn.setStyleSheet(theme.BUTTON_STYLE)
 
         def browse():
-            path, _filter = QFileDialog.getOpenFileName(dialog, 'Scegli l\'eseguibile Python')
+            path, _filter = QFileDialog.getOpenFileName(dialog, self._tr('Scegli l\'eseguibile Python'))
             if path:
                 item = QListWidgetItem(path)
                 listbox.addItem(item)
@@ -882,7 +882,7 @@ class IdeDialogsMixin:
         browse_btn.setStyleSheet(theme.BUTTON_STYLE)
 
         def browse():
-            chosen = QFileDialog.getExistingDirectory(dialog, 'Cartella principale', location_field.text())
+            chosen = QFileDialog.getExistingDirectory(dialog, self._tr('Cartella principale'), location_field.text())
             if chosen:
                 location_field.setText(chosen)
 

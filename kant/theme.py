@@ -84,12 +84,12 @@ def set_theme(night=False):
 
     NIGHT = night
     if night:
-        # terminal-inspired dark palette: BG is the deepest surface (editor/content), PANEL one
+        # neutral-black dark palette: BG is the deepest surface (editor/content), PANEL one
         # step up (chrome bars, side panels), PANEL2 a further step up (hover states, nested
         # surfaces inside a panel) — exactly three tonal levels, no more. CODE_BG stays pure black
         # so the coding area still recesses below PANEL the same way it does in day mode.
-        BG = '#0E1116'; PANEL = '#131820'; PANEL2 = '#181E27'; BORDER = '#29313C'; BORDER_WEAK = '#202730'
-        TEXT = '#DCE1E7'; DIM = '#8F99A6'; TEXT_DISABLED = '#5F6975'; ACCENT = '#f3bd27'; CODE_BG = '#000000'
+        BG = '#090909'; PANEL = '#111111'; PANEL2 = '#1a1a1a'; BORDER = '#303030'; BORDER_WEAK = '#242424'
+        TEXT = '#e5e5e5'; DIM = '#a3a3a3'; TEXT_DISABLED = '#666666'; ACCENT = '#f3bd27'; CODE_BG = '#000000'
         # a lighter, more saturated orange than the day value — needs to read clearly against the
         # dark BG/CODE_BG while staying just as distinct from gold ACCENT (see the top-level HOT
         # comment for why this can't just be a tint of ACCENT)

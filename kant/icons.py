@@ -40,7 +40,7 @@ _SVG_BODIES = {
     'moon': '<path d="M20 15.5A9 9 0 0 1 8.5 4 9 9 0 1 0 20 15.5z"/>',
     'attach': '<path d="M21 11.5l-8.8 8.8a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/>',
     'model': '<rect x="5" y="5" width="14" height="14" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>',
-    'effort': '<path d="M4 18a8 8 0 1 1 16 0"/><path d="M12 18l4-7M7 18h10"/>',
+    'effort': '<circle cx="12" cy="12" r="9"/><path d="M12 12l5-5M7 17h10"/>',
     'kant': '<path d="M7 3v18M18 3L7 13M11 10l8 11"/>',
     'grid': '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
     'pin': '<path d="M9 3h6l-1 6 3 3H7l3-3zM12 12v9"/>',
