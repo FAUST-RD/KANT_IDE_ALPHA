@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from xml.etree import ElementTree
 
-from kant.model import CATEGORY_RE, TAGLINE_RE, Node, Run, _short_desc, parse_kant, KantParseError
+from kant.model import CATEGORY_RE, CLOSED_RE, TAGLINE_RE, Node, Run, _short_desc, parse_kant, KantParseError
 
 
 # [CST] KEYWORDS — cross-language keyword set for the lightweight syntax highlighter below
@@ -30,90 +30,99 @@ KEYWORDS = set((
 # the meaning genuinely differs by language (e.g. Python's `except` vs C-family `catch`).
 # [CST] KEYWORD_DOCS — hover explanation text for each cross-language keyword
 # [CST OPEN] KEYWORD_DOCS
+def _keyword_doc(language, syntax, example):
+    """Build the same scan-friendly Markdown card for every keyword hover."""
+    return (
+        f'**{language}**\n'
+        f'**Sintassi**\n```text\n{syntax}\n```\n'
+        f'**Esempio**\n```text\n{example}\n```'
+    )
+
+
 KEYWORD_DOCS = {
-    'def': 'Definisce una funzione o un metodo (Python, Rust in forma "fn" a parte). Il corpo che segue è il codice eseguito quando la funzione viene chiamata.',
-    'class': 'Definisce una classe: un modello per creare oggetti che condividono attributi e metodi.',
-    'function': 'Definisce una funzione (JavaScript e simili). Equivalente a "def" in Python.',
-    'return': 'Esce subito dalla funzione corrente, restituendo il valore indicato al chiamante (o nulla, se omesso).',
-    'if': 'Esegue il blocco che segue solo se la condizione è vera.',
-    'elif': "Ramo alternativo di un if (Python) — controllato solo se le condizioni precedenti erano false. Equivale a 'else if' in molti altri linguaggi.",
-    'else': "Ramo eseguito quando nessuna condizione precedente (if/elif/else if) è risultata vera.",
-    'for': 'Ciclo che itera su una sequenza (lista, range, iteratore...) o, in alcuni linguaggi, su un contatore con condizione esplicita (for classico stile C).',
-    'while': 'Ciclo che ripete il blocco finché la condizione resta vera — controllata prima di ogni iterazione.',
-    'do': "Introduce un ciclo do/while (C-family): il corpo viene eseguito almeno una volta, prima che la condizione venga controllata.",
-    'switch': 'Confronta un valore contro una serie di casi (case) ed esegue il ramo corrispondente, invece di una catena di if/else if.',
-    'case': "Un singolo ramo dentro uno switch/match — eseguito quando il valore confrontato coincide.",
-    'break': 'Esce immediatamente dal ciclo (o switch) più interno che lo contiene.',
-    'continue': "Salta subito alla prossima iterazione del ciclo più interno, senza eseguire il resto del corpo per quella iterazione.",
-    'import': 'Rende disponibile in questo file codice definito altrove (un modulo, un pacchetto, una libreria).',
-    'from': "Usato insieme a import per specificare da dove importare (Python: 'from modulo import nome'; JS/TS: 'import nome from \"modulo\"').",
-    'as': "Assegna un alias locale a ciò che si sta importando o convertendo, per usare un nome diverso nel resto del file.",
-    'export': 'Rende un nome (funzione, classe, costante) visibile/importabile da altri file (JavaScript/TypeScript).',
-    'default': "In uno switch, il ramo eseguito se nessun case corrisponde. In import/export (JS), indica l'esportazione/importazione principale del modulo.",
-    'const': 'Dichiara un nome il cui valore (o riferimento, a seconda del linguaggio) non può essere riassegnato dopo la dichiarazione.',
-    'let': 'Dichiara una variabile con visibilità limitata al blocco in cui si trova (JavaScript/TypeScript), a differenza di var.',
-    'var': "Dichiara una variabile — in JavaScript con visibilità estesa a tutta la funzione (non solo al blocco), diversamente da let/const.",
-    'public': "Modificatore di visibilità: il membro è accessibile da qualsiasi altro codice, senza restrizioni.",
-    'private': "Modificatore di visibilità: il membro è accessibile solo dall'interno della stessa classe.",
-    'protected': "Modificatore di visibilità: il membro è accessibile dalla classe che lo definisce e dalle sue sottoclassi, non dall'esterno.",
-    'static': "Il membro appartiene alla classe stessa, non a una singola istanza — condiviso da tutti gli oggetti di quella classe.",
-    'final': 'Impedisce che una classe venga estesa, un metodo venga sovrascritto, o una variabile venga riassegnata, a seconda del contesto.',
-    'void': "Indica che una funzione non restituisce alcun valore.",
-    'int': 'Tipo numerico intero (senza parte decimale).',
-    'float': 'Tipo numerico a virgola mobile a precisione singola (con parte decimale).',
-    'double': 'Tipo numerico a virgola mobile a precisione doppia (più precisione/range di float).',
-    'long': 'Tipo numerico intero con un intervallo di valori più ampio del normale int.',
-    'short': "Tipo numerico intero con un intervallo di valori più piccolo del normale int.",
-    'byte': 'Tipo numerico che occupa un singolo byte (8 bit), usato per dati grezzi o interi molto piccoli.',
-    'char': 'Tipo che rappresenta un singolo carattere.',
-    'bool': "Tipo che rappresenta un valore vero/falso.",
-    'boolean': "Tipo che rappresenta un valore vero/falso (nome esteso di bool, es. Java).",
-    'string': 'Tipo che rappresenta una sequenza di caratteri (testo).',
-    'String': 'Tipo che rappresenta una sequenza di caratteri (testo) — variante con iniziale maiuscola (es. Java, Rust, C#).',
-    'True': 'Il valore booleano vero (Python — notare l\'iniziale maiuscola).',
-    'False': 'Il valore booleano falso (Python — notare l\'iniziale maiuscola).',
-    'None': "Il valore che rappresenta l'assenza di un valore (Python). Equivalente concettuale di null/nil in altri linguaggi.",
-    'null': "Il valore che rappresenta l'assenza (intenzionale) di un valore o di un riferimento a un oggetto.",
-    'nil': "Il valore che rappresenta l'assenza di un valore — usato al posto di null in alcuni linguaggi (es. Go, Ruby, Lua).",
-    'undefined': "In JavaScript, il valore automatico di una variabile dichiarata ma non ancora assegnata — diverso da null, che è un'assenza esplicita.",
-    'true': 'Il valore booleano vero (linguaggi case-sensitive con iniziale minuscola, es. JavaScript, Java, C-family).',
-    'false': 'Il valore booleano falso (linguaggi case-sensitive con iniziale minuscola, es. JavaScript, Java, C-family).',
-    'self': "Riferimento all'istanza corrente dentro un metodo (Python, Rust) — equivalente a 'this' in molti altri linguaggi.",
-    'this': "Riferimento all'istanza corrente (oggetto) dentro un metodo — equivalente a 'self' in Python.",
-    'new': 'Crea una nuova istanza di una classe, allocando la memoria per il nuovo oggetto e chiamandone il costruttore.',
-    'delete': "Rimuove una proprietà da un oggetto (JavaScript) o dealloca memoria allocata manualmente (C++).",
-    'try': 'Apre un blocco il cui codice viene monitorato: se viene sollevata un\'eccezione, l\'esecuzione salta al blocco except/catch corrispondente invece di interrompere il programma.',
-    'except': "Cattura e gestisce un'eccezione sollevata nel blocco try precedente (Python). Equivalente a catch in molti altri linguaggi.",
-    'catch': "Cattura e gestisce un'eccezione sollevata nel blocco try precedente. Equivalente a except in Python.",
-    'finally': "Blocco eseguito sempre dopo un try/except/catch, sia che sia stata sollevata un'eccezione sia che tutto sia andato a buon fine — tipico per pulizia risorse.",
-    'throw': "Solleva un'eccezione, interrompendo il flusso normale finché non viene catturata da un try/catch (o il programma termina).",
-    'throws': "Dichiara nella firma di un metodo quali eccezioni può sollevare, senza gestirle (Java) — chi lo chiama deve gestirle o ridichiararle a sua volta.",
-    'raise': "Solleva un'eccezione in Python, interrompendo il flusso normale finché non viene catturata da un blocco except.",
-    'yield': 'Restituisce un valore da un generatore mettendo in pausa la funzione, che riprende da lì alla chiamata successiva — invece di terminare come farebbe return.',
-    'async': "Segna una funzione come asincrona: al suo interno si può usare await, e chiamarla restituisce una promise/coroutine invece del risultato diretto.",
-    'await': "Sospende l'esecuzione di una funzione async finché il valore atteso (una promise/coroutine) non si risolve, senza bloccare il resto del programma.",
-    'lambda': 'Definisce una funzione anonima breve, di solito inline, senza bisogno di un def/function separato con un nome.',
-    'with': "Apre un blocco che gestisce automaticamente l'apertura e la chiusura di una risorsa (es. un file) — la chiusura avviene anche se nel blocco viene sollevata un'eccezione (Python: context manager).",
-    'in': "Verifica l'appartenenza di un valore a una sequenza/collezione, oppure introduce la sequenza su cui iterare in un ciclo for.",
-    'is': "Confronta se due nomi puntano allo stesso oggetto in memoria (identità), non se i loro valori sono uguali (Python — per quello si usa ==).",
-    'not': 'Nega logicamente il valore booleano che segue.',
-    'and': 'Operatore logico: vero solo se entrambi gli operandi sono veri.',
-    'or': 'Operatore logico: vero se almeno uno dei due operandi è vero.',
-    'typeof': "Restituisce una stringa che indica il tipo del valore indicato (JavaScript/TypeScript).",
-    'instanceof': "Verifica se un oggetto è un'istanza di una determinata classe (o di una sua sottoclasse).",
-    'extends': 'Dichiara che una classe eredita da un\'altra classe (o un\'interfaccia ne estende un\'altra), ereditandone membri e comportamento.',
-    'implements': "Dichiara che una classe fornisce concretamente i metodi richiesti da un'interfaccia.",
-    'interface': 'Definisce un contratto — un insieme di metodi/proprietà che una classe deve implementare, senza fornirne il codice.',
-    'enum': 'Definisce un tipo con un insieme fisso e nominato di valori possibili (es. i giorni della settimana).',
-    'struct': 'Definisce un tipo che raggruppa più campi/valori correlati sotto un unico nome (senza i metodi/ereditarietà di una classe piena, a seconda del linguaggio).',
-    'namespace': 'Raggruppa nomi correlati (classi, funzioni) sotto un prefisso comune, per evitare collisioni di nomi tra librerie diverse.',
-    'using': "In C#, importa un namespace per usarne i nomi senza qualificarli per intero; in C++, crea un alias o importa un namespace.",
-    'package': 'Dichiara a quale gruppo/namespace di file appartiene questo file (Java, Go), o importa un pacchetto esterno (Go).',
-    'fn': 'Definisce una funzione (Rust). Equivalente a def in Python.',
-    'pub': 'Rende pubblico (visibile da altri moduli) l\'elemento che segue (Rust) — di default gli elementi Rust sono privati al modulo.',
-    'mut': "Segna una variabile come modificabile dopo l'assegnazione iniziale (Rust) — di default le variabili Rust sono immutabili.",
-    'impl': 'Introduce un blocco che implementa metodi per un tipo (struct/enum), o l\'implementazione di un trait per un tipo (Rust).',
-    'match': "Confronta un valore contro una serie di pattern ed esegue il ramo del primo che corrisponde — più potente di uno switch semplice (Rust e altri).",
+    'def': _keyword_doc('Python', 'def nome(parametro: Tipo = valore) -> Tipo:\n    corpo', 'def area(r: float) -> float:\n    return 3.14 * r * r'),
+    'class': _keyword_doc('Python / JS / Java', 'class Nome(Base): ...\nclass Nome extends Base { ... }', 'class Utente(Persona):\n    pass'),
+    'function': _keyword_doc('JavaScript', 'function nome(parametro = valore) {\n  corpo\n}', 'function somma(a, b) {\n  return a + b;\n}'),
+    'return': _keyword_doc('Python / C-family / JS', 'return [valore]', 'return totale;'),
+    'if': _keyword_doc('Python / C-family / JS', 'if condizione:\n    corpo\nif (condizione) { corpo }', 'if eta >= 18:\n    abilita()'),
+    'elif': _keyword_doc('Python', 'elif condizione:\n    corpo', 'elif voto >= 6:\n    promuovi()'),
+    'else': _keyword_doc('Python / C-family / JS', 'else:\n    corpo\nelse { corpo }', 'else:\n    mostra_errore()'),
+    'for': _keyword_doc('Python / C-family / JS', 'for elemento in iterabile:\n    corpo\nfor (init; condizione; passo) { corpo }', 'for item in elementi:\n    stampa(item)'),
+    'while': _keyword_doc('Python / C-family / JS', 'while condizione:\n    corpo\nwhile (condizione) { corpo }', 'while coda:\n    elabora(coda.pop())'),
+    'do': _keyword_doc('C-family / JavaScript', 'do {\n  corpo\n} while (condizione);', 'do { tentativi++; } while (!pronto);'),
+    'switch': _keyword_doc('C-family / JavaScript', 'switch (valore) {\n  case valore: ...; break;\n  default: ...;\n}', 'switch (stato) {\n  case "ok": salva(); break;\n}'),
+    'case': _keyword_doc('C-family / JavaScript', 'case valore:\n  istruzioni\n  break;', 'case 404:\n  mostraErrore();\n  break;'),
+    'break': _keyword_doc('Python / C-family / JS', 'break', 'for item in elementi:\n    if item == target: break'),
+    'continue': _keyword_doc('Python / C-family / JS', 'continue', 'for item in elementi:\n    if not item: continue'),
+    'import': _keyword_doc('Python / JavaScript', 'import modulo\nfrom modulo import nome\nimport nome from "modulo";', 'from pathlib import Path'),
+    'from': _keyword_doc('Python / JavaScript', 'from modulo import nome\nimport nome from "modulo";', 'from collections import deque'),
+    'as': _keyword_doc('Python / TypeScript', 'import nome as alias\nvalore as Tipo', 'import numpy as np'),
+    'export': _keyword_doc('JavaScript / TypeScript', 'export [default] dichiarazione;\nexport { nome };', 'export const VERSION = "1.0";'),
+    'default': _keyword_doc('JavaScript / switch', 'export default valore;\ndefault:\n  istruzioni', 'export default App;'),
+    'const': _keyword_doc('JavaScript / C-family', 'const nome = valore;\nconst Tipo nome = valore;', 'const MAX_RETRY = 3;'),
+    'let': _keyword_doc('JavaScript / TypeScript', 'let nome[: Tipo] = valore;', 'let totale: number = 0;'),
+    'var': _keyword_doc('JavaScript / Go', 'var nome = valore;\nvar nome Tipo = valore', 'var count = 0;'),
+    'public': _keyword_doc('Java / C# / TypeScript', 'public Tipo nome(...) { ... }', 'public void salva() { ... }'),
+    'private': _keyword_doc('Java / C# / TypeScript', 'private Tipo nome;', 'private String token;'),
+    'protected': _keyword_doc('Java / C# / TypeScript', 'protected Tipo nome;', 'protected int tentativi;'),
+    'static': _keyword_doc('Java / C# / TypeScript', 'static Tipo nome = valore;\nstatic Tipo nome(...) { ... }', 'static int count = 0;'),
+    'final': _keyword_doc('Java', 'final Tipo nome = valore;\nfinal class Nome { ... }', 'final int MAX = 10;'),
+    'void': _keyword_doc('C-family / Java / TypeScript', 'void nome(parametri) { ... }', 'void reset() { count = 0; }'),
+    'int': _keyword_doc('C-family / Java / C#', 'int nome = valore;', 'int count = 0;'),
+    'float': _keyword_doc('C-family / Java / C#', 'float nome = valore;', 'float prezzo = 9.99f;'),
+    'double': _keyword_doc('C-family / Java / C#', 'double nome = valore;', 'double media = 12.5;'),
+    'long': _keyword_doc('C-family / Java / C#', 'long nome = valore;', 'long timestamp = 1720000000L;'),
+    'short': _keyword_doc('C-family / Java / C#', 'short nome = valore;', 'short porta = 8080;'),
+    'byte': _keyword_doc('Java / C#', 'byte nome = valore;', 'byte canale = 127;'),
+    'char': _keyword_doc('C-family / Java / C#', "char nome = 'x';", "char iniziale = 'K';"),
+    'bool': _keyword_doc('C++ / C# / Rust', 'bool nome = true;', 'bool attivo = true;'),
+    'boolean': _keyword_doc('Java', 'boolean nome = true;', 'boolean pronto = false;'),
+    'string': _keyword_doc('C# / TypeScript', 'string nome = "testo";', 'string titolo = "KANT";'),
+    'String': _keyword_doc('Java / Rust', 'String nome = "testo";\nlet nome: String = String::from("testo");', 'String titolo = "KANT";'),
+    'True': _keyword_doc('Python', 'True', 'attivo = True'),
+    'False': _keyword_doc('Python', 'False', 'completato = False'),
+    'None': _keyword_doc('Python', 'None', 'risultato = None'),
+    'null': _keyword_doc('JavaScript / Java / C#', 'null', 'const utente = null;'),
+    'nil': _keyword_doc('Go / Ruby / Lua', 'nil', 'if err != nil { return err }'),
+    'undefined': _keyword_doc('JavaScript / TypeScript', 'undefined', 'let risultato = undefined;'),
+    'true': _keyword_doc('C-family / JS / Rust', 'true', 'const attivo = true;'),
+    'false': _keyword_doc('C-family / JS / Rust', 'false', 'let pronto = false;'),
+    'self': _keyword_doc('Python / Rust', 'self.attributo\nself::nome', 'def salva(self):\n    self.pronto = True'),
+    'this': _keyword_doc('JavaScript / Java / C#', 'this.membro', 'this.nome = nome;'),
+    'new': _keyword_doc('JavaScript / Java / C# / C++', 'new Classe(argomenti)', 'const utente = new Utente(nome);'),
+    'delete': _keyword_doc('JavaScript / C++', 'delete oggetto.proprieta;\ndelete puntatore;', 'delete cache.chiave;'),
+    'try': _keyword_doc('Python / C-family / JS', 'try:\n    codice_rischioso\nexcept Errore: ...\ntry { ... } catch (Errore e) { ... }', 'try:\n    carica()\nexcept OSError:\n    recupera()'),
+    'except': _keyword_doc('Python', 'except TipoErrore as errore:\n    gestisci', 'except ValueError as errore:\n    log(errore)'),
+    'catch': _keyword_doc('JavaScript / Java / C#', 'catch (errore) {\n  gestisci\n}', 'catch (error) {\n  console.error(error);\n}'),
+    'finally': _keyword_doc('Python / C-family / JS', 'finally:\n    pulizia\nfinally { pulizia }', 'finally:\n    file.close()'),
+    'throw': _keyword_doc('JavaScript / Java / C#', 'throw espressione;', 'throw new Error("dato non valido");'),
+    'throws': _keyword_doc('Java', 'Tipo nome(...) throws TipoErrore { ... }', 'void carica() throws IOException { ... }'),
+    'raise': _keyword_doc('Python', 'raise TipoErrore(messaggio)\nraise', 'raise ValueError("dato non valido")'),
+    'yield': _keyword_doc('Python / JavaScript', 'yield valore\nyield* iterabile', 'for item in elementi:\n    yield item.id'),
+    'async': _keyword_doc('Python / JavaScript', 'async def nome(...): ...\nasync function nome(...) { ... }', 'async def carica():\n    return await fetch()'),
+    'await': _keyword_doc('Python / JavaScript', 'risultato = await operazione_async', 'const dati = await fetch(url);'),
+    'lambda': _keyword_doc('Python', 'lambda parametri: espressione', 'raddoppia = lambda x: x * 2'),
+    'with': _keyword_doc('Python', 'with gestore as nome:\n    corpo', 'with open(path) as file:\n    testo = file.read()'),
+    'in': _keyword_doc('Python / JavaScript', 'elemento in collezione\nfor elemento in iterabile', 'if chiave in dizionario:\n    usa(dizionario[chiave])'),
+    'is': _keyword_doc('Python', 'sinistra is destra\nsinistra is not destra', 'if valore is None:\n    return'),
+    'not': _keyword_doc('Python', 'not espressione\nvalore not in collezione', 'if not pronto:\n    attendi()'),
+    'and': _keyword_doc('Python', 'sinistra and destra', 'if pronto and connesso:\n    avvia()'),
+    'or': _keyword_doc('Python', 'sinistra or destra', 'nome = input_nome or "Anonimo"'),
+    'typeof': _keyword_doc('JavaScript / TypeScript', 'typeof espressione', 'if (typeof id === "string") { ... }'),
+    'instanceof': _keyword_doc('JavaScript / Java', 'oggetto instanceof Classe', 'if (error instanceof TypeError) { ... }'),
+    'extends': _keyword_doc('JavaScript / Java / TypeScript', 'class Figlia extends Base { ... }', 'class Admin extends Utente { ... }'),
+    'implements': _keyword_doc('Java / TypeScript', 'class Nome implements Interfaccia { ... }', 'class FileStore implements Store { ... }'),
+    'interface': _keyword_doc('Java / TypeScript', 'interface Nome {\n  metodo(...): Tipo;\n}', 'interface Store {\n  save(id: string): void;\n}'),
+    'enum': _keyword_doc('C-family / Java / TypeScript / Rust', 'enum Nome { ValoreA, ValoreB }', 'enum Stato { Attivo, Inattivo }'),
+    'struct': _keyword_doc('C / C++ / Rust', 'struct Nome {\n  Tipo campo;\n}', 'struct Punto {\n  int x;\n  int y;\n};'),
+    'namespace': _keyword_doc('C++ / C#', 'namespace Nome {\n  dichiarazioni\n}', 'namespace Kant { class Editor { }; }'),
+    'using': _keyword_doc('C# / C++', 'using Namespace;\nusing Alias = Tipo;', 'using System.Text;'),
+    'package': _keyword_doc('Java / Go', 'package nome;', 'package com.example.app;'),
+    'fn': _keyword_doc('Rust', 'fn nome(parametro: Tipo) -> Tipo {\n    corpo\n}', 'fn somma(a: i32, b: i32) -> i32 {\n    a + b\n}'),
+    'pub': _keyword_doc('Rust', 'pub elemento\npub(crate) elemento', 'pub fn salva() { ... }'),
+    'mut': _keyword_doc('Rust', 'let mut nome: Tipo = valore;\n&mut valore', 'let mut count = 0;'),
+    'impl': _keyword_doc('Rust', 'impl Tipo {\n    metodi\n}\nimpl Trait for Tipo { ... }', 'impl Utente {\n    fn nome(&self) -> &str { ... }\n}'),
+    'match': _keyword_doc('Rust', 'match valore {\n    pattern => espressione,\n    _ => fallback,\n}', 'match stato {\n    Ok(v) => usa(v),\n    Err(e) => log(e),\n}'),
 }
 # [CST CLOSED] KEYWORD_DOCS
 
@@ -398,6 +407,81 @@ def audit_kant_headers(text):
     walk(tree)
     return {'errors': errors, 'warnings': warnings}
 # [FN CLOSED] audit_kant_headers
+
+
+def repair_kant_error(text, line, message):
+    """Repair one unambiguous header/CLOSED mismatch; return None when judgment is required."""
+    lines = text.split('\n')
+    if not 1 <= line <= len(lines):
+        return None
+    raw = lines[line - 1]
+    repaired = None
+
+    if 'incoerente con OPEN' in message:
+        try:
+            tree = parse_kant(text)
+        except KantParseError:
+            return None
+
+        def nodes(node):
+            for item in node.body:
+                if isinstance(item, Node):
+                    yield item
+                    yield from nodes(item)
+
+        node = next(
+            (item for item in nodes(tree) if line in (item.category_line, item.tagline_line)), None,
+        )
+        if node is None:
+            return None
+        category = line == node.category_line
+        match = (CATEGORY_RE if category else TAGLINE_RE).match(raw)
+        if match is None:
+            return None
+        payload = match.group(2 if category else 3)
+        old_name = _header_name_part(payload)
+        new_payload = node.name + payload[len(old_name):] if old_name else node.name
+        start = raw.find(payload, raw.find(']') + 1)
+        if start < 0:
+            return None
+        repaired = raw[:start] + new_payload + raw[start + len(payload):]
+        marker = f'[{node.tag} CATEGORY]' if category else f'[{node.tag}]'
+        repaired = re.sub(r'\[[^\]]+\]', marker, repaired, count=1)
+
+    elif 'does not match the open element' in message:
+        expected = re.search(r'\[(\w+) OPEN\]\s+(.+)$', message)
+        current = CLOSED_RE.match(raw)
+        if expected is None or current is None:
+            return None
+        expected_tag, expected_name = expected.groups()
+        repaired = re.sub(r'\[\w+\s+CLOSED', f'[{expected_tag} CLOSED', raw, count=1)
+        name_start = repaired.find(current.group(3), repaired.find(']') + 1)
+        if name_start < 0:
+            return None
+        repaired = repaired[:name_start] + expected_name + repaired[name_start + len(current.group(3)):]
+
+    elif 'id does not match its OPEN' in message:
+        expected = re.search(r'its OPEN \(#([^\)]+)\)', message)
+        current = CLOSED_RE.match(raw)
+        if expected is None or current is None:
+            return None
+        expected_uid = expected.group(1)
+        repaired = re.sub(
+            r'(\[\w+\s+CLOSED)(?:\s+#\S+)?\]',
+            lambda match: f'{match.group(1)} #{expected_uid}]', raw, count=1,
+        )
+
+    if repaired is None or repaired == raw:
+        return None
+    lines[line - 1] = repaired
+    result = '\n'.join(lines)
+    try:
+        parse_kant(result)
+    except KantParseError as error:
+        # A later independent error is allowed: this repair still made deterministic progress.
+        if error.line <= line:
+            return None
+    return result
 
 
 # ponytail: broad syntax support is delegated to compilers already on PATH; unknown or missing tools

@@ -614,7 +614,7 @@ def apply_skeleton_to_project(root):
     from kant.projectops import iter_project_text_files
 
     changed, skipped = [], []
-    for path, text in iter_project_text_files(root):
+    for path, text in iter_project_text_files(root, max_bytes=None):
         language = language_for_path(path)
         if language is None:
             continue
@@ -642,6 +642,25 @@ def apply_skeleton_to_project(root):
 # [FN CLOSED] apply_skeleton_to_project
 
 
+def strip_kant_project(root):
+    """Remove every KANT marker project-wide, including markers in malformed trees."""
+    from kant.projectops import iter_project_text_files
+    from kant.model import strip_kant_marker_lines
+
+    changed, skipped = [], []
+    for path, text in iter_project_text_files(root, max_bytes=None):
+        bare = strip_kant_marker_lines(text)
+        if bare == text:
+            continue
+        try:
+            write_file_atomic(path, bare)
+        except OSError:
+            skipped.append(os.path.relpath(path, root))
+            continue
+        changed.append(os.path.relpath(path, root))
+    return changed, skipped
+
+
 # [FN CATEGORY] wipe_and_reskeleton_project — the "wipe and rebuild deterministically" project
 # action (kant/mainwindow.py's KANT menu): strips every existing KANT marker (model.py's
 # strip_kant_markers — CATEGORY/tagline/OPEN/CLOSED and any legacy INCOMING/OUTGOING) back to bare
@@ -656,7 +675,7 @@ def wipe_and_reskeleton_project(root):
     from kant.model import parse_kant, strip_kant_markers, KantParseError
 
     changed, skipped = [], []
-    for path, text in iter_project_text_files(root):
+    for path, text in iter_project_text_files(root, max_bytes=None):
         language = language_for_path(path)
         # SQL/HTML/Generico have no scanner and so no reliable way to re-tag anything at all —
         # wiping their markers without being able to rebuild would just be a loss, so they're left

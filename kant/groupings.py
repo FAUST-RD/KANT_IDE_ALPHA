@@ -25,6 +25,7 @@ class Grouping:
     id: str
     name: str
     members: list = field(default_factory=list)  # xref-style keys, '<rel_path>::<uid>'
+    member_hints: dict = field(default_factory=dict)  # key -> stable xref fields used for recovery
 # [TYP CLOSED] Grouping
 
 
@@ -40,7 +41,15 @@ def load_groupings(project_root):
     except (OSError, ValueError):
         return []
     groups = data.get('groups', [])
-    return [Grouping(id=g['id'], name=g['name'], members=list(g.get('members', ()))) for g in groups if g.get('id') and g.get('name')]
+    return [
+        Grouping(
+            id=g['id'],
+            name=g['name'],
+            members=list(g.get('members', ())),
+            member_hints=dict(g.get('member_hints', {})) if isinstance(g.get('member_hints', {}), dict) else {},
+        )
+        for g in groups if g.get('id') and g.get('name')
+    ]
 # [FN CLOSED] load_groupings
 
 
@@ -61,16 +70,86 @@ def new_grouping(name):
 # [FN] add_member — adds a key to a grouping (by id) if not already present, saves, returns the
 # updated list; a pure convenience wrapper so callers don't hand-roll the load/mutate/save sequence
 # [FN OPEN] add_member
-def add_member(project_root, group_id, key):
+def add_member(project_root, group_id, key, hint=None):
     groupings = load_groupings(project_root)
     for grouping in groupings:
         if grouping.id == group_id:
             if key not in grouping.members:
                 grouping.members.append(key)
+            if hint:
+                grouping.member_hints[key] = dict(hint)
             break
     save_groupings(project_root, groupings)
     return groupings
 # [FN CLOSED] add_member
+
+
+def member_hint(element):
+    """Minimal identity snapshot for recovering one grouped xref element after edits."""
+    if element is None:
+        return {}
+    return {
+        'file': element.file,
+        'uid': element.uid,
+        'tag': element.tag,
+        'name': element.name,
+        'order': element.order,
+    }
+
+
+def reconcile_groupings(groupings, xref):
+    """Repair stale member keys only when the current xref has one unambiguous match."""
+    indexes = ({}, {}, {})
+    for element in xref.values():
+        identities = (
+            element.uid,
+            (element.file, element.tag, element.name),
+            (element.file, element.tag, element.order),
+        )
+        for index, identity in zip(indexes, identities):
+            index.setdefault(identity, []).append(element)
+
+    changed = False
+    for grouping in groupings:
+        old_members = list(grouping.members)
+        old_hints = dict(grouping.member_hints)
+        members = []
+        hints = {}
+        for old_key in old_members:
+            key = old_key
+            element = xref.get(key)
+            hint = old_hints.get(old_key, {})
+            if element is None and hint:
+                identities = (
+                    hint.get('uid'),
+                    (hint.get('file'), hint.get('tag'), hint.get('name')),
+                    (hint.get('file'), hint.get('tag'), hint.get('order')),
+                )
+                for index, identity in zip(indexes, identities):
+                    parts = identity if isinstance(identity, tuple) else (identity,)
+                    candidates = index.get(identity, ()) if None not in parts else ()
+                    if len(candidates) == 1:
+                        element = candidates[0]
+                        key = element.key
+                        break
+            if key not in members:
+                members.append(key)
+                current_hint = member_hint(element) or hint
+                if current_hint:
+                    hints[key] = current_hint
+        if members != old_members or hints != old_hints:
+            grouping.members = members
+            grouping.member_hints = hints
+            changed = True
+    return changed
+
+
+def load_reconciled_groupings(project_root, xref):
+    """Load groups and persist deterministic key repairs and refreshed member hints."""
+    groupings = load_groupings(project_root)
+    if reconcile_groupings(groupings, xref):
+        save_groupings(project_root, groupings)
+    return groupings
 
 
 # [FN CATEGORY] remap_member_key — rewrites the rel_path portion of one xref-style key
@@ -116,9 +195,20 @@ def migrate_member_paths(project_root, old_rel, new_rel, is_dir):
         # dict.fromkeys dedupes while preserving order — if two distinct old keys ever remapped onto
         # the same new key (a rename target colliding with an existing member), keep one entry
         # instead of a stray duplicate; mirrors migrate_position_keys' own collision handling below
-        remapped = list(dict.fromkeys(remap_member_key(key, old_rel, new_rel, is_dir) for key in grouping.members))
-        if remapped != grouping.members:
+        remapped = []
+        remapped_hints = {}
+        for old_key in grouping.members:
+            new_key = remap_member_key(old_key, old_rel, new_rel, is_dir)
+            if new_key not in remapped:
+                remapped.append(new_key)
+            hint = dict(grouping.member_hints.get(old_key, {}))
+            if hint:
+                if new_key != old_key:
+                    hint['file'] = new_key.rsplit('::', 1)[0]
+                remapped_hints[new_key] = hint
+        if remapped != grouping.members or remapped_hints != grouping.member_hints:
             grouping.members = remapped
+            grouping.member_hints = remapped_hints
             changed = True
     if changed:
         save_groupings(project_root, groupings)

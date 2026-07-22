@@ -19,16 +19,19 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 | Change | Start here | Then inspect |
 | --- | --- | --- |
 | KANT marker parsing, IDs, round-trip serialization | `model.py`: `parse_kant`, `_assign_uids`, `serialize_kant` | parser assertions in `kant_editor.py`; smoke cases in `test_kant_smoke.py` |
+| Generate or remove KANT marker skeletons | `skeleton.py`: `apply_skeleton`, `strip_kant_project` | KANT menu actions in `widgets.py`; orchestration in `mainwindow.py` |
 | Atomic writes, fingerprints, filename safety | `fileio.py` | save callers in `widgets.py` and `workspace.py` |
-| Local syntax checks or run commands | `syntax.py` | status/run orchestration in `mainwindow.py` |
+| Local syntax checks, KANT marker audit/repair, or run commands | `syntax.py` | status/run orchestration in `mainwindow.py` |
 | Project search, replace scan, map generation, validation | `projectops.py` | UI callbacks in `mainwindow.py` |
 | Incoming/Outgoing reference detection | `xref.py`: `build_xref` | cache and panels in `mainwindow.py` |
+| Saved element groups and member recovery after edits | `groupings.py`: `reconcile_groupings` | Groups tree and menus in `mainwindow.py` |
 | MAPPA layout, filters, drill-down, graphics | `mappa.py`: `_force_layout_positions`, `XrefMapView`, `XrefMapDialog` | graph creation in `xref.py`; entry point (LOCAL/GLOBAL) in `mainwindow.py`'s `_build_io_tabs`/`_open_xref_window` |
 | Editor blocks, tabs, autosave, undo/redo | `widgets.py`: `CodeEdit`, section widgets, `FileTab` | rendering and callbacks in `mainwindow.py` |
-| Project tree drag-to-reorder | `widgets.py`: `ProjectTree` (`reorder_allowed`/`reorder_handler` callables, role-agnostic — same "callback not import" split as `file_drop_handler`) | wiring/apply logic in `mainwindow.py`: `_update_tree_drop_handler`, `_kant_reorder_allowed`, `_kant_reorder_apply` |
+| Project tree drag/drop | `widgets.py`: `ProjectTree` routes role-agnostic callbacks | KANT reorder and File-view moves in `mainwindow.py`; safe path/tab/group migration in `workspace.py` `_move_tree_path` |
 | Project tree, active tabs, rendering, menus, Git/LSP routing | `mainwindow.py`: `MainWindow` | the service module called by the relevant method |
 | Snapshots, review/apply/rollback, file watching, create/rename/trash | `workspace.py` | live diff rendering in `mainwindow.py`: `_enter_ai_review_mode`/`_show_ai_review_diff`; review UI in `widgets.py`: `ClaudePane.offer_ai_review` |
 | Claude/Codex process and inline review UI | `widgets.py`: `ClaudePane.offer_ai_review`, `_agent_command` | the diff itself lives in the coding board/tree, not a review widget — see `mainwindow.py`'s `_enter_ai_review_mode` |
+| PURE AI layout and global grouped chat archive | `mainwindow.py`: `_set_pure_ai_mode`, `_switch_ai_project`, `_group_ai_conversation` | `widgets.py`: `ConversationSidebar`, `ClaudePane.conversation_state` |
 | "Modifica import" (local, editable copy of a third-party import) | `mainwindow.py`: `_start_import_edit`, `_open_import_edit_dialog`, `_open_import_occurrence_picker`, `_apply_local_import_shadow` | context-menu detection in `widgets.py`'s `CodeEdit.contextMenuEvent`/`import_edit_provider`; Python-only (resolves via the project's active interpreter) |
 | Permission requests from Claude Code | `aipermissions.py` and `permission_mcp.py` | `ClaudePane` in `widgets.py` |
 | LSP transport/configuration | `lsp.py` | request and fallback handling in `mainwindow.py` |
@@ -42,12 +45,16 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 
 - `kant_editor.py` — thin executable entry point, compatibility re-exports, and small deterministic self-check.
 - `kant/model.py` — `Node`/`Run` tree, strict marker parser, UID stamping, serialization, cached top-level labels.
+- `kant/skeleton.py` — deterministic marker generation and project-wide KANT-marker removal.
 - `kant/fileio.py` — atomic text/byte replacement, line endings, fingerprints, safe child names.
 - `kant/syntax.py` — shared tokenizer, lightweight checks, KANT validation, per-extension run commands.
 - `kant/xref.py` — deterministic project-wide graph of KANT elements and identifier references.
+- `kant/groupings.py` — persisted groups, stable member hints, and deterministic stale-key recovery.
 - `kant/projectops.py` — pure project scans and generated KANT map validation.
 - `kant/workspace.py` — trust boundary for filesystem watching/mutation and AI snapshot review/rollback.
 - `kant/widgets.py` — reusable Qt UI, agent terminal (`ClaudePane`, including the accept/cancel review card — the diff itself renders in `mainwindow.py`'s coding board/tree, not here), file tabs.
+- `docs/PURE_AI_DESIGN.md` — panel composition and persistence contract for PURE AI mode.
+- `docs/AUDIT_BUG_PERFORMANCE_2026-07-22.md` — latest verified bug/performance audit and inactive-feature inventory.
 - `kant/mappa.py` — MAPPA: layout algorithm, graph graphics items, `XrefMapView`, `XrefMapDialog`.
 - `kant/mainwindow.py` — application state and orchestration. Search its region headings or `AI-NAV` before reading linearly.
 - `kant/lsp.py` — JSON-RPC/LSP process lifecycle and document synchronization.
@@ -60,7 +67,6 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 - `kant/icons.py` — central monochrome SVG icon set; defaults to gold in night mode.
 - `test_kant_smoke.py` — offscreen integration/regression checks, one `test_*` method per feature area.
 - `DESIGN.md` — invariants, data flow, and rationale; not a second file index.
-- `legacy/index.html` — legacy browser prototype, outside the Python runtime.
 
 ## End-to-end flows
 

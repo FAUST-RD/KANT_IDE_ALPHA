@@ -13,12 +13,12 @@ from pathlib import Path
 
 import shiboken6
 
-from PySide6.QtCore import Qt, QEvent, QPointF, QSettings
+from PySide6.QtCore import Qt, QCoreApplication, QEvent, QPointF, QProcess, QSettings
 from PySide6.QtGui import QImage, QKeyEvent, QKeySequence, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication, QGraphicsItem, QLabel, QListWidget, QMenu, QMessageBox, QPushButton, QTabBar, QToolButton,
-    QTreeWidget, QTreeWidgetItem,
+    QTreeWidget, QTreeWidgetItem, QWidget,
 )
 
 import kant_editor
@@ -34,7 +34,7 @@ from kant.pyenv import (
 )
 from kant.xref import build_xref, XrefElement
 from kant.widgets import (
-    ClaudePane, CollapsibleSection, FileTab, LeafSection, RecentFolderCard,
+    ClaudePane, CollapsibleSection, FileTab, LeafSection, RecentFolderCard, TerminalPane,
     _agent_command, _markdown_to_html, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
     _code_hover_popup_instance, make_app_icon, make_app_pixmap, set_vim_mode, vim_mode_enabled,
     compress_attached_image, convert_attached_document,
@@ -50,8 +50,8 @@ from kant.workspace import (
     rollback_snapshot, render_review_text, safe_project_path,
 )
 from kant.permission_mcp import handle_message
-from kant.groupings import load_groupings, new_grouping, save_groupings
-from kant.syntax import audit_kant_headers, check_kant_markers
+from kant.groupings import load_groupings, load_reconciled_groupings, member_hint, new_grouping, save_groupings
+from kant.syntax import KEYWORDS, KEYWORD_DOCS, audit_kant_headers, check_kant_markers, repair_kant_error
 from kant import skeleton
 from kant import toolchains as kant_toolchains
 from kant.projectops import _canonical_map_text, build_kant_map, validate_kant_project
@@ -314,7 +314,12 @@ class KantSmokeTest(unittest.TestCase):
         assert window.terminal_stack.currentIndex() == 2
         assert window.terminal_stack.currentWidget() is window.errors_view
         assert window.terminal_sidebar_group.button(3).property('kantIcon') == 'kant'
+        validation_runs = []
+        window._run_kant_validation_background = lambda: validation_runs.append(True)
+        window._switch_terminal_tab(3)
+        assert validation_runs == [True]
         window._show_validation_results(['sample.py: errore KANT'], [])
+        assert validation_runs == [True]  # rendering errors must not recursively start another scan
         assert window.terminal_stack.currentWidget() is window.kant_errors_view
         assert window.terminal_sidebar_group.button(3).isChecked()
         assert 'errore KANT' in window.kant_errors_view.topLevelItem(0).child(0).text(0)
@@ -414,6 +419,42 @@ class KantSmokeTest(unittest.TestCase):
             MainWindow._launch_kant_fill_blanks(window, 'claude')
             assert not launch_args
 
+    def test_comment_kant_project_scans_nested_sources_without_search_size_cap(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            nested = root / 'src'
+            nested.mkdir()
+            source = nested / 'large.py'
+            source.write_text('# padding beyond search cap\n' * 8 + 'def alpha():\n    pass\n', encoding='utf-8')
+            ignored = root / 'node_modules'
+            ignored.mkdir()
+            (ignored / 'ignored.py').write_text('def ignored(): pass\n', encoding='utf-8')
+            prompts, messages = [], []
+            window = MainWindow.__new__(MainWindow)
+            window.project_root_path = str(root)
+            window._flush_all_tabs = lambda: True
+            window._tab_for_path = lambda _path: None
+            window._refresh_after_fs_change = lambda: None
+            window._ide_message = lambda title, message: messages.append((title, message))
+            window.claude_pane = type('Pane', (), {
+                'effort_select': type('Combo', (), {'currentText': lambda _self: MODEL_DEFAULT})(),
+                'run_prompt': lambda _self, *args, **kwargs: prompts.append((args, kwargs)) or True,
+            })()
+            old_limit = theme.SEARCH_MAX_BYTES
+            theme.SEARCH_MAX_BYTES = 32
+            try:
+                MainWindow._comment_kant_project(window)
+            finally:
+                theme.SEARCH_MAX_BYTES = old_limit
+
+            tagged = source.read_text(encoding='utf-8')
+            assert '[FN OPEN] alpha' in tagged
+            assert '[FN OPEN] ignored' not in (ignored / 'ignored.py').read_text(encoding='utf-8')
+            assert len(prompts) == 1 and not messages
+            prompt = prompts[0][0][0]
+            md_content = Path(prompt.split('Leggi ', 1)[1].split('.md:', 1)[0] + '.md').read_text(encoding='utf-8')
+            assert 'src\\large.py' in md_content or 'src/large.py' in md_content
+
     def _fake_ai_fill_window(self, tab):
         prompts, messages = [], []
         window = MainWindow.__new__(MainWindow)
@@ -475,6 +516,14 @@ class KantSmokeTest(unittest.TestCase):
         md_content = Path(prompt.split('Leggi ', 1)[1].split('.md:', 1)[0] + '.md').read_text(encoding='utf-8')
         assert 'alpha' in md_content
         assert 'beta' not in md_content  # untagged too, but outside the isolated leaf's own span
+
+        whole_window, whole_prompts, whole_messages = self._fake_ai_fill_window(tab)
+        MainWindow._ai_fill_kant_blanks(whole_window, whole_file=True)
+        assert not whole_messages and len(whole_prompts) == 1
+        whole_md = Path(
+            whole_prompts[0][0].split('Leggi ', 1)[1].split('.md:', 1)[0] + '.md'
+        ).read_text(encoding='utf-8')
+        assert 'alpha' in whole_md and 'beta' in whole_md
 
     def test_ai_fill_kant_blanks_reports_when_nothing_is_blank(self):
         src = '\n'.join([
@@ -577,17 +626,56 @@ class KantSmokeTest(unittest.TestCase):
             assert '[FN OPEN] beta' in b_text
             assert '[MOD OPEN] b.py' in b_text and '[MOD CLOSED] b.py' in b_text
 
+    def test_strip_kant_project_removes_only_kant_comments(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            tagged = root / 'tagged.py'
+            tagged.write_text(
+                '# ordinary comment\n'
+                '# [FN CATEGORY] alpha — description\n'
+                '# [FN] alpha — short description\n'
+                '# [FN OPEN #abc] alpha\ndef alpha():\n    pass\n# [FN CLOSED #abc] alpha\n',
+                encoding='utf-8',
+            )
+            plain = root / 'plain.py'
+            plain.write_text('# keep me\nx = 1\n', encoding='utf-8')
+            broken = root / 'broken.py'
+            broken.write_text(
+                '# [FN CATEGORY] orphan — remove me\n'
+                '# [FN] orphan — remove me too\n'
+                '# [FN OPEN]\n'
+                '# [FN OPEN] x\ndef x(): pass\n# [FN CLOSED] y\n'
+                'example = "# [FN OPEN] text inside a string"\n'
+                '# [NOTE] ordinary bracketed comment\n',
+                encoding='utf-8',
+            )
+
+            changed, skipped = skeleton.strip_kant_project(str(root))
+
+            assert changed == ['broken.py', 'tagged.py']
+            assert skipped == []
+            assert tagged.read_text(encoding='utf-8') == '# ordinary comment\ndef alpha():\n    pass\n'
+            assert plain.read_text(encoding='utf-8') == '# keep me\nx = 1\n'
+            assert broken.read_text(encoding='utf-8') == (
+                'def x(): pass\n'
+                'example = "# [FN OPEN] text inside a string"\n'
+                '# [NOTE] ordinary bracketed comment\n'
+            )
+
     def test_agent_command_building(self):
         automatic = _agent_command('codex', 'tagga', True)[1]
+        windows_sandbox = ['-c', 'windows.sandbox="unelevated"'] if os.name == 'nt' else []
         assert '--full-auto' not in automatic
-        assert automatic[:5] == ['exec', '--sandbox', 'workspace-write', '--ask-for-approval', 'never']
+        assert automatic == [
+            'exec', *windows_sandbox, '--sandbox', 'workspace-write', '--ask-for-approval', 'never', 'tagga',
+        ]
         # --model must precede the trailing prompt positional for both agents, or the CLI would
         # consume the flag/value as the prompt itself instead of the actual prompt text
         claude_args = _agent_command('claude', 'ciao', model='claude-opus-4-8')[1]
         assert claude_args == ['--model', 'claude-opus-4-8', '-p', 'ciao']
         codex_args = _agent_command('codex', 'ciao', True, 'gpt-5.6')[1]
         assert codex_args == [
-            'exec', '--sandbox', 'workspace-write', '--ask-for-approval', 'never',
+            'exec', *windows_sandbox, '--sandbox', 'workspace-write', '--ask-for-approval', 'never',
             '--model', 'gpt-5.6', 'ciao',
         ]
         assert _agent_command('claude', 'ciao')[1] == ['-p', 'ciao']  # no --model when unset
@@ -603,6 +691,45 @@ class KantSmokeTest(unittest.TestCase):
         assert _agent_command('claude', 'ciao', session_args=('--resume', 'abc'))[1] == ['--resume', 'abc', '-p', 'ciao']
         codex_resume_args = _agent_command('codex', 'ciao', session_args=('resume', '--last'))[1]
         assert codex_resume_args == ['exec', 'resume', '--last', 'ciao']
+
+    def test_process_and_lsp_request_cleanup(self):
+        terminal = TerminalPane(os.getcwd())
+        terminal_process = QProcess(terminal)
+        terminal.process = terminal_process
+        terminal._finished(0, None)
+        assert terminal.process is None
+
+        pane = ClaudePane(os.getcwd())
+        ai_process = QProcess(pane)
+        pane.process = ai_process
+        pane._reset_process()
+        assert pane.process is None
+
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        assert not shiboken6.isValid(terminal_process)
+        assert not shiboken6.isValid(ai_process)
+
+        map_dialog = XrefMapDialog()
+        map_dialog.show()
+        map_dialog.loading_spinner.start()
+        assert map_dialog.loading_spinner._timer.isActive()
+        map_dialog.hide()
+        assert not map_dialog.loading_spinner._timer.isActive()
+        map_dialog.deleteLater()
+
+        window = MainWindow()
+        try:
+            edit = CodeEdit('value = 1')
+            holder = QWidget()
+            edit.setParent(holder)
+            window.lsp_completion_requests = {1: edit}
+            window.lsp_hover_requests = {2: (edit, QPointF())}
+            window._drop_lsp_widget_requests(holder)
+            assert not window.lsp_completion_requests and not window.lsp_hover_requests
+        finally:
+            window.close()
+            pane.deleteLater()
+            terminal.deleteLater()
 
     def test_claude_pane_resumes_conversation_across_messages(self):
         # each run_prompt call is otherwise a brand-new, memory-less claude/codex process — this
@@ -667,6 +794,110 @@ class KantSmokeTest(unittest.TestCase):
             kant_widgets_module.QProcess = original_process_cls
             kant_widgets_module.shutil.which = original_which
             pane.deleteLater()
+
+    def test_pure_ai_layout_and_conversation_restore(self):
+        pane = ClaudePane(os.getcwd())
+        try:
+            pane._add_message('Prima domanda', 'user')
+            pane._append_stream('Prima risposta')
+            pane._commit_stream_history()
+            pane._claude_session_id = 'session-1'
+            state = pane.conversation_state()
+            assert [message['role'] for message in state['messages']] == ['user', 'assistant']
+
+            assert pane.load_conversation(state)
+            assert [message[0] for message in pane._messages] == ['user', 'assistant']
+            assert pane._claude_session_id == 'session-1'
+        finally:
+            pane.deleteLater()
+
+        window = MainWindow()
+        try:
+            window.claude_pane.pure_ai_btn.setChecked(True)
+            assert window.splitter.widget(0) is window.conversation_sidebar
+            assert window.splitter.widget(1) is window.claude_pane
+            assert window.splitter.widget(2) is window.main_splitter
+            assert window.workspace_splitter.orientation() == Qt.Vertical
+            assert window.claude_tab_btn.isHidden()
+            assert window.claude_pane.global_mode_btn.isHidden()
+            assert window.claude_pane.focus_label.isHidden()
+
+            window.claude_pane.pure_ai_btn.setChecked(False)
+            assert window.splitter.count() == 2
+            assert window.splitter.widget(0) is window.main_splitter
+            assert window.splitter.widget(1) is window.claude_pane
+            assert window.workspace_splitter.orientation() == Qt.Horizontal
+            assert not window.claude_pane.global_mode_btn.isHidden()
+            assert not window.claude_pane.focus_label.isHidden()
+        finally:
+            window.close()
+
+        with _temp_dir() as tmp:
+            first = os.path.join(tmp, 'first-project')
+            second = os.path.join(tmp, 'second-project')
+            os.makedirs(first)
+            os.makedirs(second)
+            window = MainWindow()
+            window.settings = QSettings(os.path.join(tmp, 'settings.ini'), QSettings.IniFormat)
+            window.settings.setValue('recentFolders', [first, second])
+            window._pure_ai_data = {}
+            try:
+                window.project_root_path = first
+                window._switch_ai_project(first)
+                # Opening a project starts with an ephemeral empty composer, not a persisted
+                # "New conversation" that never actually happened.
+                assert window._active_ai_conversation_id is None
+                assert window.conversation_sidebar.tree.topLevelItemCount() == 0
+                window.claude_pane._add_message('Ricorda questa chat', 'user')
+                original_id = window._active_ai_conversation_id
+                assert original_id is not None
+                window._new_ai_conversation()
+                assert window._active_ai_conversation_id != original_id
+                window._activate_ai_conversation(first, original_id)
+                assert window.claude_pane._history[0]['text'] == 'Ricorda questa chat'
+                # PURE AI is one flat archive: project paths stay hidden in each chat's data so
+                # selection can restore its cwd, but no project/folder row is rendered.
+                assert window.conversation_sidebar.tree.topLevelItemCount() == 1
+                assert all(
+                    window.conversation_sidebar.tree.topLevelItem(i).data(0, Qt.UserRole)
+                    for i in range(window.conversation_sidebar.tree.topLevelItemCount())
+                )
+                assert window.conversation_sidebar.title_label.text() == 'CHAT ARCHIVE'
+
+                # The selected chat can be grouped from the sidebar. Typing the same group name
+                # on more chats collects them under one optional heading; blank removes the group.
+                window._ide_text = lambda *args, **kwargs: ('Work', True)
+                assert window.conversation_sidebar.group_btn.isEnabled()
+                window.conversation_sidebar.group_btn.click()
+                assert window._pure_ai_data[first]['conversations'][original_id]['group'] == 'Work'
+                group_item = next(
+                    window.conversation_sidebar.tree.topLevelItem(i)
+                    for i in range(window.conversation_sidebar.tree.topLevelItemCount())
+                    if window.conversation_sidebar.tree.topLevelItem(i).text(0) == 'Work'
+                )
+                assert group_item.data(0, Qt.UserRole) is None
+                assert group_item.child(0).data(0, Qt.UserRole) == (first, original_id)
+
+                # A chat archived under another workspace loads without opening that workspace in
+                # the right KANT board. Provider resume ids are cleared across cwd boundaries.
+                other = window._blank_ai_conversation()
+                other['state'] = {
+                    'messages': [{'role': 'user', 'text': 'Chat del secondo progetto', 'name': None}],
+                    'agent': 'claude', 'claude_session_id': 'old-session', 'codex_resumable': True,
+                }
+                second_data = window._ai_project_data(second)
+                second_data['conversations'][other['id']] = other
+                window.claude_pane.pure_ai_btn.setChecked(True)
+                window._refresh_ai_conversation_sidebar()
+                window._activate_ai_conversation(second, other['id'])
+                assert window.project_root_path == first
+                assert window.claude_pane.cwd == first
+                assert window.claude_pane._history[0]['text'] == 'Chat del secondo progetto'
+                assert window.claude_pane._claude_session_id is None
+                assert window.claude_pane._codex_resumable is False
+                assert 'does not scope this conversation' in window._build_ai_context_hint()
+            finally:
+                window.close()
 
     def test_codex_context_hint_not_reframed_as_kant_code_map(self):
         # bug: every codex message (not just genuine /kant-code-map runs) was being rewritten into
@@ -984,7 +1215,10 @@ class KantSmokeTest(unittest.TestCase):
 
     def test_kant_menu_has_verify_tag_and_wipe_actions(self):
         window = MainWindow()
-        for attr in ('validate_kant_menu_action', 'tag_current_file_menu_action', 'wipe_retag_menu_action'):
+        for attr in (
+            'validate_kant_menu_action', 'tag_current_file_menu_action', 'comment_full_file_menu_action',
+            'comment_project_menu_action', 'remove_kant_comments_menu_action', 'wipe_retag_menu_action',
+        ):
             assert hasattr(window.title_bar, attr)
         window.close()
 
@@ -993,11 +1227,21 @@ class KantSmokeTest(unittest.TestCase):
         # title bar's own Aspetto -> Notte/Giorno menu is hidden on the welcome screen
         # (_set_project_chrome_visible(False)), so before this there was no way to switch themes
         # before opening a project at all.
+        settings = QSettings('KANT', 'KANT Editor')
+        previous_language = settings.value('language')
+        settings.remove('language')
         window = MainWindow()
         window.resize(1000, 700)
         window.show()
         QApplication.processEvents()
         QApplication.processEvents()  # let the deferred QTimer.singleShot(0, ...) reposition run
+
+        assert window.welcome_language_btn.isVisible()
+        assert window.welcome_language_btn.text() == 'English'
+        assert window.welcome_open_btn.text() == 'Open folder…'
+        window.welcome_language_actions['it'].trigger()
+        assert window.welcome_language_btn.text() == 'Italiano'
+        assert window.welcome_open_btn.text() == 'Apri cartella…'
 
         start_mode = window.night_mode
         QTest.mouseClick(window.welcome_theme_btn, Qt.LeftButton)
@@ -1013,7 +1257,13 @@ class KantSmokeTest(unittest.TestCase):
         # position bug — same reasoning test_mappa_geometry_drag_reorder_and_tab_label_leak already
         # tolerates for this class of geometry check
         assert abs(actual_x - expected_x) <= 6 and abs(actual_y - expected_y) <= 6
+        assert abs(window.welcome_language_btn.x() - margin) <= 6
+        assert abs(window.welcome_language_btn.y() - expected_y) <= 6
         window.close()
+        if previous_language is None:
+            settings.remove('language')
+        else:
+            settings.setValue('language', previous_language)
 
     def test_project_tree_build_read_label_and_fs_reload(self):
         with _temp_dir() as tmp:
@@ -1203,6 +1453,17 @@ class KantSmokeTest(unittest.TestCase):
             assert isinstance(fn_widget, LeafSection)
             fn_edit = fn_widget.findChild(CodeEdit)
             assert fn_edit.kant_node is fn_node
+            class_edit = next(edit for edit in cls_widget.findChildren(CodeEdit) if edit.kant_node is cls_node)
+            assert class_edit.absolute_line_number(0) == 3
+            assert fn_edit.absolute_line_number(0) == 6
+            tree_window._update_cursor_position_label(fn_edit)
+            assert 'Riga 6' in tree_window.cursor_pos_label.text()
+            # Offsets stay live: inserting one physical line in an earlier Run immediately shifts
+            # every later block's gutter, without rebuilding/reopening the file.
+            class_edit.setPlainText('class Widget:\n    pass')
+            assert fn_edit.absolute_line_number(0) == 7
+            class_edit.setPlainText('class Widget:')
+            assert fn_edit.absolute_line_number(0) == 6
             assert tree_window._visible_ai_context_uid(nested_tab) == fn_node.uid
             tree_window._on_focus_changed(None, fn_edit)
             assert tree_window._ai_context_target() == (nested_tab, fn_node.uid)
@@ -1573,6 +1834,21 @@ class KantSmokeTest(unittest.TestCase):
             # see kant/widgets.py's show_code_hover_popup/hide_code_hover_popup
             assert 'def f()' in _code_hover_popup_instance[0].label.text()
             assert 999 not in lsp_window.lsp_hover_requests
+
+            # Built-in statement help is a syntax card, not generic prose: every highlighted
+            # keyword has a concrete form and a runnable-sized example rendered as code blocks.
+            assert set(KEYWORD_DOCS) == KEYWORDS
+            assert all('**Sintassi**' in doc and '**Esempio**' in doc for doc in KEYWORD_DOCS.values())
+            keyword_edit = CodeEdit('def')
+            keyword_edit.kant_tab = type('T', (), {'path': str(root / 'demo.py')})()
+            keyword_cursor = keyword_edit.textCursor()
+            keyword_cursor.movePosition(QTextCursor.End)
+            lsp_window._request_hover(
+                keyword_edit, keyword_cursor, keyword_edit.mapToGlobal(keyword_edit.rect().center()),
+            )
+            keyword_html = _code_hover_popup_instance[0].label.text()
+            assert '<pre' in keyword_html and 'def nome(parametro' in keyword_html
+            assert '<b>Sintassi</b>' in keyword_html and '<b>Esempio</b>' in keyword_html
 
             # local fallback: no LSP server configured -> definition-location lookup shown as tooltip
             lsp_window._local_hover(local_completion_edit, local_completion_edit.mapToGlobal(local_completion_edit.rect().center()), 'alpha_function')
@@ -1954,7 +2230,9 @@ class KantSmokeTest(unittest.TestCase):
                 'cls': XrefElement('cls', 'cls', 'CLS', 'Foo', 'classe', 'd.py', 0),
                 'm1': XrefElement('m1', 'm1', 'FN', 'bar', 'metodo bar', 'd.py', 1, outgoing=['m2'], parent='cls'),
                 'm2': XrefElement('m2', 'm2', 'FN', 'baz', 'metodo baz', 'd.py', 2, incoming=['m1'], parent='cls'),
-                'lone': XrefElement('lone', 'lone', 'FN', 'solo', 'funzione sola', 'd.py', 3),
+                'inner': XrefElement('inner', 'inner', 'FN', 'inner', 'figlio di metodo', 'd.py', 3, parent='m1'),
+                'deep': XrefElement('deep', 'deep', 'VAR', 'deep', 'nipote profondo', 'd.py', 4, parent='inner'),
+                'lone': XrefElement('lone', 'lone', 'FN', 'solo', 'funzione sola', 'd.py', 5),
             }
             drill_dialog = XrefMapDialog()
             drill_dialog.resize(900, 650)
@@ -1977,10 +2255,13 @@ class KantSmokeTest(unittest.TestCase):
             QTest.mouseClick(drill_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, eye_viewport_pos)
             app.processEvents()
             assert drill_dialog._drill_key == 'cls'
-            # the parent ('cls') is detached from the graph entirely — only its children remain,
-            # 'lone' stays excluded (not a child of 'cls')
-            assert set(drill_dialog._display) == {'m1', 'm2'}
+            # the parent ('cls') is detached from the graph entirely; its full descendant tree
+            # remains, while 'lone' stays excluded because it is outside that subtree
+            assert set(drill_dialog._display) == {'m1', 'm2', 'inner', 'deep'}
             assert drill_dialog._display['m1'].outgoing == ['m2']
+            assert drill_dialog._display['m1'].parent is None
+            assert drill_dialog._display['inner'].parent == 'm1'
+            assert drill_dialog._display['deep'].parent == 'inner'
             assert 'cls' not in drill_dialog.view._node_items
             # the parent becomes the fixed title card instead of a graph node
             assert drill_dialog.drill_title_card.isVisible()
@@ -1989,7 +2270,7 @@ class KantSmokeTest(unittest.TestCase):
             assert drill_dialog.drill_back_btn.isVisible()
             drill_dialog._exit_drill_mode()
             app.processEvents()
-            assert set(drill_dialog._display) == {'cls', 'm1', 'm2', 'lone'}
+            assert set(drill_dialog._display) == {'cls', 'm1', 'm2', 'inner', 'deep', 'lone'}
             assert not drill_dialog.drill_back_btn.isVisible()
             assert not drill_dialog.drill_title_card.isVisible()
             drill_dialog.close()
@@ -3373,6 +3654,7 @@ class KantSmokeTest(unittest.TestCase):
             assert window.view_mode == 'groups'  # switched automatically to show the new group
             saved = load_groupings(str(project))
             assert len(saved) == 1 and saved[0].name == 'Auth flow' and set(saved[0].members) == set(fn_keys)
+            assert set(saved[0].member_hints) == set(fn_keys)
 
             # the tree shows one 'grouping' row with two 'grouping_member' children
             it = window.tree.invisibleRootItem()
@@ -3389,6 +3671,144 @@ class KantSmokeTest(unittest.TestCase):
             assert window.active_tab is not None
             assert os.path.basename(window.active_tab.path) == target_rel
             window.close()
+
+    def test_file_view_drag_moves_file_into_folder_and_retargets_open_tab(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            source = project / 'source.py'
+            source.write_text('# [FN OPEN] source\npass\n# [FN CLOSED] source\n', encoding='utf-8')
+            destination_dir = project / 'package'
+            destination_dir.mkdir()
+
+            window = MainWindow()
+            window.project_root_path = str(project)
+            window.git_root = None
+            window.git_status = {}
+            window.view_mode = 'file'
+            window._update_tree_drop_handler()
+            window._rebuild_tree(refresh_git=False)
+
+            root_item = window.tree.invisibleRootItem()
+            folder_item = next(
+                root_item.child(i) for i in range(root_item.childCount())
+                if root_item.child(i).data(0, ROLE_PATH) == str(destination_dir)
+            )
+            file_item = next(
+                root_item.child(i) for i in range(root_item.childCount())
+                if root_item.child(i).data(0, ROLE_PATH) == str(source)
+            )
+            assert window.tree.dragEnabled()
+            assert window.tree.file_move_handler is not None
+            assert window._open_file(str(source))
+            window.show()
+            self.app.processEvents()
+            window.tree.setCurrentItem(file_item)
+
+            class _DropEvent:
+                accepted = False
+
+                def source(self):
+                    return window.tree
+
+                def position(self):
+                    return QPointF(window.tree.visualItemRect(folder_item).center())
+
+                def acceptProposedAction(self):
+                    self.accepted = True
+
+                def ignore(self):
+                    self.accepted = False
+
+            event = _DropEvent()
+            window.tree.dropEvent(event)
+
+            moved = destination_dir / source.name
+            assert event.accepted
+            assert moved.is_file() and not source.exists()
+            assert str(moved) in window.open_tabs and str(source) not in window.open_tabs
+            assert window.active_tab.path == str(moved)
+            window.close()
+
+    def test_kant_tree_drop_reorders_sibling_blocks_in_source(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            source = project / 'order.py'
+            source.write_text('\n'.join([
+                '# [MOD OPEN #mod] order.py',
+                '# [FN OPEN #first] first', 'def first(): pass', '# [FN CLOSED #first] first',
+                '# [FN OPEN #second] second', 'def second(): pass', '# [FN CLOSED #second] second',
+                '# [FN OPEN #third] third', 'def third(): pass', '# [FN CLOSED #third] third',
+                '# [MOD CLOSED #mod] order.py',
+            ]), encoding='utf-8')
+
+            window = MainWindow()
+            window.project_root_path = str(project)
+            window.git_root = None
+            window.git_status = {}
+            window.view_mode = 'code'
+            window._update_tree_drop_handler()
+            window._rebuild_tree(refresh_git=False)
+            file_item = window.tree.topLevelItem(0)
+            file_item.setExpanded(True)
+            window.show()
+            self.app.processEvents()
+            first, _second, third = (file_item.child(i) for i in range(3))
+            window.tree.setCurrentItem(first)
+
+            class _DropEvent:
+                accepted = False
+
+                def source(self):
+                    return window.tree
+
+                def position(self):
+                    return QPointF(window.tree.visualItemRect(third).center())
+
+                def acceptProposedAction(self):
+                    self.accepted = True
+
+                def ignore(self):
+                    self.accepted = False
+
+            event = _DropEvent()
+            window.tree.dropEvent(event)
+
+            assert event.accepted
+            saved = parse_kant(source.read_text(encoding='utf-8'))
+            module = next(node for node in saved.body if isinstance(node, Node))
+            assert [node.name for node in module.body if isinstance(node, Node)] == ['second', 'third', 'first']
+            window.close()
+
+    def test_grouping_recovers_member_after_uid_and_name_change(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            old_tree = parse_kant('\n'.join([
+                '# [MOD OPEN #module1] service.py',
+                '# [FN OPEN #old123] fetch_user',
+                'def fetch_user(): pass',
+                '# [FN CLOSED #old123] fetch_user',
+                '# [MOD CLOSED #module1] service.py',
+            ]))
+            old_xref = build_xref({'service.py': old_tree})
+            old_element = old_xref['service.py::old123']
+            grouping = new_grouping('Service')
+            grouping.members = [old_element.key]
+            grouping.member_hints = {old_element.key: member_hint(old_element)}
+            save_groupings(str(project), [grouping])
+
+            new_tree = parse_kant('\n'.join([
+                '# [MOD OPEN #module1] service.py',
+                '# [FN OPEN #new456] load_user',
+                'def load_user(): pass',
+                '# [FN CLOSED #new456] load_user',
+                '# [MOD CLOSED #module1] service.py',
+            ]))
+            new_xref = build_xref({'service.py': new_tree})
+            saved = load_reconciled_groupings(str(project), new_xref)
+
+            assert saved[0].members == ['service.py::new456']
+            assert saved[0].member_hints['service.py::new456']['name'] == 'load_user'
+            assert load_groupings(str(project))[0].members == ['service.py::new456']
 
     def test_rename_file_migrates_grouping_and_mappa_position(self):
         # regression for the rename-stability gap: _rename_tree_item used to touch neither
@@ -3407,6 +3827,9 @@ class KantSmokeTest(unittest.TestCase):
             old_key = 'auth.py::abc123'
             grouping = new_grouping('Auth flow')
             grouping.members = [old_key]
+            grouping.member_hints = {old_key: {
+                'file': 'auth.py', 'uid': 'abc123', 'tag': 'FN', 'name': 'login', 'order': 1,
+            }}
             save_groupings(str(project), [grouping])
 
             position_key = _position_settings_key(str(project))
@@ -3421,6 +3844,7 @@ class KantSmokeTest(unittest.TestCase):
             assert (project / 'auth2.py').is_file() and not (project / 'auth.py').exists()
             saved = load_groupings(str(project))
             assert saved[0].members == ['auth2.py::abc123']
+            assert saved[0].member_hints['auth2.py::abc123']['file'] == 'auth2.py'
             data = json.loads(settings.value(position_key, '{}'))
             assert data == {'auth2.py::abc123': [12.0, 34.0]}
             settings.remove(position_key)
@@ -3486,6 +3910,73 @@ class KantSmokeTest(unittest.TestCase):
         ])
         result3 = audit_kant_headers(tagline_name_mismatch)
         assert any('riga descrittiva' in e['message'] and e['line'] == 2 for e in result3['errors'])
+
+    def test_repair_kant_error_fixes_only_unambiguous_marker_mismatches(self):
+        header = '\n'.join([
+            '# [CLS CATEGORY] other_name - reads a user',
+            '# [FN] load_user - fetch by id',
+            '# [FN OPEN #abc] load_user',
+            'def load_user(): pass',
+            '# [FN CLOSED #abc] load_user',
+        ])
+        message = audit_kant_headers(header)['errors'][0]['message']
+        repaired = repair_kant_error(header, 1, message)
+        assert repaired is not None
+        assert repaired.splitlines()[0] == '# [FN CATEGORY] load_user - reads a user'
+        assert audit_kant_headers(repaired)['errors'] == []
+
+        closed = '\n'.join([
+            '# [FN OPEN #abc] load_user',
+            'def load_user(): pass',
+            '# [CLS CLOSED #abc] other_name',
+        ])
+        error = audit_kant_headers(closed)['errors'][0]
+        repaired_closed = repair_kant_error(closed, error['line'], error['message'])
+        assert repaired_closed is not None
+        assert repaired_closed.splitlines()[2] == '# [FN CLOSED #abc] load_user'
+        assert check_kant_markers(repaired_closed)['ok'] is True
+
+        wrong_id = closed.replace('[CLS CLOSED #abc] other_name', '[FN CLOSED #wrong] load_user')
+        id_error = audit_kant_headers(wrong_id)['errors'][0]
+        repaired_id = repair_kant_error(wrong_id, id_error['line'], id_error['message'])
+        assert repaired_id.splitlines()[2] == '# [FN CLOSED #abc] load_user'
+
+    def test_kant_error_double_click_runs_available_fix(self):
+        with _temp_dir() as tmp:
+            path = Path(tmp) / 'broken.py'
+            path.write_text('\n'.join([
+                '# [CLS CATEGORY] other_name - reads a user',
+                '# [FN] load_user - fetch by id',
+                '# [FN OPEN #abc] load_user',
+                'def load_user(): pass',
+                '# [FN CLOSED #abc] load_user',
+            ]), encoding='utf-8')
+            message = audit_kant_headers(path.read_text(encoding='utf-8'))['errors'][0]['message']
+            window = MainWindow()
+            window.project_root_path = tmp
+            window._refresh_after_fs_change = lambda: None
+            validation_runs = []
+            window._run_kant_validation_background = lambda: validation_runs.append(True)
+            window._open_file = lambda _path: True
+            item = QTreeWidgetItem(window.kant_errors_view, [message])
+            item.setData(0, ROLE_KIND, 'validation-result')
+            item.setData(0, ROLE_PATH, str(path))
+            item.setData(0, ROLE_LINE, 1)
+            item.setData(0, ROLE_TEXT, message)
+
+            window.kant_errors_view.itemDoubleClicked.emit(item, 0)
+
+            assert path.read_text(encoding='utf-8').splitlines()[0] == '# [FN CATEGORY] load_user - reads a user'
+            assert validation_runs == [True]
+
+            map_syncs = []
+            window._sync_kant_map = lambda: map_syncs.append(True)
+            map_item = QTreeWidgetItem(window.kant_errors_view, ['manca KANT_*.md nella radice del progetto'])
+            map_item.setData(0, ROLE_KIND, 'validation-result')
+            map_item.setData(0, ROLE_TEXT, 'manca KANT_*.md nella radice del progetto')
+            window.kant_errors_view.itemDoubleClicked.emit(map_item, 0)
+            assert map_syncs == [True]
+            window.close()
 
     def test_audit_kant_headers_flags_orphaned_pending_header(self):
         src = '\n'.join([

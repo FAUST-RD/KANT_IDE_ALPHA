@@ -1696,6 +1696,14 @@ class XrefMapDialog(QDialog):
         self._save_positions()
         super().closeEvent(event)
 
+    def hideEvent(self, event):
+        self.loading_spinner.stop()
+        self._hover_show_timer.stop()
+        self._edge_hide_timer.stop()
+        self.view._anim_timer.stop()
+        self.view._laying_out = False
+        super().hideEvent(event)
+
     def _element_label(self, key):
         element = self._display.get(key) or self._elements.get(key)
         return f'[{element.tag}] {element.desc} — {element.file}' if element else key
@@ -1894,32 +1902,44 @@ class XrefMapDialog(QDialog):
         return disp
     # [FN CLOSED] _display_elements
 
-    # [FN CATEGORY] _drill_display — the internal-only view for one element: ONLY its direct
-    # children, with only the reference edges where BOTH ends are children (no outside callers/
-    # callees, no sibling clusters, no grandchildren) — just the geography of how the children
-    # relate to each other. The parent itself is deliberately excluded from this set: it's not a
-    # node in this graph at all, it's rendered as a fixed title card instead (see _enter_drill_mode).
+    # [FN CATEGORY] _drill_display — the internal-only view for one element: its complete
+    # descendant tree, with only reference edges whose ends both remain inside that tree. The
+    # drilled parent itself is excluded and rendered as a fixed title card; its direct children
+    # become roots, while deeper descendants retain their real internal containment links.
     # Node-visibility/edge-tag/isolate filters don't apply here; drilling in is its own lens.
-    # [FN] _drill_display — builds the children-only node set for drill-down mode
+    # [FN] _drill_display — builds the complete descendant node set for drill-down mode
     # [FN OPEN] _drill_display
     def _drill_display(self):
         if self._drill_key not in self._elements:
             return {}
-        children = {key for key, element in self._elements.items() if element.parent == self._drill_key}
+        children_by_parent = {}
+        for key, element in self._elements.items():
+            children_by_parent.setdefault(element.parent, []).append(key)
+        descendants = []
+        pending = list(reversed(children_by_parent.get(self._drill_key, ())))
+        seen = set()
+        while pending:
+            key = pending.pop()
+            if key in seen:
+                continue
+            seen.add(key)
+            descendants.append(key)
+            pending.extend(reversed(children_by_parent.get(key, ())))
+        descendant_set = set(descendants)
         disp = {}
-        for key in children:
+        for key in descendants:
             e = self._elements[key]
             node = XrefElement(
                 key=e.key, uid=e.uid, tag=e.tag, name=e.name, desc=e.desc,
                 file=e.file, order=e.order, category_desc=e.category_desc,
-                parent=None,  # the real parent is excluded from this graph entirely
+                parent=e.parent if e.parent in descendant_set else None,
             )
             node.outgoing_detail = []
             node.incoming_detail = []
             disp[key] = node
-        for key in children:
+        for key in descendants:
             for target in self._elements[key].outgoing:
-                if target in children and target != key:
+                if target in descendant_set and target != key:
                     if target not in disp[key].outgoing:
                         disp[key].outgoing.append(target)
                     if key not in disp[target].incoming:

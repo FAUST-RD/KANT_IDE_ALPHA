@@ -688,19 +688,21 @@ class WorkspaceMixin:
             self._ide_message('Rinomina', 'Usa solo un nome, senza percorsi.')
             return
         new_path = os.path.join(os.path.dirname(old_path), new_name)
+        self._move_tree_path(old_path, new_path, kind == 'dir', 'Rinomina')
+
+    def _move_tree_path(self, old_path, new_path, is_dir, title):
         if os.path.exists(new_path):
-            self._ide_message('Rinomina', 'Esiste gia un file o una cartella con questo nome.')
-            return
-        is_dir = kind == 'dir'
+            self._ide_message(title, 'Esiste gia un file o una cartella con questo nome.')
+            return False
         affected = [tab for path, tab in self.open_tabs.items()
                     if path == old_path or (is_dir and path.startswith(old_path + os.sep))]
         if any(not tab.flush_pending_save() for tab in affected):
-            return
+            return False
         try:
             os.rename(old_path, new_path)
         except OSError as error:
-            self._ide_message('Rinomina', f'Impossibile rinominare: {error}')
-            return
+            self._ide_message(title, f'Impossibile spostare: {error}')
+            return False
         for tab in affected:
             self._retarget_tab(tab, new_path + tab.path[len(old_path):])
         if self.project_root_path:
@@ -709,6 +711,7 @@ class WorkspaceMixin:
             migrate_member_paths(self.project_root_path, old_rel, new_rel, is_dir)
             migrate_position_keys(self.project_root_path, old_rel, new_rel, is_dir)
         self._refresh_after_fs_change()
+        return True
 
     def _retarget_tab(self, tab, new_path):
         old_path = tab.path

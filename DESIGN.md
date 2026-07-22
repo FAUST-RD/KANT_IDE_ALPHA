@@ -14,7 +14,7 @@ KANT IDE is a desktop editor for source files containing structural comment mark
 [TAG CLOSED #stable-id] name
 ```
 
-The editor turns those markers into an outline, editable section views, Incoming/Outgoing lists, and a project graph. The Python/PySide6 application is current; `legacy/index.html` is a legacy prototype.
+The editor turns those markers into an outline, editable section views, Incoming/Outgoing lists, and a project graph.
 
 ## Architecture
 

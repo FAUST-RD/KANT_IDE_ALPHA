@@ -10,11 +10,14 @@ AI navigation:
 This module owns coordination and cache invalidation, not the underlying parser, persistence,
 workspace safety, or graph algorithms.
 """
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
@@ -42,10 +45,14 @@ from kant.model import (
     KantParseError, ELEMENT_LANGUAGES, build_new_element_node, build_new_file_content,
 )
 from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending, is_safe_child_name
-from kant.syntax import check_file_syntax, run_command_for_path, _quote_arg, audit_kant_headers, KEYWORD_DOCS
+from kant.syntax import (
+    check_file_syntax, run_command_for_path, _quote_arg, audit_kant_headers, repair_kant_error, KEYWORD_DOCS,
+)
 from kant import skeleton
 from kant.xref import build_xref, _walk_nodes
-from kant.groupings import load_groupings, save_groupings, new_grouping, add_member
+from kant.groupings import (
+    load_groupings, load_reconciled_groupings, save_groupings, new_grouping, add_member, member_hint,
+)
 from kant.lsp import LSP_SERVERS_BY_EXT, file_uri, path_from_file_uri, lsp_server_for_path, LspClient
 from kant.dialogs import IdeDialogsMixin
 from kant.gitops import GitOpsMixin
@@ -60,7 +67,7 @@ from kant.pyenv import (
 )
 from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback_snapshot
 from kant.widgets import (
-    CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
+    CodeEdit, TerminalPane, ClaudePane, ConversationSidebar, CollapsibleSection, LeafSection,
     ProjectTree, ScanlineOverlay, make_app_icon, make_app_pixmap, RecentFolderCard, TitleBar, FileTab,
     MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html, _markdown_to_html,
     set_vim_mode, vim_mode_enabled, show_code_hover_popup, hide_code_hover_popup,
@@ -92,6 +99,9 @@ ROLE_ORDER = Qt.UserRole + 8
 # [CST] _KANT_ERROR_KB — regex -> (key, explanation, fix) for known KANT validation error shapes
 # [CST OPEN] _KANT_ERROR_KB
 _KANT_ERROR_KB = [
+    (re.compile(r'^manca KANT_.+ nella radice del progetto$|^KANT map non coerente'), 'mappa-non-sincronizzata',
+     "La mappa è un file generato: può essere ricostruita deterministicamente dai marker KANT del progetto.",
+     'sync-map'),
     (re.compile(r'^CATEGORY mancante$'), 'category-mancante',
      "Manca la riga [TAG CATEGORY] sopra il marker OPEN di questo elemento — deve spiegare COME "
      "funziona (il meccanismo), non ripetere cosa fa in altre parole.", 'ai-fill'),
@@ -121,7 +131,10 @@ _KANT_ERROR_KB = [
     (re.compile(r'incoerente con OPEN'), 'nome-incoerente',
      "Il nome o il tag in questa riga (CATEGORY o descrittiva) non corrisponde a quello nel "
      "marker OPEN dell'elemento — probabilmente è stato rinominato in un punto ma non negli altri "
-     "(CATEGORY, riga descrittiva e OPEN devono avere lo stesso nome).", None),
+     "(CATEGORY, riga descrittiva e OPEN devono avere lo stesso nome).", 'repair-marker'),
+    (re.compile(r'does not match the open element|id does not match its OPEN'), 'closed-incoerente',
+     "Il marker CLOSED non corrisponde all'elemento attualmente aperto. Tag, nome e #id possono "
+     "essere riallineati senza modificare il codice contenuto.", 'repair-marker'),
 ]
 # [CST CLOSED] _KANT_ERROR_KB
 
@@ -158,10 +171,9 @@ def _write_kant_fill_markdown(intro, listing):
 
 
 # [FN CATEGORY] _TreeItemLabel — tree rows use setItemWidget with a rich-HTML QLabel instead of plain
-# item text (for colored tag badges); WA_TransparentForMouseEvents alone was unreliable for getting
-# clicks through to the QTreeWidget's own itemClicked/itemDoubleClicked, so this label forwards
-# clicks to its own item directly instead of depending on hit-test pass-through.
-# [FN] _TreeItemLabel — a tree-row label that forwards its own clicks to the owning QTreeWidgetItem
+# item text. It forwards the complete mouse gesture to the tree viewport: forwarding only clicks
+# made rows open correctly but swallowed move/release, so QTreeWidget could never start a drag.
+# [FN] _TreeItemLabel — forwards tree-row mouse gestures through its rich-text label
 # [FN OPEN] _TreeItemLabel
 class _TreeItemLabel(QLabel):
     def __init__(self, tree, item, html):
@@ -170,14 +182,25 @@ class _TreeItemLabel(QLabel):
         self._item = item
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._tree.setCurrentItem(self._item)
-            self._tree.itemClicked.emit(self._item, 0)
-        event.accept()
+        self._forward_to_tree(event)
+
+    def mouseMoveEvent(self, event):
+        self._forward_to_tree(event)
+
+    def mouseReleaseEvent(self, event):
+        self._forward_to_tree(event)
 
     def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._tree.itemDoubleClicked.emit(self._item, 0)
+        self._forward_to_tree(event)
+
+    def _forward_to_tree(self, event):
+        viewport = self._tree.viewport()
+        pos = self.mapTo(viewport, event.position().toPoint())
+        forwarded = QMouseEvent(
+            event.type(), QPointF(pos), event.globalPosition(),
+            event.button(), event.buttons(), event.modifiers(),
+        )
+        QApplication.sendEvent(viewport, forwarded)
         event.accept()
 # [FN CLOSED] _TreeItemLabel
 
@@ -262,6 +285,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.open_tabs = {}  # path -> FileTab, every currently open file
         self._ai_context_page = None  # last coding tab selected by the user
         self.settings = QSettings('KANT', 'KANT Editor')  # persists the dragged column width
+        self._pure_ai_data = self._load_pure_ai_data()
+        self._active_ai_conversation_id = None
+        self._active_ai_conversation_path = None
+        self._pending_ai_conversation_id = None
+        self._loading_ai_conversation = False
+        self.pure_ai_mode = False
+        self._normal_splitter_sizes = None
+        self._normal_workspace_sizes = None
         self.night_mode = self.settings.value('nightMode', False, type=bool)
         set_theme(self.night_mode)
         self.project_root_path = None
@@ -306,9 +337,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.lsp_client = LspClient(self)
         self.lsp_client.diagnosticsChanged.connect(self._on_lsp_diagnostics)
         self.lsp_client.responseReceived.connect(self._on_lsp_response)
-        self.lsp_client.serverError.connect(
-            lambda message: self.terminal.write_info(f'\n# LSP: {message}\n') if hasattr(self, 'terminal') else None
-        )
+        self.lsp_client.serverError.connect(self._on_lsp_server_error)
         self.lsp_timer = QTimer(self)
         self.lsp_timer.setSingleShot(True)
         self.lsp_timer.timeout.connect(self._update_lsp_diagnostics)
@@ -416,6 +445,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             if proc is not None:
                 proc.kill()
                 proc.waitForFinished(1000)
+        self._save_active_ai_conversation()
         self.claude_pane.permission_bridge.stop()
         # an in-flight AI run is rolled back synchronously above, by _finish_ai_review reacting to
         # claude_pane.process finishing during waitForFinished(). If self._ai_snapshot is still set
@@ -451,6 +481,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # dragging, instead of once per mouse-move tick splitterMoved otherwise fires on
     # [FN OPEN] _debounce_splitter_save
     def _debounce_splitter_save(self, key, splitter):
+        if self.pure_ai_mode and key in ('splitterSizes', 'workspaceSplitterSizes'):
+            return
         timer = self._splitter_save_timers.get(key)
         if timer is None:
             timer = QTimer(self)
@@ -546,7 +578,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         QTimer.singleShot(0, self._position_welcome_theme_btn)
 
     def _position_claude_tab(self):
-        if not hasattr(self, 'claude_tab_btn'):
+        if not hasattr(self, 'claude_tab_btn') or self.pure_ai_mode:
             return
         # centered ON the splitter boundary (half the button's own width on each side), not flush
         # against it — a tall narrow pill straddling the seam between the coding board and the AI
@@ -681,7 +713,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _tree_stylesheet — boxed KANT tree QSS with a theme-aware selection color
     # [FN OPEN] _tree_stylesheet
     def _tree_stylesheet(self):
-        padding = '2px' if self.view_mode == 'code' and self.compact_kant_view else f'{theme.SPACE_2}px {theme.SPACE_1}px'
+        padding = '2px' if self.view_mode == 'code' and self.compact_kant_view else '6px 4px'
         item_padding = '1px 2px' if self.view_mode == 'code' and self.compact_kant_view else '2px 0px'
         # selection reads as a left accent bar + a slightly raised surface, not a large yellow
         # fill — border-left is the one QSS-reliable way to fake a left bar on a tree row (no
@@ -722,6 +754,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.add_file_btn.setStyleSheet(self._add_row_button_style())
             self.add_grouping_btn.setStyleSheet(self._add_row_button_style())
             self.claude_pane.apply_style()
+            self.conversation_sidebar.apply_style()
             self._style_io_tabs()
             self._style_view_mode_bar()
             self._style_action_toolbar()
@@ -900,7 +933,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             btn.setStyleSheet(style)
         self._action_toolbar_separator.setStyleSheet(f'color:{theme.BORDER};')
         self._action_toolbar_lead_separator.setStyleSheet(f'color:{theme.BORDER};')
-        self.run_target_label.setStyleSheet(f'color:{theme.DIM}; font-size:{theme.CODE_FONT_PT - 1}pt; padding-left:2px;')
+        self.run_target_label.setStyleSheet(f'color:{theme.DIM}; font-size:{theme.CODING_FONT_PT - 1}pt; padding-left:2px;')
 
     # [FN CATEGORY] _build_welcome_page — previously had a "+" new-project button floating in its
     # own top_row inside the SAME centered outer layout as the card: since outer.setAlignment
@@ -1013,7 +1046,22 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.welcome_theme_btn.setCursor(Qt.PointingHandCursor)
         self.welcome_theme_btn.clicked.connect(self._toggle_theme)
 
-        self._style_welcome_page()
+        self.welcome_language_btn = QPushButton(page)
+        self.welcome_language_btn.setFixedSize(126, 40)
+        self.welcome_language_btn.setIcon(draw_icon('globe', 18, theme.ACCENT))
+        self.welcome_language_btn.setIconSize(QSize(18, 18))
+        self.welcome_language_btn.setCursor(Qt.PointingHandCursor)
+        language_menu = QMenu(self.welcome_language_btn)
+        self.welcome_language_actions = {
+            'en': language_menu.addAction('English'),
+            'it': language_menu.addAction('Italiano'),
+        }
+        for code, action in self.welcome_language_actions.items():
+            action.setCheckable(True)
+            action.triggered.connect(lambda _checked=False, value=code: self._set_language(value))
+        self.welcome_language_btn.setMenu(language_menu)
+
+        self._apply_welcome_language()
         QTimer.singleShot(0, self._position_welcome_theme_btn)  # page has no real layout yet here
         self._refresh_recent_folders()
         return page
@@ -1027,12 +1075,49 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if not hasattr(self, 'welcome_theme_btn'):
             return
         margin = 18
+        self.welcome_language_btn.move(
+            margin,
+            self.welcome_page.height() - self.welcome_language_btn.height() - margin,
+        )
         self.welcome_theme_btn.move(
             self.welcome_page.width() - self.welcome_theme_btn.width() - margin,
             self.welcome_page.height() - self.welcome_theme_btn.height() - margin,
         )
+        self.welcome_language_btn.raise_()
         self.welcome_theme_btn.raise_()
     # [FN CLOSED] _position_welcome_theme_btn
+
+    def _set_language(self, code):
+        code = 'it' if str(code).lower().startswith('it') else 'en'
+        self.settings.setValue('language', code)
+        self._apply_welcome_language()
+
+    def _apply_welcome_language(self):
+        italian = str(self.settings.value('language', 'en')).lower().startswith('it')
+        code = 'it' if italian else 'en'
+        self.welcome_language_btn.setText('Italiano' if italian else 'English')
+        self.welcome_language_btn.setToolTip('Cambia lingua' if italian else 'Change language')
+        for action_code, action in self.welcome_language_actions.items():
+            action.setChecked(action_code == code)
+        self.welcome_desc.setText(
+            'Apri la cartella di un progetto per esplorarlo: i file vengono etichettati secondo i '
+            'marcatori KANT ([TAG OPEN] Nome / [TAG CLOSED] Nome) e mostrati suddivisi in sezioni '
+            'pieghevoli secondo la gerarchia MOD > CLS > FN, ecc.' if italian else
+            'Open a project folder to explore it: files are labeled using KANT markers '
+            '([TAG OPEN] Name / [TAG CLOSED] Name) and shown as collapsible sections following '
+            'the MOD > CLS > FN hierarchy.'
+        )
+        self.welcome_open_btn.setText('Apri cartella…' if italian else 'Open folder…')
+        self.welcome_open_btn.setToolTip(
+            "Scegli una cartella di progetto da aprire nell'IDE" if italian else
+            'Choose a project folder to open in the IDE'
+        )
+        self.welcome_new_project_btn.setText('＋  Nuovo progetto' if italian else '＋  New project')
+        self.welcome_new_project_btn.setToolTip(
+            'Crea un progetto nuovo da zero' if italian else 'Create a new project from scratch'
+        )
+        self.recent_title.setText('CARTELLE RECENTI' if italian else 'RECENT FOLDERS')
+        self._style_welcome_page()
 
     # [FN CATEGORY] _welcome_page_stylesheet / _style_welcome_page — split out of
     # _build_welcome_page so _apply_theme can re-run the exact same styling after a day/night
@@ -1075,10 +1160,20 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # already uses for the Aspetto menu's own Notte/Giorno text
         self.welcome_theme_btn.setIcon(draw_icon('sun' if self.night_mode else 'moon', 18, theme.ACCENT))
         self.welcome_theme_btn.setIconSize(QSize(18, 18))
-        self.welcome_theme_btn.setToolTip('Passa al tema chiaro' if self.night_mode else 'Passa al tema scuro')
+        italian = str(self.settings.value('language', 'en')).lower().startswith('it')
+        self.welcome_theme_btn.setToolTip(
+            ('Passa al tema chiaro' if self.night_mode else 'Passa al tema scuro') if italian else
+            ('Switch to light theme' if self.night_mode else 'Switch to dark theme')
+        )
         self.welcome_theme_btn.setStyleSheet(
             f'QPushButton {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; '
             f'border-radius:20px; }} '
+            f'QPushButton:hover {{ border-color:{theme.ACCENT}; background:{theme.CODE_BG}; }}'
+        )
+        self.welcome_language_btn.setIcon(draw_icon('globe', 18, theme.ACCENT))
+        self.welcome_language_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:20px; padding:0 10px; }} '
             f'QPushButton:hover {{ border-color:{theme.ACCENT}; background:{theme.CODE_BG}; }}'
         )
     # [FN CLOSED] _style_welcome_page
@@ -1140,6 +1235,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         add_row.addWidget(self.add_file_btn)
         add_row.addWidget(self.add_grouping_btn)
         tree_panel_layout.addLayout(add_row)
+        self.tree_panel = tree_panel
 
         # MAPPA opens from a small tab stuck to the bottom-center edge of the window (like a
         # drawer handle) rather than a button buried in the tree panel; clicking it again while
@@ -1197,6 +1293,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         view_panel_layout.addWidget(self.tabs, 1)
         self.io_tabs = self._build_io_tabs()
         view_panel_layout.addWidget(self.io_tabs)
+        self.view_panel = view_panel
 
         self.claude_pane = ClaudePane(os.getcwd())
         self.claude_pane.before_run = self._prepare_ai_snapshot
@@ -1204,6 +1301,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.claude_pane.focus_hint = self._build_ai_focus_summary
         self.claude_pane.refresh_focus_label()
         self.claude_pane.finished.connect(self._finish_ai_review)
+        self.claude_pane.conversationChanged.connect(self._save_active_ai_conversation)
+        self.claude_pane.pureAiToggled.connect(self._set_pure_ai_mode)
+        self.conversation_sidebar = ConversationSidebar(self.shell)
+        self.conversation_sidebar.conversationSelected.connect(self._activate_ai_conversation)
+        self.conversation_sidebar.groupRequested.connect(self._group_ai_conversation)
+        self.conversation_sidebar.newRequested.connect(self._new_ai_conversation)
+        self.conversation_sidebar.hide()
 
         self.terminal_dock = self._build_terminal_dock()
         self._style_io_tabs()
@@ -1233,7 +1337,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # state on every subsequent launch, silently hiding the terminal until the user remembered
         # to drag it back open by hand. A minimum here doesn't discard the rest of the saved layout
         # (the workspace/terminal split ratio still restores), it just floors the terminal's share.
-        MIN_TERMINAL_HEIGHT = 120
+        MIN_TERMINAL_HEIGHT = 200
         if saved_main_sizes and len(saved_main_sizes) == 2:
             sizes = [int(x) for x in saved_main_sizes]
             if sizes[1] < MIN_TERMINAL_HEIGHT:
@@ -1241,7 +1345,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 sizes[1] = MIN_TERMINAL_HEIGHT
             self.main_splitter.setSizes(sizes)
         else:
-            self.main_splitter.setSizes([650, 180])
+            self.main_splitter.setSizes([630, 200])
         self.main_splitter.splitterMoved.connect(
             lambda *_: self._debounce_splitter_save('mainVerticalSplitterSizes', self.main_splitter)
         )
@@ -1391,7 +1495,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
     def _update_cursor_position_label(self, edit):
         cursor = edit.textCursor()
-        self.cursor_pos_label.setText(f'  Riga {cursor.blockNumber() + 1}, Col {cursor.columnNumber() + 1}  ')
+        self.cursor_pos_label.setText(
+            f'  Riga {edit.absolute_line_number(cursor.blockNumber())}, Col {cursor.columnNumber() + 1}  '
+        )
 
     # [FN CATEGORY] _build_view_mode_bar — three mutually-exclusive source/grouping modes plus one
     # independent compact-render toggle for KANT; the compact renderer keeps the same tree/items.
@@ -1541,6 +1647,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         tab, uid = self._ai_context_target()
         root = getattr(self, 'project_root_path', None)
         italian = str(self.settings.value('language', 'en')).lower().startswith('it')
+        if getattr(self, 'pure_ai_mode', False):
+            root_label = (root or '.').replace(os.sep, '/')
+            return (
+                f'Root: {root_label}. Hai accesso in lettura a tutto il progetto in questa cartella; '
+                'la plancia KANT a destra è solo una vista e non definisce il focus della conversazione.'
+                if italian else
+                f'Root: {root_label}. You have read access to the whole project in this directory; '
+                'the KANT board on the right is only a view and does not scope this conversation.'
+            )
         target = None
         if tab is not None:
             node = self._find_node_by_uid(tab.tree, uid) if uid else None
@@ -1613,6 +1728,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.title_bar.redo_menu_action.setEnabled(bool(has_tab and self.active_tab.redo_stack))
         self.title_bar.validate_kant_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.tag_current_file_menu_action.setEnabled(has_tab)
+        self.title_bar.comment_full_file_menu_action.setEnabled(has_tab)
+        self.title_bar.comment_project_menu_action.setEnabled(bool(self.project_root_path))
+        self.title_bar.remove_kant_comments_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.wipe_retag_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.run_menu_action.setEnabled(has_tab)
         self.title_bar.find_menu_action.setEnabled(has_tab)
@@ -1675,7 +1793,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.find_input = QLineEdit()
         self.find_input.setPlaceholderText('Cerca nel file aperto…')
         self.find_input.returnPressed.connect(self._find_next)
-        self.find_input.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+        self.find_input.setFont(QFont('Consolas', theme.CODING_FONT_PT))
         layout.addWidget(self.find_input, 1)
 
         prev_btn = QPushButton('')
@@ -1753,12 +1871,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.setSpacing(6)
 
         prefix = QLabel(':')
-        prefix.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
+        prefix.setFont(QFont('Consolas', theme.CODING_FONT_PT, QFont.DemiBold))
         layout.addWidget(prefix)
 
         self.vim_command_input = QLineEdit()
         self.vim_command_input.setPlaceholderText('w, q, wq, x, qa…')
-        self.vim_command_input.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+        self.vim_command_input.setFont(QFont('Consolas', theme.CODING_FONT_PT))
         self.vim_command_input.returnPressed.connect(self._run_vim_command)
         layout.addWidget(self.vim_command_input, 1)
 
@@ -1919,13 +2037,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if not self._focus_visible_text(tab, item.data(0, ROLE_TEXT) or ''):
             self._goto_line(tab, int(line))
 
-    # [FN CATEGORY] _show_kant_error_help — double-click handler for a "Verifica KANT" error row:
-    # looks the message up in _KANT_ERROR_KB, shows how many times this pattern has recurred this
-    # session, and opens the explanation dialog. "Vai alla riga" reuses _open_result_item's own
-    # navigation (same path/line/text-search logic, nothing duplicated); "Applica fix" (only
-    # offered when the KB entry has one) navigates there first, then runs the fix — currently only
-    # 'ai-fill' exists, which just runs the same AI-fill-blanks action the sparkle button does,
-    # scoped to whatever's isolated once the file is open (whole-file if nothing is).
+    # [FN CATEGORY] _show_kant_error_help — explanation fallback for KANT errors that require human
+    # judgment. Resolvable rows bypass it in _on_kant_error_double_clicked and run their fix.
     # [FN] _show_kant_error_help — explains a KANT validation error, offers to fix it
     # [FN OPEN] _show_kant_error_help
     def _show_kant_error_help(self, item, _column):
@@ -1944,6 +2057,62 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 self._ai_fill_kant_blanks()
     # [FN CLOSED] _show_kant_error_help
 
+    def _on_kant_error_double_clicked(self, item, _column):
+        if item.data(0, ROLE_KIND) != 'validation-result':
+            return
+        message = item.data(0, ROLE_TEXT) or item.text(0)
+        _key, _explanation, fix = _kant_error_lookup(message)
+        if fix == 'ai-fill':
+            self._open_result_item(item, 0)
+            self._ai_fill_kant_blanks()
+        elif fix == 'repair-marker':
+            self._repair_kant_error_item(item)
+        elif fix == 'sync-map':
+            self._sync_kant_map()
+            self.statusBar().showMessage('Rigenerazione della mappa KANT avviata', 4000)
+        else:
+            self._show_kant_error_help(item, 0)
+
+    def _repair_kant_error_item(self, item):
+        path = item.data(0, ROLE_PATH)
+        line = int(item.data(0, ROLE_LINE) or 1)
+        message = item.data(0, ROLE_TEXT) or item.text(0)
+        if not path:
+            return
+        tab = self._tab_for_path(path)
+        try:
+            if tab is not None:
+                text = serialize_kant(tab.tree)
+            else:
+                with open(path, encoding='utf-8', newline='') as source:
+                    text = source.read()
+            repaired = repair_kant_error(text, line, message)
+            if repaired is None:
+                self._show_kant_error_help(item, 0)
+                return
+            try:
+                new_tree = parse_kant(repaired)
+            except KantParseError:
+                # repair_kant_error only permits this when another independent error occurs later;
+                # keep the corrected text editable and let the next validation expose that error.
+                new_tree = Node(tag='ROOT', name='', open_raw=None, body=[Run(lines=repaired.split('\n'))])
+            if tab is None:
+                write_file_atomic(path, repaired)
+                self._open_file(path)
+            else:
+                tab.remember_undo_state()
+                tab.tree = new_tree
+                tab.mark_dirty()
+                self._render_view(tab, tab.filter_uid)
+                if not tab.save():
+                    return
+                self._update_tab_title(tab)
+            self.statusBar().showMessage('Errore KANT risolto', 4000)
+            self._refresh_after_fs_change()
+            self._run_kant_validation_background()
+        except (OSError, UnicodeDecodeError, KantParseError) as error:
+            self._ide_message('Fix KANT', f'Impossibile applicare il fix: {error}')
+
     def _focus_visible_text(self, tab, text):
         if tab is None or not text:
             return False
@@ -1960,15 +2129,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _goto_line(self, tab, line):
         if tab is None:
             return
-        remaining = max(1, line)
+        line = max(1, line)
         for edit in tab.view_container.findChildren(CodeEdit):
-            blocks = edit.blockCount()
-            if remaining > blocks:
-                remaining -= blocks
+            first = edit.absolute_line_number(0)
+            last = edit.absolute_line_number(max(0, edit.blockCount() - 1))
+            if not first <= line <= last:
                 continue
             cursor = edit.textCursor()
             cursor.movePosition(QTextCursor.Start)
-            for _ in range(remaining - 1):
+            for _ in range(line - first):
                 cursor.movePosition(QTextCursor.Down)
             edit.setTextCursor(cursor)
             edit.setFocus()
@@ -2054,12 +2223,18 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _update_tree_drop_handler — enables tree file-drop only while in File view mode
     # [FN OPEN] _update_tree_drop_handler
     def _update_tree_drop_handler(self):
-        self.tree.file_drop_handler = self._handle_tree_file_drop if self.view_mode == 'file' else None
+        file_mode = self.view_mode == 'file'
+        self.tree.file_drop_handler = self._handle_tree_file_drop if file_mode else None
+        self.tree.file_move_allowed = self._tree_file_move_allowed if file_mode else None
+        self.tree.file_move_handler = self._handle_tree_file_move if file_mode else None
         # KANT elements are only reorderable while the tree is actually showing KANT structure —
         # File/Gruppi mode rows aren't KANT elements at all (plain filenames / grouping members)
         code_mode = self.view_mode == 'code'
-        self.tree.setDragEnabled(code_mode)
-        self.tree.setDragDropMode(QAbstractItemView.InternalMove if code_mode else QAbstractItemView.NoDragDrop)
+        self.tree.setDragEnabled(code_mode or file_mode)
+        self.tree.setDragDropMode(
+            QAbstractItemView.InternalMove if code_mode else
+            QAbstractItemView.DragDrop if file_mode else QAbstractItemView.NoDragDrop
+        )
         self.tree.reorder_allowed = self._kant_reorder_allowed if code_mode else None
         self.tree.reorder_handler = self._kant_reorder_apply if code_mode else None
     # [FN CLOSED] _update_tree_drop_handler
@@ -2068,8 +2243,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # sharing its exact parent (same file, same nesting level) — reparenting or reordering across
     # files/levels via drag is out of scope, this only reshuffles siblings that are already siblings
     # [FN OPEN] _kant_reorder_allowed
-    def _kant_reorder_allowed(self, dragged, target, dropped_on_item):
-        if dragged.data(0, ROLE_KIND) != 'section' or dropped_on_item:
+    def _kant_reorder_allowed(self, dragged, target):
+        if dragged.data(0, ROLE_KIND) != 'section':
             return False
         if target is None or target.data(0, ROLE_KIND) != 'section':
             return False
@@ -2120,6 +2295,31 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._render_view(tab, tab.filter_uid)
         self._rebuild_tree()
     # [FN CLOSED] _kant_reorder_apply
+
+    def _tree_file_move_allowed(self, dragged, target):
+        if target is None or target.data(0, ROLE_KIND) != 'dir':
+            return False
+        source = dragged.data(0, ROLE_PATH)
+        target_dir = target.data(0, ROLE_PATH)
+        if dragged.data(0, ROLE_KIND) not in {'plainfile', 'dir'} or not source or not target_dir:
+            return False
+        destination = os.path.join(target_dir, os.path.basename(source))
+        if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(destination)):
+            return False
+        if os.path.isdir(source):
+            try:
+                if os.path.commonpath([os.path.abspath(source), os.path.abspath(target_dir)]) == os.path.abspath(source):
+                    return False
+            except ValueError:
+                return False
+        return not os.path.exists(destination)
+
+    def _handle_tree_file_move(self, dragged, target):
+        if not self._tree_file_move_allowed(dragged, target):
+            return False
+        source = dragged.data(0, ROLE_PATH)
+        destination = os.path.join(target.data(0, ROLE_PATH), os.path.basename(source))
+        return self._move_tree_path(source, destination, os.path.isdir(source), 'Sposta')
 
     # [FN CATEGORY] _handle_tree_file_drop — copies each dropped OS path into the project (a
     # directory drop target if the drop landed on a folder row, its parent directory if it landed
@@ -2360,7 +2560,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.kant_errors_view = QTreeWidget()
         self.kant_errors_view.setHeaderHidden(True)
         self.kant_errors_view.itemClicked.connect(self._open_result_item)
-        self.kant_errors_view.itemDoubleClicked.connect(self._show_kant_error_help)
+        self.kant_errors_view.itemDoubleClicked.connect(self._on_kant_error_double_clicked)
 
         self.terminal_stack = QStackedWidget()
         self.terminal_stack.addWidget(self.terminal)
@@ -2523,6 +2723,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.map_tab_btn.setProperty('kantIcon', 'arrow-up')
             self.map_tab_btn.setIcon(draw_icon('arrow-up', 12))
             self.map_tab_btn.hide()
+            self._position_map_tab()
             if key:
                 self._navigate_to_element(key)
             return
@@ -2786,6 +2987,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _toggle_claude_pane — collapses/restores the AI terminal pane
     # [FN OPEN] _toggle_claude_pane
     def _toggle_claude_pane(self):
+        if self.pure_ai_mode:
+            return
         sizes = self.splitter.sizes()
         if len(sizes) < 2:
             return
@@ -2804,6 +3007,44 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._style_claude_tab_button(False)
         self._position_claude_tab()
     # [FN CLOSED] _toggle_claude_pane
+
+    def _set_pure_ai_mode(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self.pure_ai_mode:
+            return
+        self.pure_ai_mode = enabled
+        # PURE AI is project-wide and independent from whichever KANT node is selected in the
+        # right board; its hidden prompt must not inherit that board's file/element focus.
+        self.claude_pane.global_mode_btn.setVisible(not enabled)
+        self.claude_pane.focus_label.setVisible(not enabled)
+        if enabled:
+            self._normal_splitter_sizes = self.splitter.sizes()
+            self._normal_workspace_sizes = self.workspace_splitter.sizes()
+            self.workspace_splitter.setOrientation(Qt.Vertical)
+            self.workspace_splitter.setSizes([300, 620])
+            self.splitter.insertWidget(0, self.conversation_sidebar)
+            self.splitter.insertWidget(1, self.claude_pane)
+            self.conversation_sidebar.show()
+            self.splitter.setCollapsible(1, False)
+            self.splitter.setStretchFactor(0, 0)
+            self.splitter.setStretchFactor(1, 1)
+            self.splitter.setStretchFactor(2, 1)
+            self.splitter.setSizes([240, 680, 520])
+            self.claude_tab_btn.hide()
+            self._refresh_ai_conversation_sidebar()
+        else:
+            self.conversation_sidebar.hide()
+            self.conversation_sidebar.setParent(self.shell)
+            self.splitter.insertWidget(0, self.main_splitter)
+            self.splitter.insertWidget(1, self.claude_pane)
+            self.splitter.setCollapsible(1, True)
+            self.workspace_splitter.setOrientation(Qt.Horizontal)
+            self.workspace_splitter.setSizes(self._normal_workspace_sizes or [theme.TREE_MIN_WIDTH, 900])
+            self.splitter.setStretchFactor(0, 1)
+            self.splitter.setStretchFactor(1, 0)
+            self.splitter.setSizes(self._normal_splitter_sizes or [1320, 460])
+            self.claude_tab_btn.setVisible(self.project_root_path is not None and self.stack.currentIndex() == 1)
+            self._position_claude_tab()
 
     # [FN CATEGORY] _navigate_to_element — resolves an xref key with legacy order fallback, then
     # routes through the same element-preview slot used by direct tree clicks.
@@ -2891,9 +3132,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         def build():
             trees = {}
             for file_path in iter_kant_tagged_files(project_root):
+                rel = os.path.relpath(file_path, project_root).replace(os.sep, '/')
+                if rel in open_texts:
+                    continue
                 label = read_top_level_label(file_path)
                 if label is not None:
-                    rel = os.path.relpath(file_path, project_root).replace(os.sep, '/')
                     trees[rel] = label[2]
             for rel, text in open_texts.items():
                 trees[rel] = parse_kant(text)
@@ -2902,7 +3145,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         def apply(graph, error):
             if self._xref_pending_generation == generation:
                 self._xref_pending_generation = None
-            if error or generation != self._xref_generation or project_root != self.project_root_path:
+            if error:
+                if generation == self._xref_generation and project_root == self.project_root_path:
+                    if self.map_dialog is not None and self.map_dialog.isVisible():
+                        self.map_dialog.set_graph({}, os.path.basename(project_root), project_root)
+                    self.statusBar().showMessage(f'Impossibile costruire MAPPA: {error}', 5000)
+                return
+            if generation != self._xref_generation or project_root != self.project_root_path:
                 return
             self._xref_cache = graph
             if self.map_dialog is not None and self.map_dialog.isVisible():
@@ -2996,6 +3245,178 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
     # ---- project tree (AI-NAV: project lifecycle and outline building) ---
 
+    def _load_pure_ai_data(self):
+        try:
+            data = json.loads(self.settings.value('pureAi/conversations', '{}'))
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _persist_pure_ai_data(self):
+        self.settings.setValue('pureAi/conversations', json.dumps(self._pure_ai_data, ensure_ascii=False))
+
+    @staticmethod
+    def _blank_ai_conversation():
+        conversation_id = str(uuid.uuid4())
+        return {
+            'id': conversation_id,
+            'title': 'New conversation',
+            'updated': time.time(),
+            'state': {'messages': [], 'agent': 'claude'},
+        }
+
+    def _ai_project_data(self, path):
+        path = os.path.abspath(path)
+        project = self._pure_ai_data.get(path)
+        if not isinstance(project, dict) or not isinstance(project.get('conversations'), dict):
+            project = {'active': None, 'conversations': {}}
+            self._pure_ai_data[path] = project
+        else:
+            project['conversations'] = {
+                str(conversation_id): conversation
+                for conversation_id, conversation in project['conversations'].items()
+                if isinstance(conversation, dict)
+                and isinstance(conversation.get('state', {}), dict)
+                and conversation.get('state', {}).get('messages')
+            }
+            for conversation_id, conversation in project['conversations'].items():
+                conversation['id'] = conversation_id
+                if not isinstance(conversation.get('title'), str):
+                    conversation['title'] = 'New conversation'
+                if not isinstance(conversation.get('updated'), (int, float)):
+                    conversation['updated'] = 0
+                if not isinstance(conversation.get('group'), str) or not conversation.get('group', '').strip():
+                    conversation.pop('group', None)
+                conversation.setdefault('state', {'messages': [], 'agent': 'claude'})
+        if project.get('active') not in project['conversations']:
+            project['active'] = next(iter(project['conversations']), None)
+        return project
+
+    def _save_active_ai_conversation(self):
+        if self._loading_ai_conversation or not self.project_root_path:
+            return
+        state = self.claude_pane.conversation_state()
+        if not state['messages']:
+            return
+        storage_path = self._active_ai_conversation_path or self.project_root_path
+        project = self._ai_project_data(storage_path)
+        if not self._active_ai_conversation_id:
+            conversation = self._blank_ai_conversation()
+            self._active_ai_conversation_id = conversation['id']
+            project['conversations'][conversation['id']] = conversation
+        conversation = project['conversations'].get(self._active_ai_conversation_id)
+        if conversation is None:
+            return
+        conversation['state'] = state
+        conversation['updated'] = time.time()
+        first_user = next((m.get('text', '') for m in state['messages'] if m.get('role') == 'user'), '')
+        if first_user:
+            conversation['title'] = ' '.join(first_user.split())[:48]
+        project['active'] = self._active_ai_conversation_id
+        self._persist_pure_ai_data()
+        self._refresh_ai_conversation_sidebar()
+
+    def _switch_ai_project(self, path):
+        project = self._ai_project_data(path)
+        conversation_id = self._pending_ai_conversation_id or project.get('active')
+        self._pending_ai_conversation_id = None
+        conversation = project['conversations'].get(conversation_id)
+        project['active'] = conversation_id
+        self._active_ai_conversation_id = conversation_id
+        self._active_ai_conversation_path = os.path.abspath(path)
+        self._loading_ai_conversation = True
+        try:
+            self.claude_pane.set_cwd(path, announce=False)
+            self.claude_pane.load_conversation(conversation.get('state', {}) if conversation else {})
+        finally:
+            self._loading_ai_conversation = False
+        self._refresh_ai_conversation_sidebar()
+
+    def _new_ai_conversation(self):
+        if not self.project_root_path or self.claude_pane.process is not None:
+            return
+        self._save_active_ai_conversation()
+        project = self._ai_project_data(self.project_root_path)
+        project['active'] = None
+        self._active_ai_conversation_id = None
+        self._active_ai_conversation_path = os.path.abspath(self.project_root_path)
+        self._persist_pure_ai_data()
+        self._loading_ai_conversation = True
+        try:
+            self.claude_pane.set_cwd(self.project_root_path, announce=False)
+            self.claude_pane.load_conversation({})
+        finally:
+            self._loading_ai_conversation = False
+        self._refresh_ai_conversation_sidebar()
+
+    def _activate_ai_conversation(self, path, conversation_id):
+        if self.claude_pane.process is not None:
+            self.statusBar().showMessage('Attendi la fine della risposta AI prima di cambiare conversazione.', 3500)
+            return
+        path = os.path.abspath(path)
+        if conversation_id == self._active_ai_conversation_id and path == self._active_ai_conversation_path:
+            return
+        self._save_active_ai_conversation()
+        if self.pure_ai_mode and path != os.path.abspath(self.project_root_path or ''):
+            conversation = self._ai_project_data(path)['conversations'].get(conversation_id)
+            if conversation is None:
+                return
+            # Keep the visible history, but never resume a provider session created in a different
+            # cwd. The next message starts a fresh session against the project already on screen.
+            state = dict(conversation.get('state', {}))
+            state['claude_session_id'] = None
+            state['codex_resumable'] = False
+            self._active_ai_conversation_id = conversation_id
+            self._active_ai_conversation_path = path
+            self._loading_ai_conversation = True
+            try:
+                self.claude_pane.load_conversation(state)
+            finally:
+                self._loading_ai_conversation = False
+            self._refresh_ai_conversation_sidebar()
+            return
+        if path != os.path.abspath(self.project_root_path or ''):
+            self._pending_ai_conversation_id = conversation_id
+            self._open_project_folder(path)
+            return
+        self._pending_ai_conversation_id = conversation_id
+        self._switch_ai_project(path)
+
+    def _group_ai_conversation(self, path, conversation_id):
+        project = self._ai_project_data(path)
+        conversation = project['conversations'].get(conversation_id)
+        if conversation is None:
+            return
+        name, ok = self._ide_text(
+            'Group chat', 'Group name (leave empty to ungroup):', text=conversation.get('group', ''),
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if name:
+            conversation['group'] = name
+        else:
+            conversation.pop('group', None)
+        self._persist_pure_ai_data()
+        self._refresh_ai_conversation_sidebar()
+
+    def _refresh_ai_conversation_sidebar(self):
+        if not hasattr(self, 'conversation_sidebar'):
+            return
+        if self.project_root_path:
+            self._ai_project_data(self.project_root_path)
+        conversations = []
+        for path in list(self._pure_ai_data):
+            if not os.path.isdir(path):
+                continue
+            project = self._ai_project_data(path)
+            for conversation in project['conversations'].values():
+                conversations.append({**conversation, 'path': path})
+        conversations.sort(key=lambda item: item.get('updated', 0), reverse=True)
+        self.conversation_sidebar.set_conversations(
+            conversations, self._active_ai_conversation_path, self._active_ai_conversation_id,
+        )
+
     def _recent_folders(self):
         folders = self.settings.value('recentFolders', [])
         if isinstance(folders, str):
@@ -3087,6 +3508,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _go_back_to_welcome(self):
         if not self._flush_all_tabs():
             return
+        self._save_active_ai_conversation()
         self._refresh_recent_folders()
         self.stack.setCurrentIndex(0)
         self._set_project_chrome_visible(False)
@@ -3105,6 +3527,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
     def _open_project_folder(self, path):
         path = os.path.abspath(path)
+        self._save_active_ai_conversation()
         self._invalidate_xref()
         if self.project_root_path and os.path.abspath(self.project_root_path) != path:
             if not self._close_all_tabs(flush=True):
@@ -3117,7 +3540,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._remember_folder(path)
         self.settings.setValue('session/openFolder', path)
         self.terminal.set_cwd(path)
-        self.claude_pane.set_cwd(path)
+        if self.pure_ai_mode and self._active_ai_conversation_id:
+            # Changing the inspected KANT project must not replace the central archived chat.
+            # set_cwd resets provider resume ids, which cannot safely cross workspaces.
+            self.claude_pane.set_cwd(path, announce=False)
+        else:
+            self._switch_ai_project(path)
         self._auto_select_interpreter()
         if is_python_majority_project(path):
             self._switch_terminal_tab(1)
@@ -3168,7 +3596,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # map_tab_btn itself stays hidden until MAPPA is actually opened (it's now only the
         # in-dialog close handle) — the always-visible entry point is mappa_label_btn in the
         # INCOMING/OUTGOING bar, built already, no per-open show() needed
-        self.claude_tab_btn.show()
+        self.claude_tab_btn.setVisible(not self.pure_ai_mode)
         self._position_claude_tab()
 
     # [FN CATEGORY] _check_kant_map — looks for a KANT_*.md structural map at the project root (the
@@ -3403,12 +3831,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 self._kant_error_pattern_counts[key] += 1
         for message in errors:
             if not any(message.startswith(f'{rel}:') for _path, rel, _line, _msg in visual_errors):
-                QTreeWidgetItem(root, [message])
+                item = QTreeWidgetItem(root, [message])
+                item.setData(0, ROLE_KIND, 'validation-result')
+                item.setData(0, ROLE_TEXT, message)
         if not errors:
             QTreeWidgetItem(root, ['Nessun errore'])
         root.setExpanded(True)
         if errors:
-            self._switch_terminal_tab(3)
+            # Showing scan results must not call _switch_terminal_tab(3): that starts another scan
+            # and loops forever (scan -> results -> scan) whenever the project has KANT errors.
+            self.terminal_stack.setCurrentIndex(3)
             self.terminal_sidebar_group.button(3).setChecked(True)
 
     # [FN CATEGORY] _launch_kant_code_map — hands off to Claude Code itself rather than trying to
@@ -3578,13 +4010,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _build_groupings_tree — renders every project grouping and its members ("Gruppi" mode)
     # [FN OPEN] _build_groupings_tree
     def _build_groupings_tree(self, parent_item, dir_path):
-        groupings = load_groupings(dir_path)
+        xref = self._get_xref()
+        groupings = load_reconciled_groupings(dir_path, xref)
         if not groupings:
             empty_item = QTreeWidgetItem(parent_item, ['Nessun gruppo — usa "+ Nuovo gruppo" per crearne uno'])
             empty_item.setData(0, ROLE_KIND, 'grouping_empty')
             empty_item.setForeground(0, QColor(theme.DIM))
             return
-        xref = self._get_xref()
         for grouping in groupings:
             group_item = QTreeWidgetItem(parent_item)
             group_item.setData(0, ROLE_KIND, 'grouping')
@@ -3943,6 +4375,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if page is None:
             return
         tab = page._file_tab
+        self._drop_lsp_widget_requests(page)
         self._element_pages.pop(getattr(page, '_element_key', None), None)
         if self._preview_page is page:
             self._preview_page = None
@@ -3967,6 +4400,17 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         for page in list(self._element_pages.values()):
             if page._file_tab is tab:
                 self._close_element_tab(page, cleanup_backing=False)
+
+    def _drop_lsp_widget_requests(self, widget):
+        edits = set(widget.findChildren(CodeEdit))
+        if not edits:
+            return
+        self.lsp_completion_requests = {
+            request_id: edit for request_id, edit in self.lsp_completion_requests.items() if edit not in edits
+        }
+        self.lsp_hover_requests = {
+            request_id: pending for request_id, pending in self.lsp_hover_requests.items() if pending[0] not in edits
+        }
 
     # ---- tabs (AI-NAV: active-tab ownership and close/flush lifecycle) ---
 
@@ -4019,6 +4463,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         else:
             tab.autosave_timer.stop()
         self.lsp_client.close_document(tab.path)
+        self._drop_lsp_widget_requests(tab)
+        self.lsp_pending_requests = {
+            request_id: pending for request_id, pending in self.lsp_pending_requests.items()
+            if pending[1] != tab.path
+        }
         if tab.path in self.open_tabs:
             del self.open_tabs[tab.path]
         if tab.path in self.fs_watcher.files():
@@ -4391,6 +4840,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._update_syntax_status()
             self._show_lsp_diagnostics(tab, diagnostics)
 
+    def _on_lsp_server_error(self, message):
+        self.lsp_pending_requests.clear()
+        self.lsp_completion_requests.clear()
+        self.lsp_hover_requests.clear()
+        if hasattr(self, 'terminal'):
+            self.terminal.write_info(f'\n# LSP: {message}\n')
+
     def _show_lsp_diagnostics(self, tab, diagnostics):
         if not diagnostics or not hasattr(self, 'results_view'):
             return
@@ -4408,30 +4864,32 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         root.setExpanded(True)
         self._toggle_info_popup(self.results_view, force_open=True)
 
+    def _run_line_offsets(self, node):
+        offsets = {}
+
+        def walk(current, count):
+            for item in current.body:
+                if isinstance(item, Run):
+                    offsets[id(item)] = count
+                    count += len(item.lines)
+                    continue
+                count += sum(bool(raw) for raw in (item.category_raw, item.tag_raw, item.open_raw))
+                count = walk(item, count)
+                count += sum(bool(raw) for raw in (item.closed_raw, item.incoming_raw, item.outgoing_raw))
+            return count
+
+        walk(node, 0)
+        return offsets
+
     def _line_count_before_run(self, node, target):
-        count = 0
-        for item in node.body:
-            if isinstance(item, Run):
-                if item is target:
-                    return count
-                count += len(item.lines)
-                continue
-            if item.category_raw:
-                count += 1
-            if item.tag_raw:
-                count += 1
-            if item.open_raw:
-                count += 1
-            inner = self._line_count_before_run(item, target)
-            if inner is not None:
-                return count + inner
-            if item.closed_raw:
-                count += 1
-            if item.incoming_raw:
-                count += 1
-            if item.outgoing_raw:
-                count += 1
-        return None
+        return self._run_line_offsets(node).get(id(target))
+
+    def _refresh_code_line_offsets(self, tab):
+        offsets = self._run_line_offsets(tab.tree)
+        container = self.tabs if hasattr(self, 'tabs') else tab.view_container
+        for edit in container.findChildren(CodeEdit):
+            if getattr(edit, 'kant_tab', None) is tab:
+                edit.set_line_number_offset(offsets.get(id(getattr(edit, 'kant_item', None)), 0))
 
     def _active_lsp_position(self, edit=None, cursor=None):
         if edit is None:
@@ -4463,11 +4921,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             },
         }
 
-    def _lsp_command(self, action, retry=12):
+    def _lsp_command(self, action, retry=12, expected_path=None):
         tab = self.active_tab
         if tab is None:
             self._ide_message('LSP', 'Apri un file prima di usare i comandi LSP.')
             return
+        if expected_path is not None and tab.path != expected_path:
+            return
+        expected_path = tab.path
         if not lsp_server_for_path(tab.path):
             self._local_lsp_command(action, tab)
             return
@@ -4496,7 +4957,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         request_id = self.lsp_client.request(method, params)
         if request_id is None:
             if retry > 0:
-                QTimer.singleShot(350, lambda: self._lsp_command(action, retry=retry - 1))
+                QTimer.singleShot(
+                    350, lambda: self._lsp_command(action, retry=retry - 1, expected_path=expected_path),
+                )
             else:
                 self._ide_message('LSP', 'Server LSP non pronto.')
             return
@@ -4798,6 +5261,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         request_id = self.lsp_client.request('textDocument/completion', params)
         if request_id is not None:
+            self.lsp_completion_requests = {
+                pending_id: pending_edit for pending_id, pending_edit in self.lsp_completion_requests.items()
+                if pending_edit is not edit
+            }
             self.lsp_completion_requests[request_id] = edit
     # [FN CLOSED] _request_completion
 
@@ -4850,7 +5317,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # real language server's own hover is about identifiers/types, not keyword syntax, and
         # would come back empty for these anyway
         if symbol in KEYWORD_DOCS:
-            show_code_hover_popup(global_pos, f'<b>{html_escape(symbol)}</b><br>{html_escape(KEYWORD_DOCS[symbol])}')
+            show_code_hover_popup(
+                global_pos,
+                f'<b style="font-size:larger">{html_escape(symbol)}</b><br>'
+                f'{_markdown_to_html(KEYWORD_DOCS[symbol])}',
+            )
             return
         if not lsp_server_for_path(tab.path):
             self._local_hover(edit, global_pos, symbol)
@@ -4861,6 +5332,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         request_id = self.lsp_client.request('textDocument/hover', params)
         if request_id is not None:
+            self.lsp_hover_requests = {
+                pending_id: pending for pending_id, pending in self.lsp_hover_requests.items()
+                if pending[0] is not edit
+            }
             self.lsp_hover_requests[request_id] = edit, global_pos
     # [FN CLOSED] _request_hover
 
@@ -5135,6 +5610,60 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._ide_message('KANT', 'Struttura KANT generata deterministicamente per questo file.')
     # [FN CLOSED] _deterministic_tag_current_file
 
+    # [FN CATEGORY] _comment_kant_project — project-wide KANT comment action: flushes open edits,
+    # scans every supported UTF-8 source recursively without the search-size cap, inserts all
+    # mechanically knowable structure first, then asks the selected AI only for blank prose.
+    # [FN] _comment_kant_project — deterministically tags and comments the complete project
+    # [FN OPEN] _comment_kant_project
+    def _comment_kant_project(self):
+        if not self.project_root_path or not self._flush_all_tabs():
+            return
+        changed, skipped = skeleton.apply_skeleton_to_project(self.project_root_path)
+        for rel, _count in changed:
+            tab = self._tab_for_path(os.path.join(self.project_root_path, rel))
+            if tab is not None:
+                self._reload_tab_from_disk(tab)
+        self._refresh_after_fs_change()
+        effort = self.claude_pane.effort_select.currentText().strip()
+        if effort == MODEL_DEFAULT:
+            effort = None
+        launched = self._launch_kant_fill_blanks(None, effort=effort)
+        if launched is None:
+            summary = 'Tutti i sorgenti supportati sono già completi: nessun commento KANT da generare.'
+            if skipped:
+                summary += '\nFile con marker non validi o non scrivibili: ' + ', '.join(skipped)
+            self._ide_message('AI KANT Comment (intero progetto)', summary)
+        elif not launched:
+            self._ide_message('AI KANT Comment (intero progetto)', 'Impossibile avviare il processo AI in questo momento.')
+        elif skipped:
+            self.statusBar().showMessage(
+                f'Commento progetto avviato; {len(skipped)} file non validi/non scrivibili esclusi', 7000,
+            )
+    # [FN CLOSED] _comment_kant_project
+
+    def _remove_all_kant_comments(self):
+        if not self.project_root_path:
+            return
+        if not self._ide_yes_no(
+            'Rimuovi tutti i commenti KANT',
+            'Questo elimina CATEGORY, righe descrittive, OPEN/CLOSED e i vecchi INCOMING/OUTGOING '
+            'da tutti i file del progetto. Il codice e i commenti normali restano invariati. Continuare?',
+            danger=True,
+        ):
+            return
+        if not self._flush_all_tabs():
+            return
+        changed, skipped = skeleton.strip_kant_project(self.project_root_path)
+        for rel in changed:
+            tab = self._tab_for_path(os.path.join(self.project_root_path, rel))
+            if tab is not None:
+                self._reload_tab_from_disk(tab)
+        self._refresh_after_fs_change()
+        summary = f'Commenti KANT rimossi da {len(changed)} file.'
+        if skipped:
+            summary += f'\n{len(skipped)} file non scrivibili: ' + ', '.join(skipped)
+        self._ide_message('Rimuovi tutti i commenti KANT', summary)
+
     # [FN CATEGORY] _wipe_and_retag_project — strips every KANT marker (including hand-written
     # CATEGORY/tagline text — that's genuinely discarded, not preserved) from the whole project,
     # then re-tags every file from scratch as if it had never been marked at all. Destructive
@@ -5180,13 +5709,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # shift line numbers — the span is always re-resolved from the tab's post-insertion tree, never
     # reused from before it). Refuses to proceed if the file's existing markers don't even parse.
     # [FN] _ai_fill_kant_blanks — inserts a deterministic KANT skeleton, then asks the AI to fill
-    # only the blanks inside whatever's currently visible
+    # the visible scope, or the whole file when explicitly requested by the KANT menu
     # [FN OPEN] _ai_fill_kant_blanks
-    def _ai_fill_kant_blanks(self):
+    def _ai_fill_kant_blanks(self, whole_file=False):
         tab = self.active_tab
         if tab is None:
             return
-        scope_uid = self._active_filter_uid()
+        scope_uid = None if whole_file else self._active_filter_uid()
         new_text = self._apply_skeleton_to_tab(tab)
         text = new_text if new_text is not None else serialize_kant(tab.tree)
         scope = self._kant_node_span(tab, scope_uid)
@@ -5242,7 +5771,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN OPEN] _project_kant_blanks
     def _project_kant_blanks(self, root):
         lines, broken = [], []
-        for path, text in iter_project_text_files(root):
+        for path, text in iter_project_text_files(root, max_bytes=None):
             rel = os.path.relpath(path, root)
             audit = audit_kant_headers(text)
             if audit['errors']:
@@ -5265,18 +5794,24 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if model:
             self.claude_pane.set_agent(agent)
             self.claude_pane.model_select.setCurrentText(model)
-        lines, _broken = self._project_kant_blanks(self.project_root_path)
+        lines, broken = self._project_kant_blanks(self.project_root_path)
         if not lines:
-            return
+            return None
+        listing = '\n'.join(lines)
+        if broken:
+            listing += (
+                '\n\nFile esclusi perché hanno marker KANT non validi (non modificarli):\n- '
+                + '\n- '.join(broken)
+            )
         md_path = _write_kant_fill_markdown(
             'In questo progetto questi elementi KANT hanno CATEGORY e/o la riga descrittiva ancora vuoti:',
-            '\n'.join(lines),
+            listing,
         )
         prompt = (
             f'Leggi {md_path}: elenca gli elementi KANT con descrizione mancante in questo progetto '
             'e le istruzioni per compilarla. Applica esattamente quelle istruzioni.'
         )
-        self.claude_pane.run_prompt(prompt, agent=agent, auto_permissions_once=True, effort=effort)
+        return self.claude_pane.run_prompt(prompt, agent=agent, auto_permissions_once=True, effort=effort)
     # [FN CLOSED] _launch_kant_fill_blanks
 
     # [FN CATEGORY] _vim_dispatch — the single callback every CodeEdit's vim engine (kant/widgets.py)
@@ -5501,7 +6036,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if run is None:
             run = Run(lines=[''])
             tab.tree.body.append(run)
-        edit = CodeEdit('\n'.join(run.lines))
+        edit = CodeEdit('\n'.join(run.lines), self._run_line_offsets(tab.tree).get(id(run), 0))
         edit.kant_item = run
         edit.kant_tab = tab
         edit.textChanged.connect(lambda e=edit, it=run, t=tab: self._on_code_changed(t, e, it))
@@ -5535,7 +6070,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         block.setMinimumHeight(56)
         block.setStyleSheet(
             f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.DIM}; '
-            f'border-radius:{theme.RADIUS}px; font-size:{theme.CODE_FONT_PT + 2}pt; font-weight:600; }} '
+            f'border-radius:{theme.RADIUS}px; font-size:{theme.CODING_FONT_PT + 2}pt; font-weight:600; }} '
             f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
         )
         block.clicked.connect(lambda: self._prompt_add_element(tab))
@@ -5621,7 +6156,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         grouping = new_grouping(name)
         grouping.members = member_keys
-        groupings = load_groupings(self.project_root_path)
+        grouping.member_hints = {key: member_hint(xref.get(key)) for key in member_keys if key in xref}
+        groupings = load_reconciled_groupings(self.project_root_path, xref)
         groupings.append(grouping)
         save_groupings(self.project_root_path, groupings)
         if self.view_mode != 'groups':
@@ -5689,7 +6225,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         return None
     # [FN CLOSED] _find_node_containing_line
 
-    def _build_node_widgets(self, tab, node, layout, depth):
+    def _build_node_widgets(self, tab, node, layout, depth, line_offsets=None):
+        if line_offsets is None:
+            line_offsets = self._run_line_offsets(tab.tree)
         i = 0
         while i < len(node.body):
             item = node.body[i]
@@ -5698,7 +6236,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 if not text.strip():
                     i += 1
                     continue
-                edit = CodeEdit(text)
+                edit = CodeEdit(text, line_offsets.get(id(item), 0))
                 edit.kant_item = item
                 edit.kant_tab = tab
                 edit.kant_node = node if node.tag != 'ROOT' else None
@@ -5714,7 +6252,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 if self._is_coordinated_leaf(item):
                     group, next_i = self._collect_coordinated_leaf_group(node.body, i)
                     if len(group) > 1:
-                        self._render_coordinated_leaf_group(tab, group, layout)
+                        self._render_coordinated_leaf_group(tab, group, layout, line_offsets)
                         i = next_i
                         continue
                 has_children = any(isinstance(c, Node) for c in item.body)
@@ -5728,13 +6266,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                     layout.addWidget(section)
                     tab.collapsibles.append(section)
                     tab.section_widgets[item.uid] = section
-                    self._build_node_widgets(tab, item, section.content_layout, depth + 1)
+                    self._build_node_widgets(tab, item, section.content_layout, depth + 1, line_offsets)
                 else:
                     leaf = LeafSection(item, show_header=depth > 0)
                     leaf.editMetadata.connect(lambda node, t=tab: self._edit_kant_metadata(t, node))
                     layout.addWidget(leaf)
                     tab.section_widgets[item.uid] = leaf
-                    self._build_node_widgets(tab, item, leaf.content_layout, depth + 1)
+                    self._build_node_widgets(tab, item, leaf.content_layout, depth + 1, line_offsets)
                 i += 1
 
     def _is_coordinated_leaf(self, item):
@@ -5758,7 +6296,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             break
         return group, i if len(group) > 1 else start + 1
 
-    def _render_coordinated_leaf_group(self, tab, nodes, layout):
+    def _render_coordinated_leaf_group(self, tab, nodes, layout, line_offsets):
         panel = QWidget()
         panel.setObjectName('coordinatedConstants')
         # same flat-block language as CollapsibleSection (thin top separator + tag-colored left
@@ -5776,12 +6314,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             leaf = LeafSection(node, compact=True)
             panel_layout.addWidget(leaf)
             tab.section_widgets[node.uid] = leaf
-            self._build_node_widgets(tab, node, leaf.content_layout, 0)
+            self._build_node_widgets(tab, node, leaf.content_layout, 0, line_offsets)
         layout.addWidget(panel)
 
     def _on_code_changed(self, tab, edit, item):
         tab.remember_undo_state(coalesce=True)
         item.lines = edit.toPlainText().split('\n')
+        self._refresh_code_line_offsets(tab)
         tab.mark_dirty()
 
     def _rewrite_marker_line(self, raw, marker, payload):
@@ -5925,7 +6464,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             copy_name_action = menu.addAction('Copia nome elemento')
             copy_path_action = menu.addAction('Copia percorso file')
             menu.addSeparator()
-            groupings = load_groupings(self.project_root_path)
+            groupings = load_reconciled_groupings(self.project_root_path, self._get_xref())
             if groupings:
                 add_to_group_menu = menu.addMenu('Aggiungi a un gruppo')
                 add_to_group_menu.setToolTipsVisible(True)
@@ -5970,7 +6509,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         else:
             matched_group = next((g for a, g in group_actions if a is chosen), None)
             if matched_group is not None:
-                add_member(self.project_root_path, matched_group.id, element_key)
+                add_member(
+                    self.project_root_path, matched_group.id, element_key,
+                    member_hint(self._get_xref().get(element_key)),
+                )
                 if self.view_mode == 'groups':
                     self._rebuild_tree()
     # [FN CLOSED] _show_tree_context_menu

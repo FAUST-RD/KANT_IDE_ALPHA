@@ -177,8 +177,6 @@ python test_kant_smoke.py
 
 On Linux or macOS, set `QT_QPA_PLATFORM=offscreen` before running the test.
 
-The legacy [`legacy/index.html`](legacy/index.html) prototype remains in the repository for reference. Current development targets the Python/PySide6 application.
-
 ## License
 
 [MIT](LICENSE)

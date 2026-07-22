@@ -30,6 +30,9 @@ TAGLINE_RE = re.compile(
 # legacy: [TAG INCOMING/OUTGOING] Name — data, comma-separated. Dropped from the convention —
 # kept only so old files that still have these round-trip losslessly.
 IO_RE = re.compile(MARKER_PREFIX + r'\[(\w+)\s+(INCOMING|OUTGOING)\]\s+(\S+)\s*(?:—\s*(.*?))?' + MARKER_SUFFIX)
+# Recovery-only matcher: accepts incomplete/unknown marker kinds, but callers must additionally
+# require one of the eight KANT tags before deleting the full comment line.
+KANT_COMMENT_RE = re.compile(MARKER_PREFIX + r'\[(\w+)(?:\s+[^\]]*)?\](?:\s+.*?)?' + MARKER_SUFFIX)
 
 # marks the exact spot an id-less OPEN/CLOSED gets a freshly generated #id stamped into its raw line
 _ID_INSERT_RE = re.compile(r'\[(\w+)\s+(OPEN|CLOSED)\]')
@@ -576,6 +579,24 @@ def strip_kant_markers(node: Node) -> str:
             out.append(strip_kant_markers(item))
     return '\n'.join(out)
 # [FN CLOSED] strip_kant_markers
+
+
+# [FN CATEGORY] strip_kant_marker_lines — recovery path for destructive marker removal: matches
+# complete comment lines directly so broken nesting and incomplete marker fields cannot block it
+# [FN] strip_kant_marker_lines — removes KANT comments without parsing their tree
+# [FN OPEN] strip_kant_marker_lines
+def strip_kant_marker_lines(source: str) -> str:
+    """Remove KANT comment lines without requiring a valid marker tree."""
+    marker_res = (OPEN_RE, CLOSED_RE, CATEGORY_RE, IO_RE)
+
+    def is_kant_marker(line):
+        if any(pattern.match(line) for pattern in marker_res):
+            return True
+        marker = KANT_COMMENT_RE.match(line)
+        return bool(marker and marker.group(1) in ELEMENT_TAG_LABELS)
+
+    return ''.join(line for line in source.splitlines(keepends=True) if not is_kant_marker(line))
+# [FN CLOSED] strip_kant_marker_lines
 
 
 # [CST] _label_cache — abspath -> ((mtime_ns, size), result) for read_top_level_label_result.

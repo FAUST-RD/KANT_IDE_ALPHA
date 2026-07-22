@@ -175,10 +175,11 @@ def _detect_import_module(line_text):
 class CodeEdit(QPlainTextEdit):
     vim_mode_changed = Signal(str)  # emitted on every vim_state transition, for a status-bar indicator
 
-    def __init__(self, text):
+    def __init__(self, text, line_number_offset=0):
         super().__init__()
+        self.line_number_offset = max(0, int(line_number_offset))
         self.setPlainText(text)
-        self.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+        self.setFont(QFont('Consolas', theme.CODING_FONT_PT))
         self.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.setFrameStyle(QFrame.NoFrame)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -283,14 +284,25 @@ class CodeEdit(QPlainTextEdit):
         scrollbar = self.horizontalScrollBar().sizeHint().height() if self.horizontalScrollBar().isVisible() else 0
         self.setFixedHeight(lines * self.fontMetrics().lineSpacing() + padding + scrollbar)
 
-    # [FN CATEGORY] line_number_area_width — sizes the gutter to fit the largest line number in this
-    # block, so a 3-line snippet gets a narrow gutter and a 400-line untagged file gets a wider one
+    # [FN CATEGORY] line_number_area_width — sizes the gutter to fit the largest absolute file line
+    # shown by this block; line_number_offset is maintained by MainWindow from the full KANT tree
     # [FN] line_number_area_width — computes the gutter width in pixels
     # [FN OPEN] line_number_area_width
     def line_number_area_width(self):
-        digits = len(str(max(1, self.blockCount())))
+        digits = len(str(self.absolute_line_number(max(0, self.blockCount() - 1))))
         return 14 + self.fontMetrics().horizontalAdvance('9') * digits
     # [FN CLOSED] line_number_area_width
+
+    def absolute_line_number(self, block_number):
+        return self.line_number_offset + block_number + 1
+
+    def set_line_number_offset(self, offset):
+        offset = max(0, int(offset))
+        if offset == self.line_number_offset:
+            return
+        self.line_number_offset = offset
+        self._update_line_number_area_width()
+        self.line_number_area.update()
 
     def _update_line_number_area_width(self):
         self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
@@ -329,7 +341,7 @@ class CodeEdit(QPlainTextEdit):
                 painter.setPen(QColor(theme.DIM))
                 painter.drawText(
                     0, top, self.line_number_area.width() - 8, self.fontMetrics().height(),
-                    Qt.AlignRight, str(block_number + 1),
+                    Qt.AlignRight, str(self.absolute_line_number(block_number)),
                 )
             block = block.next()
             top = bottom
@@ -855,6 +867,7 @@ class TerminalPane(QPlainTextEdit):
         self.encoding = locale.getpreferredencoding(False)
         self.setFont(QFont('Consolas', 8))
         self.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.document().setMaximumBlockCount(10000)
         self.setStyleSheet(
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border-top:1px solid {theme.BORDER}; '
             f'padding:12px;'
@@ -989,9 +1002,14 @@ class TerminalPane(QPlainTextEdit):
         self.process.finished.connect(self._finished)
         self.process.start(python_exe, ['-m', 'pdb', path])
         self.prompt_start = len(self.toPlainText())
-        for line_no in sorted(breakpoint_lines):
-            self.process.write(f'break {path}:{line_no}\n'.encode(self.encoding))
-        self.process.write(b'continue\n')
+        process = self.process
+
+        def prime_debugger():
+            for line_no in sorted(breakpoint_lines):
+                process.write(f'break {path}:{line_no}\n'.encode(self.encoding))
+            process.write(b'continue\n')
+
+        process.started.connect(prime_debugger)
         return True
     # [FN CLOSED] run_debug_python
 
@@ -1037,14 +1055,21 @@ class TerminalPane(QPlainTextEdit):
 
     def _error(self, error):
         self._append(f'\n[errore avvio processo: {error}]\n')
-        self.process = None
+        self._release_process()
         self._show_prompt()
 
     def _finished(self, exit_code, _status):
+        if self.process is None:
+            return
         if exit_code:
             self._append(f'\n[exit code {exit_code}]\n')
-        self.process = None
+        self._release_process()
         self._show_prompt()
+
+    def _release_process(self):
+        process, self.process = self.process, None
+        if process is not None:
+            process.deleteLater()
 # [FN CLOSED] TerminalPane
 
 
@@ -1176,8 +1201,13 @@ def _agent_command(agent, prompt, auto_permissions=False, model=None, effort=Non
     if agent == 'codex':
         effort_args = ('-c', f'model_reasoning_effort="{effort}"') if effort else ()
         permission_args = ('--sandbox', 'workspace-write', '--ask-for-approval', 'never') if auto_permissions else ()
+        # The preferred elevated Windows sandbox launches commands through dedicated users. On
+        # machines where that setup/helper is unavailable it fails before every command with
+        # CreateProcessWithLogonW error 2. Codex documents "unelevated" as the restricted-token
+        # fallback; keep workspace-write rather than silently widening access to danger-full-access.
+        windows_sandbox_args = ('-c', 'windows.sandbox="unelevated"') if auto_permissions and os.name == 'nt' else ()
         return 'codex', [
-            'exec', *session_args, *permission_args,
+            'exec', *session_args, *windows_sandbox_args, *permission_args,
             *model_args, *effort_args, prompt,
         ]
     effort_args = ('--effort', effort) if effort else ()
@@ -1409,7 +1439,7 @@ class _CodeHoverPopup(QFrame):
         self.accent_bar.setStyleSheet(
             f'background:{theme.ACCENT}; border-top-left-radius:11px; border-top-right-radius:11px;'
         )
-        self.label.setStyleSheet(f'color:{theme.TEXT}; border:none; font-size:{theme.CODE_FONT_PT}pt;')
+        self.label.setStyleSheet(f'color:{theme.TEXT}; border:none; font-size:{theme.CODING_FONT_PT}pt;')
 
     def show_at(self, global_pos, html_text):
         self.apply_style()
@@ -1648,8 +1678,100 @@ class ToggleSwitch(QCheckBox):
 # [FN CLOSED] ToggleSwitch
 
 
+class ConversationSidebar(QWidget):
+    """Compact PURE AI chat archive with optional user-defined groups."""
+
+    conversationSelected = Signal(str, str)
+    groupRequested = Signal(str, str)
+    newRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(190)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 10, 8, 10)
+        layout.setSpacing(8)
+        self.title_label = QLabel('CHAT ARCHIVE')
+        self.title_label.setFont(QFont('Consolas', theme.TREE_FONT_PT, QFont.Bold))
+        layout.addWidget(self.title_label)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.itemClicked.connect(self._selected)
+        self.tree.currentItemChanged.connect(self._selection_changed)
+        layout.addWidget(self.tree, 1)
+        self.new_btn = QPushButton('+  New conversation')
+        self.new_btn.setCursor(Qt.PointingHandCursor)
+        self.new_btn.clicked.connect(self.newRequested)
+        self.group_btn = QPushButton('Group')
+        self.group_btn.setCursor(Qt.PointingHandCursor)
+        self.group_btn.setToolTip('Group the selected chat; an empty name removes it from its group')
+        self.group_btn.clicked.connect(self._request_group)
+        self.group_btn.setEnabled(False)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(6)
+        button_row.addWidget(self.new_btn, 1)
+        button_row.addWidget(self.group_btn)
+        layout.addLayout(button_row)
+        self.apply_style()
+
+    def set_conversations(self, conversations, active_path=None, active_id=None):
+        self.tree.clear()
+        active_item = None
+        groups = {}
+        for conversation in conversations:
+            group = conversation.get('group', '').strip()
+            if group:
+                parent = groups.get(group)
+                if parent is None:
+                    parent = QTreeWidgetItem(self.tree, [group])
+                    parent.setExpanded(True)
+                    groups[group] = parent
+                item = QTreeWidgetItem(parent, [conversation['title']])
+            else:
+                item = QTreeWidgetItem(self.tree, [conversation['title']])
+            target = (conversation['path'], conversation['id'])
+            item.setData(0, Qt.UserRole, target)
+            item.setToolTip(0, conversation['path'])
+            if target == (active_path, active_id):
+                active_item = item
+        if active_item is not None:
+            self.tree.setCurrentItem(active_item)
+            if active_item.parent() is not None:
+                active_item.parent().setExpanded(True)
+        self._selection_changed(self.tree.currentItem())
+
+    def _selected(self, item, _column):
+        target = item.data(0, Qt.UserRole)
+        if target:
+            self.conversationSelected.emit(*target)
+
+    def _selection_changed(self, item, _previous=None):
+        self.group_btn.setEnabled(bool(item and item.data(0, Qt.UserRole)))
+
+    def _request_group(self):
+        item = self.tree.currentItem()
+        target = item.data(0, Qt.UserRole) if item is not None else None
+        if target:
+            self.groupRequested.emit(*target)
+
+    def apply_style(self):
+        self.setStyleSheet(f'background:{theme.PANEL}; border-right:1px solid {theme.BORDER};')
+        self.title_label.setStyleSheet(f'color:{theme.DIM}; border:none;')
+        self.tree.setStyleSheet(
+            f'QTreeWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:{theme.RADIUS}px; padding:4px; }} '
+            f'QTreeWidget::item {{ padding:5px 3px; }} '
+            f'QTreeWidget::item:hover, QTreeWidget::item:selected {{ background:{theme.PANEL2}; color:{theme.TEXT}; }}'
+        )
+        self.new_btn.setStyleSheet(theme.BUTTON_STYLE)
+        self.group_btn.setStyleSheet(theme.BUTTON_STYLE)
+
+
 class ClaudePane(QWidget):
     finished = Signal()
+    conversationChanged = Signal()
+    pureAiToggled = Signal(bool)
 
     def __init__(self, cwd):
         super().__init__()
@@ -1671,8 +1793,10 @@ class ClaudePane(QWidget):
         self._claude_session_id = None
         self._codex_resumable = False
         self._messages = []
+        self._history = []
         self._stream_label = None
         self._stream_text = ''
+        self._stream_history_index = None
         self._typing_timer = QTimer(self)
         self._typing_timer.timeout.connect(self._typing_tick)
         self._typing_frame = 0
@@ -1818,7 +1942,7 @@ class ClaudePane(QWidget):
         self.lossy_images = QToolButton()
         self.lossy_images.setIcon(draw_icon('tokens', 16))
         self.lossy_images.setIconSize(QSize(16, 16))
-        self.lossy_images.setText(' Cheap mode')
+        self.lossy_images.setText(' AI CHEAP&&LOSS')
         self.lossy_images.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.lossy_images.setCheckable(True)
         self.lossy_images.setCursor(Qt.PointingHandCursor)
@@ -1832,6 +1956,14 @@ class ClaudePane(QWidget):
         token_row.setContentsMargins(0, 0, 0, 2)
         token_row.addStretch(1)
         token_row.addWidget(self.lossy_images)
+        self.pure_ai_btn = QToolButton()
+        self.pure_ai_btn.setText(' PURE AI')
+        self.pure_ai_btn.setCheckable(True)
+        self.pure_ai_btn.setCursor(Qt.PointingHandCursor)
+        self.pure_ai_btn.setFixedHeight(theme.ICON_BTN)
+        self.pure_ai_btn.setToolTip('Conversazioni a sinistra, AI al centro e plancia KANT a destra')
+        self.pure_ai_btn.toggled.connect(self.pureAiToggled)
+        token_row.addWidget(self.pure_ai_btn)
         layout.addLayout(token_row)
 
         composer = QHBoxLayout()
@@ -1890,6 +2022,11 @@ class ClaudePane(QWidget):
         )
         self.focus_label.setStyleSheet(f'color:{theme.DIM};')
         self.lossy_images.setStyleSheet(theme.icon_button_style())
+        self.pure_ai_btn.setStyleSheet(
+            theme.icon_button_style()
+            + f'QToolButton:checked {{ background:{theme.ACCENT}; color:{theme.BG if theme.NIGHT else "#111827"}; '
+              f'border-color:{theme.ACCENT}; }}'
+        )
         self.attach_btn.setStyleSheet(theme.icon_button_style())
         self._refresh_attachment_chips()
         self.global_mode_btn.setIcon(draw_icon('globe', 14))
@@ -2060,18 +2197,20 @@ class ClaudePane(QWidget):
         status.setStyleSheet(f"color:{theme.OK if allow else theme.DANGER}; border:none;")
         for button in buttons:
             button.setEnabled(False)
+        self._permission_cards = [card for card in self._permission_cards if card[0] is not request]
 
     def _cancel_pending_permissions(self):
         for request, status, buttons in list(self._permission_cards):
             if not request['event'].is_set():
                 self._decide_permission(request, status, buttons, 'deny')
 
-    def set_cwd(self, cwd):
+    def set_cwd(self, cwd, announce=True):
         self.cwd = cwd
         self._claude_session_id = None
         self._codex_resumable = False
         self._session_allowed_tools.clear()
-        self._append(f'Cartella di lavoro: {cwd}')
+        if announce:
+            self._append(f'Cartella di lavoro: {cwd}')
 
     def refresh_focus_label(self):
         text = self.focus_hint() if self.focus_hint else None
@@ -2079,6 +2218,9 @@ class ClaudePane(QWidget):
 
     def _write_log(self, text):
         try:
+            if os.path.isfile(self.log_path) and os.path.getsize(self.log_path) > 5 * 1024 * 1024:
+                with open(self.log_path, 'w', encoding='utf-8', newline='') as f:
+                    f.write('[log ruotato: limite 5 MB]\n')
             with open(self.log_path, 'a', encoding='utf-8', newline='') as f:
                 f.write(text)
         except OSError:
@@ -2098,7 +2240,7 @@ class ClaudePane(QWidget):
         name.setStyleSheet(f'color:{fg}; border:none; font-weight:600; background:transparent;')
         label.setStyleSheet(f'color:{fg}; border:none; background:transparent;')
 
-    def _add_message(self, text, role='system', name=None):
+    def _add_message(self, text, role='system', name=None, record=True):
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
@@ -2127,11 +2269,15 @@ class ClaudePane(QWidget):
             row_layout.addStretch(1)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, row)
         self._messages.append((role, frame, name_label, label))
+        if record:
+            self._history.append({'role': role, 'text': text, 'name': name})
+            self.conversationChanged.emit()
         self._style_message(role, frame, name_label, label)
         QTimer.singleShot(0, lambda: self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum()))
         return label
 
     def _append(self, text):
+        self._commit_stream_history()
         self._add_message(text, 'system')
         self._write_log(text)
 
@@ -2145,8 +2291,9 @@ class ClaudePane(QWidget):
             return
         self._typing_timer.stop()  # real output arrived — stop the "still working" placeholder
         if self._stream_label is None:
-            self._stream_label = self._add_message('', 'assistant')
+            self._stream_label = self._add_message('', 'assistant', record=False)
             self._stream_text = ''
+            self._stream_history_index = None
         self._stream_text += text
         self._write_log(text)
         if not self._stream_render_timer.isActive():
@@ -2157,6 +2304,57 @@ class ClaudePane(QWidget):
             return
         self._stream_label.setText(_markdown_to_html(self._stream_text.strip()))
         QTimer.singleShot(0, lambda: self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum()))
+
+    def _commit_stream_history(self):
+        text = self._stream_text.strip()
+        if not text:
+            return
+        if self._stream_history_index is None:
+            self._history.append({'role': 'assistant', 'text': text, 'name': None})
+            self._stream_history_index = len(self._history) - 1
+        elif self._history[self._stream_history_index]['text'] != text:
+            self._history[self._stream_history_index]['text'] = text
+        else:
+            return
+        self.conversationChanged.emit()
+
+    def conversation_state(self):
+        self._commit_stream_history()
+        return {
+            'messages': list(self._history),
+            'claude_session_id': self._claude_session_id,
+            'codex_resumable': self._codex_resumable,
+            'agent': self._agent(),
+        }
+
+    def load_conversation(self, state):
+        if self.process is not None:
+            return False
+        self._typing_timer.stop()
+        self._stream_render_timer.stop()
+        self._cancel_pending_permissions()
+        while self.chat_layout.count() > 1:
+            item = self.chat_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._messages.clear()
+        self._permission_cards.clear()
+        self._stream_label = None
+        self._stream_text = ''
+        self._stream_history_index = None
+        messages = state.get('messages', [])
+        if not isinstance(messages, list):
+            messages = []
+        self._history = [dict(message) for message in messages if isinstance(message, dict)]
+        self._claude_session_id = state.get('claude_session_id')
+        self._codex_resumable = bool(state.get('codex_resumable'))
+        self.set_agent(state.get('agent', 'claude'))
+        self.current_agent = self._agent()
+        for message in self._history:
+            self._add_message(
+                message.get('text', ''), message.get('role', 'system'), message.get('name'), record=False,
+            )
+        return True
 
     def write_info(self, text):
         self._append(text)
@@ -2407,7 +2605,8 @@ class ClaudePane(QWidget):
         self.process.closeWriteChannel()
         # a real response can take a few seconds; show an animated "still working" placeholder
         # right away instead of leaving the chat looking stalled until the first output arrives
-        self._stream_label = self._add_message(_TYPING_FRAMES[0], 'assistant')
+        self._stream_label = self._add_message(_TYPING_FRAMES[0], 'assistant', record=False)
+        self._stream_history_index = None
         self._typing_frame = 0
         self._typing_timer.start(450)
         return True
@@ -2437,11 +2636,14 @@ class ClaudePane(QWidget):
             self._flush_stream_render()  # a pending throttled render must land before the label is dropped below
         if self._stream_label is not None and not self._stream_text:
             self._stream_label.setText('')  # no output ever arrived — drop the typing placeholder
+        self._commit_stream_history()
         self._cancel_pending_permissions()
         self._cleanup_temp_files()
         self._auto_permissions_once = False
         self._stream_label = None
-        self.process = None
+        process, self.process = self.process, None
+        if process is not None:
+            process.deleteLater()
         self.send_btn.setText('Invia')
         self.send_btn.setEnabled(True)
         self.finished.emit()
@@ -2515,6 +2717,7 @@ class ClaudePane(QWidget):
 
         def resolve_inline(action):
             row.setParent(None)
+            row.deleteLater()
             if action == 'apply':
                 accepted = {item['path']: set(range(len(item['hunks']))) for item in review}
                 on_resolved('apply', accepted, {})
@@ -2550,15 +2753,16 @@ def _build_header_row(owner, node, show_label=True):
     header = None
     if show_label:
         # the name/short-description is the element's headline — bigger than the extended
-        # [TAG CATEGORY] description below it (CODE_FONT_PT - 1), not just the same size in a bolder weight
+        # [TAG CATEGORY] description below it, not just the same size in a bolder weight
         header = QLabel(_tag_header_html(node.tag, node.name, node.desc))
         header.setTextFormat(Qt.RichText)
-        header.setFont(QFont('Consolas', theme.CODE_FONT_PT + 1))
+        header.setFont(QFont('Consolas', theme.CODING_FONT_PT + 1))
         header.setWordWrap(True)
         header_row.addWidget(header, 1)
     else:
         header_row.addStretch(1)
     meta_btn = QToolButton()
+    meta_btn.setText('⋮')  # accessible/fallback label; the normal face remains icon-only
     meta_btn.setIcon(draw_icon('more', 14))
     meta_btn.setIconSize(QSize(14, 14))
     meta_btn.setToolTip('Modifica metadati KANT')
@@ -2636,7 +2840,7 @@ class CollapsibleSection(QWidget):
             # pulled closer to the fold-arrow toggle button above it (less left indent, no extra
             # top margin) and bumped a point larger, on request
             cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 6px; margin-top: 0px;')
-            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT + 1))
+            cat.setFont(QFont('Consolas', theme.CODING_FONT_PT + 1))
             outer.addWidget(cat)
 
         self.content = QWidget()
@@ -2696,7 +2900,7 @@ class LeafSection(QWidget):
             cat = QLabel(html_escape(node.category_desc))
             cat.setWordWrap(True)
             cat.setStyleSheet(f'color:{theme.DIM}; margin-left: 2px; margin-top: 0px;')
-            cat.setFont(QFont('Consolas', theme.CODE_FONT_PT + 1))
+            cat.setFont(QFont('Consolas', theme.CODING_FONT_PT + 1))
             outer.addWidget(cat)
 
         self.content = QWidget()
@@ -2721,11 +2925,15 @@ class ProjectTree(QTreeWidget):
         # view mode, or no project open), in which case drops are simply rejected rather than
         # silently doing nothing unexpected
         self.file_drop_handler = None
+        # Internal File-view moves use tree items rather than OS URL mime data. MainWindow owns
+        # path roles and filesystem policy, so this widget only routes validation + apply calls.
+        self.file_move_allowed = None
+        self.file_move_handler = None
         # internal item-reorder drag (KANT elements within the same file/parent) — kept fully
         # role-agnostic here (this class has no access to mainwindow.py's ROLE_KIND/ROLE_UID
         # constants without a circular import), so both the validity check and the actual sync-to-
         # file work are callbacks MainWindow supplies, same shape as file_drop_handler above.
-        # reorder_allowed(dragged_item, target_item_or_None, dropped_on_item: bool) -> bool
+        # reorder_allowed(dragged_item, target_item_or_None) -> bool
         # reorder_handler(parent_item_or_None, ordered_child_items) — called after Qt's own native
         # move already happened, with the new sibling order for MainWindow to apply to the source
         self.reorder_allowed = None
@@ -2743,14 +2951,29 @@ class ProjectTree(QTreeWidget):
         if dragged is None:
             return False
         target = self.itemAt(event.position().toPoint())
-        on_item = self.dropIndicatorPosition() == QAbstractItemView.OnItem
-        if self.reorder_allowed is not None and not self.reorder_allowed(dragged, target, on_item):
+        if self.reorder_allowed is not None and not self.reorder_allowed(dragged, target):
             return False
         return True
+
+    @staticmethod
+    def _move_reordered_item(dragged, target):
+        parent = dragged.parent()
+        source_index = parent.indexOfChild(dragged)
+        target_index = parent.indexOfChild(target)
+        # Dropping onto a sibling moves through it in the drag direction. This makes the whole row
+        # a useful target instead of requiring the tiny AboveItem/BelowItem indicator gap.
+        insert_index = target_index + (source_index < target_index)
+        parent.takeChild(source_index)
+        if source_index < insert_index:
+            insert_index -= 1
+        parent.insertChild(insert_index, dragged)
 
     def dragEnterEvent(self, event):
         ok = self._reorder_drag_ok(event)
         if ok:
+            event.acceptProposedAction()
+            return
+        if ok is None and event.source() is self and self.file_move_handler is not None:
             event.acceptProposedAction()
             return
         if ok is None and self.file_drop_handler is not None and event.mimeData().hasUrls():
@@ -2760,6 +2983,14 @@ class ProjectTree(QTreeWidget):
         ok = self._reorder_drag_ok(event)
         if ok:
             event.acceptProposedAction()
+            return
+        if ok is None and event.source() is self and self.file_move_handler is not None:
+            dragged = self.currentItem()
+            target = self.itemAt(event.position().toPoint())
+            if dragged is not None and self.file_move_allowed(dragged, target):
+                event.acceptProposedAction()
+            else:
+                event.ignore()
             return
         if ok is None and self.file_drop_handler is not None and event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -2772,12 +3003,25 @@ class ProjectTree(QTreeWidget):
                 return
             dragged = self.currentItem()
             parent_item = dragged.parent()
-            super().dropEvent(event)
+            target = self.itemAt(event.position().toPoint())
+            self._move_reordered_item(dragged, target)
             if parent_item is not None:
                 siblings = [parent_item.child(i) for i in range(parent_item.childCount())]
             else:
                 siblings = [self.topLevelItem(i) for i in range(self.topLevelItemCount())]
             self.reorder_handler(parent_item, siblings)
+            event.acceptProposedAction()
+            return
+        if event.source() is self and self.file_move_handler is not None:
+            dragged = self.currentItem()
+            target = self.itemAt(event.position().toPoint())
+            if dragged is None or not self.file_move_allowed(dragged, target):
+                event.ignore()
+                return
+            if self.file_move_handler(dragged, target):
+                event.acceptProposedAction()
+            else:
+                event.ignore()
             return
         if self.file_drop_handler is None:
             return
@@ -2965,7 +3209,26 @@ class TitleBar(QWidget):
             'attivo — le stesse regole del tasto ✨ nella barra azioni in modalità File'
         )
         self.tag_current_file_menu_action.triggered.connect(window._deterministic_tag_current_file)
+        self.comment_full_file_menu_action = kant_menu.addAction('AI KANT Comment (intero file)')
+        self.comment_full_file_menu_action.setToolTip(
+            'Genera la struttura mancante e chiede all’AI di compilare i commenti KANT dell’intero file attivo, '
+            'anche quando nella plancia è isolato un solo blocco'
+        )
+        self.comment_full_file_menu_action.triggered.connect(
+            lambda _checked=False: window._ai_fill_kant_blanks(whole_file=True)
+        )
+        self.comment_project_menu_action = kant_menu.addAction('AI KANT Comment (intero progetto)')
+        self.comment_project_menu_action.setToolTip(
+            'Controlla ricorsivamente tutti i sorgenti supportati nella cartella del progetto, genera '
+            'deterministicamente la struttura mancante e chiede all’AI soltanto le descrizioni'
+        )
+        self.comment_project_menu_action.triggered.connect(window._comment_kant_project)
         kant_menu.addSeparator()
+        self.remove_kant_comments_menu_action = kant_menu.addAction('Rimuovi tutti i commenti KANT (progetto)')
+        self.remove_kant_comments_menu_action.setToolTip(
+            'ATTENZIONE: elimina tutti e soli i marker/commenti KANT da ogni file; codice e commenti normali restano'
+        )
+        self.remove_kant_comments_menu_action.triggered.connect(window._remove_all_kant_comments)
         self.wipe_retag_menu_action = kant_menu.addAction('Rimuovi e rigenera tutto (deterministico)')
         self.wipe_retag_menu_action.setToolTip(
             'ATTENZIONE: rimuove ogni marker KANT (incluse le descrizioni) da tutto il progetto e '

@@ -16,16 +16,20 @@ from kant.model import Node, read_top_level_label, read_top_level_label_result
 from kant.syntax import audit_kant_headers
 from kant.xref import build_xref
 
+_SEARCH_SIZE_LIMIT = object()
 
-def iter_project_text_files(root):
+
+def iter_project_text_files(root, max_bytes=_SEARCH_SIZE_LIMIT):
+    if max_bytes is _SEARCH_SIZE_LIMIT:
+        max_bytes = theme.SEARCH_MAX_BYTES
     if not root:
         return
     for current, subdirs, files in os.walk(root):
-        subdirs[:] = [name for name in subdirs if name not in theme.IGNORE_DIRS]
-        for name in files:
+        subdirs[:] = sorted(name for name in subdirs if name not in theme.IGNORE_DIRS)
+        for name in sorted(files):
             path = os.path.join(current, name)
             try:
-                if os.path.getsize(path) > theme.SEARCH_MAX_BYTES:
+                if max_bytes is not None and os.path.getsize(path) > max_bytes:
                     continue
                 data = Path(path).read_bytes()
                 if b'\0' not in data:
